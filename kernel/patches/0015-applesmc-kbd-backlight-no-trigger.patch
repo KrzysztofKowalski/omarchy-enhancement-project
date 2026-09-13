@@ -1,0 +1,34 @@
+From 0015-applesmc-kbd-backlight-no-trigger Mon Sep 17 00:00:00 2001
+From: Krzysztof Kowalski <krzysztof7kowalski@gmail.com>
+Date: Fri, 28 Aug 2026 00:00:00 +0200
+Subject: [PATCH 0015/0015] applesmc: kbd backlight — no default_trigger (fix backlight going out)
+
+The kbd LED (smc::kbd_backlight) has default_trigger = "nand-disk", i.e. it is
+wired to the ledtrig_nand/mtd trigger. Every SPI NOR flash read
+(ledtrig_mtd_activity, mtdcore.c) fires a oneshot blink on it, which leaves
+the LED at 0 (LED_BLINK_ONESHOT_STOP) → applesmc_brightness_set(0) → SMC LKSB=0 →
+the physical keyboard backlight goes out. Affected: reclocked (reading
+gpu-power-prefs from /dev/mtd0ro), nvram-test.sh, gmux-io.c, udev/firmware —
+any MTD read.
+
+"nand-disk" on the kbd backlight is a historical artifact (old MacBooks with
+NAND); the kbd must not blink on flash activity. Fix of the problem class:
+default_trigger = NULL — the LED stays under brightness control
+(applesmc_brightness_set / sysfs), no trigger.
+
+Signed-off-by: Krzysztof Kowalski <krzysztof7kowalski@gmail.com>
+---
+ drivers/hwmon/applesmc.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/hwmon/applesmc.c	2026-08-28 00:00:00.000000000 +0200
++++ b/drivers/hwmon/applesmc.c	2026-08-28 00:00:00.000000000 +0200
+@@ -1067,7 +1067,7 @@
+ }
+
+ static struct led_classdev applesmc_backlight = {
+ 	.name			= "smc::kbd_backlight",
+-	.default_trigger	= "nand-disk",
++	.default_trigger	= NULL,	/* kbd must not blink on MTD activity (raport 80) */
+ 	.brightness_set		= applesmc_brightness_set,
+ };

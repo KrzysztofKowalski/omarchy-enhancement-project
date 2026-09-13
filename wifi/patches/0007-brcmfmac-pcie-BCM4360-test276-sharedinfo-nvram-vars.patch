@@ -1,0 +1,124 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 7/7] brcmfmac: pcie: BCM4360 test.276 shared_info NVRAM vars fields (variant B)
+
+BCM4360 experiment T276 variant B (follow-up to 0006). Static analysis of
+wl.ko (notes/wl-sharedinfo-static.md) showed that the ONLY gap between our
+T276 shared_info struct at TCM[ramsize-0x2F5C] and the real wl.ko struct
+(wlc_ol_up @ 0x80fbb-0x81030) is the pair of NVRAM-vars fields:
+
+- +0x020 = NVRAM vars size (varsz, out-param of si_attach; wlc_attach
+  @ 0x37df3/0x37e06)
+- +0x024..0x033 = first 16 bytes of the NVRAM vars buffer (memcpy from
+  vars; wlc_attach @ 0x37de7)
+
+The nvram buffer passed to brcmf_pcie_download_fw_nvram is the stripped
+vars buffer (brcmf_fw_nvram_strip in firmware.c; nv_data.len = stripped
+size), i.e. exactly what wl.ko's si_attach hands out as vars/varsz -- but
+it is freed (brcmf_fw_nvram_free) right after the TCM download, before the
+T276 pre-release block runs. This patch snapshots varsz + the first 16
+bytes before the free and writes them into shared_info +0x020/+0x024..0x033
+(le32 words preserve the raw buffer byte order). The sequence order is
+unchanged (halt ARM -> download fw -> shared_info -> ARM release -> poll);
+the 0xA5A5A5A5/0x5A5A5A5A magic and the olmsg ring header are untouched.
+The pre-release readback log additionally reports varsz and the four
+vars16 dwords for fire-session verification.
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 50 insertions(+), 1 deletion(-)
+diff --git a/brcmfmac/pcie.c b/brcmfmac/pcie.c
+index ce6e1e9..e7bedb3 100644
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -94,6 +94,8 @@
+ #define BCM4360_T276_SI_DMA_LO		0x004
+ #define BCM4360_T276_SI_DMA_HI		0x008
+ #define BCM4360_T276_SI_BUF_SIZE	0x00C
++#define BCM4360_T276_SI_NVRAM_VARSZ	0x020	/* NVRAM vars size (varsz) */
++#define BCM4360_T276_SI_NVRAM_VARS	0x024	/* first 16 B of NVRAM vars */
+ #define BCM4360_T276_SI_FW_STATUS	0x010	/* fw-writable */
+ #define BCM4360_T276_SI_FW_INIT_DONE	0x2028
+ #define BCM4360_T276_SI_MAGIC_END	0x2F38
+@@ -2069,6 +2071,11 @@
+ 	int err;
+ 	u32 address;
+ 	u32 resetintr;
++	/* BCM4360 test.276: NVRAM vars snapshot (varsz + first 16 B) for the
++	 * shared_info fields +0x020/+0x024..0x033. The nvram buffer is freed
++	 * right after the TCM download below, so capture it beforehand. */
++	u32 t276_varsz = 0;
++	u8 t276_vars16[16] = { 0 };
+
+ 	brcmf_dbg(PCIE, "Halt ARM.\n");
+ 	err = brcmf_pcie_enter_download_state(devinfo);
+@@ -2093,6 +2100,17 @@
+ 			  nvram_len;
+ 		brcmf_pcie_copy_mem_to_dev(devinfo, address, nvram,
+ 					   nvram_len);
++
++		/* BCM4360 test.276: snapshot the NVRAM vars (the stripped
++		 * buffer, i.e. what si_attach hands out as vars/varsz) before
++		 * the buffer is freed; written to shared_info +0x020/
++		 * +0x024..0x033 later in this function. */
++		t276_varsz = nvram_len;
++		if (nvram_len < sizeof(t276_vars16))
++			memcpy(t276_vars16, nvram, nvram_len);
++		else
++			memcpy(t276_vars16, nvram, sizeof(t276_vars16));
++
+ 		brcmf_fw_nvram_free(nvram);
+
+ 		if (devinfo->fwseed) {
+@@ -2189,6 +2207,21 @@
+ 				brcmf_pcie_write_ram32(devinfo,
+ 					t276_base + BCM4360_T276_SI_BUF_SIZE,
+ 					BCM4360_T276_OLMSG_BUF_SIZE);
++				/* wl.ko writes varsz (+0x020) and the first
++				 * 16 B of the NVRAM vars (+0x024..0x033) into
++				 * shared_info; the le32 words below preserve
++				 * the raw buffer byte order. */
++				brcmf_pcie_write_ram32(devinfo,
++					t276_base + BCM4360_T276_SI_NVRAM_VARSZ,
++					t276_varsz);
++				for (t276_i = 0; t276_i < 4; t276_i++)
++					brcmf_pcie_write_ram32(devinfo,
++						t276_base +
++						BCM4360_T276_SI_NVRAM_VARS +
++						t276_i * 4,
++						get_unaligned_le32(
++							t276_vars16 +
++							t276_i * 4));
+ 				brcmf_pcie_write_ram32(devinfo,
+ 					t276_base + BCM4360_T276_SI_FW_INIT_DONE,
+ 					0);
+@@ -2212,13 +2245,29 @@
+ 						t276_base +
+ 						BCM4360_T276_SI_DMA_HI),
+ 					 upper_32_bits(t276_dma));
+-				pr_emerg("BCM4360 test.276: readback buf_size=0x%08x (exp 0x%08x) fw_init_done=0x%08x (exp 0) magic_end=0x%08x (exp 0x%08x)\n",
++				pr_emerg("BCM4360 test.276: readback buf_size=0x%08x (exp 0x%08x) varsz=0x%08x (exp 0x%08x) vars16=0x%08x,0x%08x,0x%08x,0x%08x fw_init_done=0x%08x (exp 0) magic_end=0x%08x (exp 0x%08x)\n",
+ 					 brcmf_pcie_read_ram32(devinfo,
+ 						t276_base +
+ 						BCM4360_T276_SI_BUF_SIZE),
+ 					 BCM4360_T276_OLMSG_BUF_SIZE,
+ 					 brcmf_pcie_read_ram32(devinfo,
+ 						t276_base +
++						BCM4360_T276_SI_NVRAM_VARSZ),
++					 t276_varsz,
++					 brcmf_pcie_read_ram32(devinfo,
++						t276_base +
++						BCM4360_T276_SI_NVRAM_VARS),
++					 brcmf_pcie_read_ram32(devinfo,
++						t276_base +
++						BCM4360_T276_SI_NVRAM_VARS + 4),
++					 brcmf_pcie_read_ram32(devinfo,
++						t276_base +
++						BCM4360_T276_SI_NVRAM_VARS + 8),
++					 brcmf_pcie_read_ram32(devinfo,
++						t276_base +
++						BCM4360_T276_SI_NVRAM_VARS + 12),
++					 brcmf_pcie_read_ram32(devinfo,
++						t276_base +
+ 						BCM4360_T276_SI_FW_INIT_DONE),
+ 					 brcmf_pcie_read_ram32(devinfo,
+ 						t276_base +

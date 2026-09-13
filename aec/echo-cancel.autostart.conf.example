@@ -1,0 +1,31 @@
+# OPTIONAL auto-start of echo cancellation (NOT installed by default).
+#
+# Default behaviour (since 2026-09-12): the module is NOT loaded with
+# PipeWire - zero background cost. Start it on demand with:
+#     aec.sh start          # or: use-aec.sh avx
+#
+# If you want it always-on instead, copy this file to:
+#     ~/.config/pipewire/pipewire.conf.d/20-echo-cancel.conf
+# and restart pipewire:
+#     systemctl --user restart pipewire wireplumber
+#
+# monitor.mode = true: the AEC reference is the monitor of the DEFAULT
+# sink, so playback may go to any output device (JBL BT, built-in, ...)
+# and is still cancelled from the mic. Mic for all apps:
+# "Mikrofon (echo-cancel)" (echo_cancel_source, priority.session 5000).
+context.modules = [
+  {
+    name = libpipewire-module-echo-cancel
+    flags = [ nofail ]
+    args = {
+        library.name = aec/libspa-aec-avx
+        aec.args = "tail_ms=80 delay_max_ms=600 mu=0.35"
+        monitor.mode = true
+        source.props = {
+            node.name = "echo_cancel_source"
+            node.description = "Mikrofon (echo-cancel)"
+            priority.session = 5000
+        }
+    }
+  }
+]

@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# reclockctl — control wrapper for the reclocked daemon (systemd)
+# Usage: reclockctl {start|stop|status|restart|reload|logs|fan-on|fan-off|switch-status|dgpu-on|dgpu-off|dgpu-auto|to-igd|to-dis}
+#   start        — systemctl start reclocked
+#   stop         — systemctl stop reclocked (SIGTERM → restore exit-state + fan auto)
+#   status       — systemctl status reclocked + pstate.sh status + fans
+#   restart      — systemctl restart reclocked
+#   reload       — systemctl kill -s HUP reclocked (re-read the config without a restart)
+#   logs         — journalctl -u reclocked -f
+#   fan-on       — remove the fan-override flag-file (the daemon takes over fan auto)
+#   fan-off      — create the fan-override flag-file (freeze auto; control manually with cusfan.sh)
+#   switch-status — switchd status (v5.15): topology, dGPU power, target, nvram_prefs
+#   dgpu-on/off  — manual dGPU power override (dgpu-override flag-file; fan-override pattern)
+#   dgpu-auto    — remove the dgpu-override (the daemon returns to auto)
+#   to-igd/to-dis — NVRAM gpu-power-prefs WRITE (commits on the next boot) + reboot
+
+set -e
+CMD="${1:-status}"
+
+# ---------- helper: extract a field value from a JSON file (without jq) ----------
+# /run/reclocked/status (daemon) is JSON — the daemon version is in the "version" field; a simple extractor of strings
+# and numbers (the json_str pattern from reclocked.cpp; no jq dependency).
+json_get() { # <file> <key>
+  local f="$1" k="$2" line v
+  line="$(tr -d '\n' < "$f" 2>/dev/null)"
+  v="$(printf '%s' "$line" | grep -o "\"$k\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -n1 | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/')"
+  if [ -z "$v" ]; then
+    # v5.10: [0-9.-]* — floating point numbers (fan_case_avg °C, e.g. 45.4 / -1.0)
+    v="$(printf '%s' "$line" | grep -o "\"$k\"[[:space:]]*:[[:space:]]*[0-9.-]*" | head -n1 | sed -E 's/.*:[[:space:]]*//')"
+  fi
+  printf '%s' "$v"
+}
+
+# ---------- NVRAM gpu-power-prefs: write (to-igd / to-dis) ----------
+# Write = SetVariable runtime service — works even when the variable is hidden from
+# enumeration (report 70 §2.4). NVRAM = commits on the next boot, NOT live.
+# BANNED: NVRAM is never written during a live power-toggle (dgpu-on/dgpu-off).
+EFIVARS=/sys/firmware/efi/efivars
+GPREFS_FILE="gpu-power-prefs-fa4ce28d-b62f-4c99-9cc3-6815686e30f9"
+
+nvram_write() { # <data-hex> <description>  — data-hex: "01 00 00 00" (IGD) / "00 00 00 00" (DIS)
+  local data="$1" desc="$2"
+  local target="$EFIVARS/$GPREFS_FILE"
+  local attrs fmt ok=0 readback
+  if [ ! -d /sys/firmware/efi ]; then
+    echo "ERROR: no /sys/firmware/efi — you are not in EFI mode" >&2
+    exit 1
+  fi
+  if ! mount | grep -q "$EFIVARS"; then
+    sudo -n mount -t efivarfs efivarfs "$EFIVARS" 2>/dev/null \
+      || { echo "ERROR: could not mount $EFIVARS" >&2; exit 1; }
+  fi
+  echo "Writing gpu-power-prefs = $desc (commits on the next boot, NOT live)"
+  # attributes 07 00 00 00 (NV|BS|RT); fallback 07 00 00 80 (+ENHANCED_AUTH)
+  for attrs in "07 00 00 00" "07 00 00 80"; do
+    # printf "\x07\x00\x00\x00\x01\x00\x00\x00" — attrs + data (report 70 §2.2)
+    fmt="\\x${attrs// /\\x}\\x${data// /\\x}"
+    sudo -n chattr -i "$target" 2>/dev/null || true
+    if printf "$fmt" | sudo -n tee "$target" >/dev/null 2>&1; then
+      ok=1
+      echo "write OK (attributes $attrs)"
+      break
+    fi
+  done
+  [ "$ok" = 1 ] || { echo "ERROR: write rejected (EFI_ACCESS_DENIED / attr mismatch?)" >&2; exit 1; }
+  # verify by re-reading; if efivarfs does not show it → after the reboot
+  if [ -r "$target" ]; then
+    readback="$(dd if="$target" bs=1 skip=4 count=4 2>/dev/null | xxd -p)"
+    if [ "$readback" = "${data// /}" ]; then
+      echo "verification OK: read $readback"
+    else
+      echo "WARNING: read $readback instead of ${data// /} — verify after the reboot"
+    fi
+  else
+    echo "write OK, verify after the reboot (efivarfs does not show the variable)"
+  fi
+}
+
+nvram_reboot() { # <description>
+  local desc="$1" ans
+  read -r -p "Reboot now to switch the GPU to $desc? [y/N] " ans
+  case "$ans" in
+    t|T|tak|Tak|TAK|y|Y|yes|Yes|YES)
+      echo "Rebooting..."
+      sudo -n reboot
+      ;;
+    *)
+      echo "No reboot — the change takes effect after a manual reboot."
+      ;;
+  esac
+}
+
+case "$CMD" in
+  start)
+    sudo -n systemctl start reclocked
+    echo "reclocked started"
+    ;;
+  stop)
+    sudo -n systemctl stop reclocked
+    echo "reclocked stopped (restore exit-state)"
+    ;;
+  status)
+    sudo -n systemctl status reclocked --no-pager 2>&1 || true
+    echo "---"
+    "$HOME/Projects/nv-kepler/scripts/pstate.sh" status
+    echo "--- fans (applesmc) ---"
+    fb="/sys/devices/platform/applesmc.768"
+    for n in 1 2; do
+      printf "fan%s: %s RPM (target=%s, manual=%s, range %s-%s)\n" "$n" \
+        "$(cat $fb/fan${n}_input 2>/dev/null || echo '?')" \
+        "$(cat $fb/fan${n}_output 2>/dev/null || echo '?')" \
+        "$(cat $fb/fan${n}_manual 2>/dev/null || echo '?')" \
+        "$(cat $fb/fan${n}_min 2>/dev/null || echo '?')" \
+        "$(cat $fb/fan${n}_max 2>/dev/null || echo '?')"
+    done
+    # v5.10: case thermals ([fan-case]) — average °C + SOAK state (from the status JSON;
+    # missing fields with an old daemon → skip)
+    f="/run/reclocked/status"
+    ca="$(json_get "$f" fan_case_avg)"
+    cs="$(json_get "$f" fan_case_state)"
+    if [ -n "$ca" ]; then
+      printf "fan-case:   %s °C (state: %s)\n" "$ca" "$cs"
+    fi
+    [ -f /run/reclocked/fan-override ] && echo "fan-override: ACTIVE (auto frozen)" || echo "fan-override: none (auto)"
+    ;;
+  switch-status)
+    f="/run/reclocked/status"
+    if [ ! -f "$f" ]; then
+      echo "no $f — daemon (switchd) inactive?" >&2
+      exit 1
+    fi
+    # version from the "version" field in the status (single source: RECLKD_VERSION in cpp;
+    # with an old daemon without the field → fallback from the src/reclocked binary)
+    ver="$(json_get "$f" version)"
+    if [ -z "$ver" ] && [ -x "$(dirname "$0")/reclocked" ]; then
+      ver="$("$(dirname "$0")/reclocked" --version 2>/dev/null | sed -E 's/.*v([0-9.]+).*/\1/' )"
+    fi
+    echo "--- switchd (v${ver:-?}) ---"
+    printf "topology:        %s\n" "$(json_get "$f" topology)"
+    printf "dGPU power:      %s\n" "$(json_get "$f" dgpu_power)"
+    printf "target:          %s\n" "$(json_get "$f" target)"
+    printf "last action:     %s\n" "$(json_get "$f" last_action)"
+    printf "nvram_prefs:     %s\n" "$(json_get "$f" nvram_prefs)"
+    err="$(json_get "$f" last_error)"
+    if [ -n "$err" ]; then
+      printf "last error:      %s\n" "$err"
+    fi
+    # v5.15 (report 116): "dGPU dead" gate — power-on failed; automatic
+    # promotions blocked until dgpu-on (one attempt) or a reboot.
+    dd="$(json_get "$f" dgpu_dead)"
+    if [ "$dd" = "true" ]; then
+      printf "dgpu-dead gate:  ACTIVE since %s (rejected auto-promotions: %s)\n" \
+        "$(json_get "$f" dgpu_dead_since)" "$(json_get "$f" dgpu_dead_rejected)"
+      printf "  reason:        %s\n" "$(json_get "$f" dgpu_dead_reason)"
+      printf "  unlock:        reclockctl dgpu-on (one attempt) or a reboot\n"
+    fi
+    ;;
+  restart)
+    sudo -n systemctl restart reclocked
+    echo "reclocked restarted"
+    ;;
+  reload)
+    sudo -n systemctl kill -s HUP reclocked
+    echo "SIGHUP sent — the daemon re-reads the config (/etc/reclocked.conf)"
+    ;;
+  fan-off)
+    sudo -n mkdir -p /run/reclocked
+    sudo -n touch /run/reclocked/fan-override
+    echo "fan-override CREATED — fan auto is frozen (control manually: cusfan.sh / fullfan.sh)"
+    ;;
+  fan-on)
+    sudo -n rm -f /run/reclocked/fan-override
+    echo "fan-override REMOVED — the daemon takes over fan auto"
+    ;;
+  dgpu-on)
+    sudo -n mkdir -p /run/reclocked
+    # v5.15 (report 116): an explicit dgpu-on clears the "dGPU dead" gate — the daemon
+    # (after seeing a fresh override transition) makes ONE power-on attempt;
+    # its failure sets dead again (next attempt = dgpu-auto + dgpu-on).
+    # rm here = belt & braces (also works with a hung daemon).
+    if [ -f /run/reclocked/dgpu-dead ]; then
+      dreason="$(sudo -n cat /run/reclocked/dgpu-dead 2>/dev/null | cut -d' ' -f2-)"
+      sudo -n rm -f /run/reclocked/dgpu-dead
+      echo "dgpu-dead gate REMOVED (it was set, reason: ${dreason:-?})"
+    fi
+    printf 'on\n' | sudo -n tee /run/reclocked/dgpu-override >/dev/null
+    echo "dgpu-override: ON — the dGPU is forced on (the daemon holds power ON)"
+    ;;
+  dgpu-off)
+    sudo -n mkdir -p /run/reclocked
+    printf 'off\n' | sudo -n tee /run/reclocked/dgpu-override >/dev/null
+    echo "dgpu-override: OFF — the dGPU is forced off (the daemon holds power OFF)"
+    ;;
+  dgpu-auto)
+    sudo -n rm -f /run/reclocked/dgpu-override
+    echo "dgpu-override REMOVED — the daemon returns to auto (switchd policy)"
+    ;;
+  to-igd)
+    nvram_write "01 00 00 00" "IGD (iGPU)"
+    nvram_reboot "IGD (iGPU)"
+    ;;
+  to-dis)
+    nvram_write "00 00 00 00" "DIS (dGPU)"
+    nvram_reboot "DIS (dGPU)"
+    ;;
+  logs)
+    sudo -n journalctl -u reclocked -f --no-pager
+    ;;
+  -h|--help|help)
+    cat <<'EOF'
+reclockctl {start|stop|status|restart|reload|logs|fan-on|fan-off|switch-status|dgpu-on|dgpu-off|dgpu-auto|to-igd|to-dis}
+  start        — start the daemon
+  stop         — stop (restore exit-state + fan auto)
+  status       — systemd status + pstate + fans
+  restart      — restart
+  reload       — SIGHUP (re-read the config without a restart)
+  logs         — journalctl -f
+  fan-on       — remove the fan-override (daemon takes over fan auto)
+  fan-off      — fan-override (freeze auto; control manually)
+  switch-status — switchd status (v5.15): topology, dGPU power, target, nvram_prefs
+  dgpu-on      — override: force dGPU ON (dgpu-override flag-file); clears the
+                 dgpu-dead gate (v5.15) and makes ONE power-on attempt
+  dgpu-off     — override: force dGPU OFF (dgpu-override flag-file)
+  dgpu-auto    — remove the dgpu-override (the daemon returns to auto; after a failed
+                 dgpu-on: first this, then dgpu-on again = a fresh attempt)
+  to-igd       — NVRAM gpu-power-prefs=IGD + reboot (user-confirmed)
+  to-dis       — NVRAM gpu-power-prefs=DIS + reboot (user-confirmed)
+EOF
+    ;;
+  *)
+    echo "Unknown command: $CMD" >&2
+    echo "Usage: reclockctl {start|stop|status|restart|reload|logs|fan-on|fan-off|switch-status|dgpu-on|dgpu-off|dgpu-auto|to-igd|to-dis}" >&2
+    exit 1
+    ;;
+esac

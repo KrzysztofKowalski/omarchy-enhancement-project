@@ -1,0 +1,639 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 5/5] brcmfmac: pcie: BCM4360 phase5 test instrumentation (T276/T277/T278/T298/T305/T306)
+
+BCM4360 bring-up instrumentation ported from kimptoc/bcm4360-re
+phase5 (base v6.12; the reference tree only contains T276/277/278/298;
+T305/T306 were specified in RESUME_NOTES design docs and the
+fire-t305-t306.sh script). Six module params, all default 0 and gated
+on chip == BRCM_CC_4360_CHIP_ID, so every other chip's behaviour is
+unchanged:
+
+- bcm4360_test276_shared_info: write a shared_info handshake struct at
+  TCM[ramsize-0x2F5C] (magic 0xA5A5A5A5) plus a 64 KiB olmsg DMA ring
+  buffer before ARM release, then poll the response fields for 2 s
+  post-release.
+- bcm4360_test277_console_decode: dump the 4-dword console struct at
+  the fw-published pointer (pre-write snapshot at 0x9af88, post-poll
+  at si[+0x010]) plus 128 B of the console buffer.
+- bcm4360_test278_console_periodic: seed the console-delta cursor with
+  a full dump, then periodic delta dumps at t+500ms, t+5s, t+30s,
+  t+90s.
+- bcm4360_test298_isr_walk: BAR2-only walk of the RTE scheduler ISR
+  list at TCM[0x629A4] + sched_ctx[+0xCC] + pending-events word, at
+  each stage.
+- bcm4360_test305_premask_with_select: pre-set_active MAILBOXMASK
+  enable WITH explicit select_core(PCIE2) before
+  brcmf_pcie_intr_enable (bcmdhd si_corereg pattern); logs
+  BAR0_WINDOW before/after, MBM pre/post and a SUMMARY verdict
+  (WRITE_LANDED/WRITE_DROPPED/UNEXPECTED_VALUE).
+- bcm4360_test306_cfg_dump: read-only PCI config dump 0x40..0xFF
+  (48 dwords) at 3 stages (pre-set_active/post-set_active/
+  post-T276-poll), highlighting the vendor area 0x94/0xB4/0xB8.
+
+Adaptations for 7.1.8: the reference restructured download_fw_nvram
+(moved the brcmf_chip_set_active call out of exit_download_state);
+7.1.8 keeps the upstream structure, so the pre-release block hooks
+between the NVRAM write and exit_download_state(), and the
+post-release block (2 s poll, T277 decode, T306 stages 2-3, T278/T298
+ladder) hooks right after exit_download_state() returns. The
+reference's 120 s test.238 dwell ladder is reduced to the four
+T278/T298 stages the fire script actually uses. T305/T306 did not
+exist in the reference tree; they are implemented from the
+RESUME_NOTES design specs, wired into the pre-set_active block per
+the fire script's description, each gated on its own param. Two
+forward declarations (brcmf_pcie_select_core, brcmf_pcie_intr_enable)
+are added for the T305 probe, which sits ahead of their definitions.
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 547 insertions(+), 0 deletions(-)
+diff --git a/brcmfmac/pcie.c b/brcmfmac/pcie.c
+index 9a0bdc8..c4a4faf 100644
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -82,8 +83,68 @@ MODULE_FIRMWARE(BRCMF_FW_DEFAULT_PATH "brcmfmac*-pcie.*.bin");
+ MODULE_FIRMWARE(BRCMF_FW_DEFAULT_PATH "brcmfmac*-pcie.*.clm_blob");
+ MODULE_FIRMWARE(BRCMF_FW_DEFAULT_PATH "brcmfmac*-pcie.*.txcap_blob");
+ 
++/* ===== BCM4360 phase5 bring-up test instrumentation (port of kimptoc
++ * bcm4360-re test.276/277/278/298/305/306; inert unless 4360 + param=1) ===== */
++
++/* BCM4360 test.276: shared_info handshake + olmsg DMA buffer written to
++ * TCM[ramsize-0x2F5C] before ARM release; 2 s post-release poll. */
++#define BCM4360_T276_SHARED_INFO_OFFSET	0x2F5C
++#define BCM4360_T276_SHARED_INFO_SIZE	0x2F3C
++#define BCM4360_T276_SI_MAGIC_START	0x000
++#define BCM4360_T276_SI_DMA_LO		0x004
++#define BCM4360_T276_SI_DMA_HI		0x008
++#define BCM4360_T276_SI_BUF_SIZE	0x00C
++#define BCM4360_T276_SI_FW_STATUS	0x010	/* fw-writable */
++#define BCM4360_T276_SI_FW_INIT_DONE	0x2028
++#define BCM4360_T276_SI_MAGIC_END	0x2F38
++#define BCM4360_T276_MAGIC_START_VAL	0xA5A5A5A5
++#define BCM4360_T276_MAGIC_END_VAL	0x5A5A5A5A
++#define BCM4360_T276_OLMSG_BUF_SIZE	0x10000	/* 64 KB */
++#define BCM4360_T276_OLMSG_RING_SIZE	0x7800	/* 30 KB per ring */
++#define BCM4360_T276_OLMSG_HDR_SIZE	0x20	/* 2 rings * 16 B header */
++
++/* BCM4360 test.277: console struct decode (4 dwords: buf_addr, size,
++ * wr_idx, rd_addr) + 128 B buffer dump. */
++#define BCM4360_T277_STRUCT_DWORDS	4
++#define BCM4360_T277_BUFFER_DUMP_BYTES	128
++
++/* BCM4360 test.278: periodic console delta dump. */
++#define BCM4360_T278_CHUNK_BYTES	128	/* per pr_emerg line */
++#define BCM4360_T278_MAX_BYTES_PER_CALL	1024	/* printk safety cap */
++
++/* BCM4360 test.298: ISR list walk (BAR2-only). */
++#define BCM4360_T298_RAMSIZE_BOUND	0xA0000
++#define BCM4360_T298_MAX_NODES		16
++#define BCM4360_T298_LIST_HEAD_ADDR	0x629A4
++#define BCM4360_T298_SCHED_PTR_ADDR	0x6296C
++
++static int bcm4360_test276_shared_info;
++module_param(bcm4360_test276_shared_info, int, 0644);
++MODULE_PARM_DESC(bcm4360_test276_shared_info, "BCM4360 test.276: write shared_info handshake at TCM[ramsize-0x2F5C] and allocate 64 KB olmsg DMA buffer before ARM release; poll response for 2 s post-release. (1=enable, 0=off)");
++
++static int bcm4360_test277_console_decode;
++module_param(bcm4360_test277_console_decode, int, 0644);
++MODULE_PARM_DESC(bcm4360_test277_console_decode, "BCM4360 test.277: dump console struct at fw-published pointer before and after the 2s poll, plus 128 B of the buffer it points to if buf_addr is a valid TCM address. Requires bcm4360_test276_shared_info=1. (1=enable, 0=off)");
++
++static int bcm4360_test278_console_periodic;
++module_param(bcm4360_test278_console_periodic, int, 0644);
++MODULE_PARM_DESC(bcm4360_test278_console_periodic, "BCM4360 test.278: periodic console delta dump at t+500ms, t+5s, t+30s, t+90s. Requires bcm4360_test276_shared_info=1 and bcm4360_test277_console_decode=1. (1=enable, 0=off)");
++
++static int bcm4360_test298_isr_walk;
++module_param(bcm4360_test298_isr_walk, int, 0644);
++MODULE_PARM_DESC(bcm4360_test298_isr_walk, "BCM4360 test.298: BAR2-only dynamic walk of ISR list at TCM[0x629A4] (head ptr) + sched_ctx[+0xCC] + pending-events word. Per-stage. Decoder: fn=0x1C99=pciedngl_isr, fn=0x0B05=RTE-CC-class ISR, fn=0x1146D=wlc_isr. (1=enable, 0=off)");
++
++static int bcm4360_test305_premask_with_select;
++module_param(bcm4360_test305_premask_with_select, int, 0644);
++MODULE_PARM_DESC(bcm4360_test305_premask_with_select, "BCM4360 test.305: pre-set_active MAILBOXMASK enable WITH explicit select_core(PCIE2): read BAR0_WINDOW before/after, MAILBOXMASK pre/post brcmf_pcie_intr_enable, then SUMMARY with verdict (WRITE_LANDED/WRITE_DROPPED/UNEXPECTED_VALUE). (1=enable, 0=off)");
++
++static int bcm4360_test306_cfg_dump;
++module_param(bcm4360_test306_cfg_dump, int, 0644);
++MODULE_PARM_DESC(bcm4360_test306_cfg_dump, "BCM4360 test.306: read-only PCI config dump 0x40..0xFF at 3 stages (pre-set_active/post-set_active/post-T276-poll), highlighting 0x94/0xB4/0xB8 vendor area. (1=enable, 0=off)");
++
+ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
++	BRCMF_FW_ENTRY(BRCM_CC_4360_CHIP_ID, 0xFFFFFFFF, 4360),
+ 	BRCMF_FW_ENTRY(BRCM_CC_43465_CHIP_ID, 0xFFFFFFF0, 4366C),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4350_CHIP_ID, 0x000000FF, 4350C),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4350_CHIP_ID, 0xFFFFFF00, 4350),
+@@ -358,6 +419,11 @@ struct brcmf_pciedev_info {
+ 	struct brcmf_mp_device *settings;
+ 	struct brcmf_otp_params otp;
+ 	bool fwseed;
++	/* BCM4360 test.276: olmsg DMA buffer handed to fw via shared_info. */
++	void *t276_olmsg_buf;
++	dma_addr_t t276_olmsg_dma;
++	/* BCM4360 test.278: cursor for delta console dumps. */
++	u32 t278_prev_write_idx;
+ #ifdef DEBUG
+ 	u32 console_interval;
+ 	bool console_active;
+@@ -579,6 +645,210 @@ brcmf_pcie_write_ram32(struct brcmf_pciedev_info *devinfo, u32 mem_offset,
+ }
+ 
+ 
++/* Forward decls for the BCM4360 probe helpers below (defined later in
++ * this file, after the register-access helpers). */
++static void brcmf_pcie_select_core(struct brcmf_pciedev_info *devinfo,
++				   u16 coreid);
++static void brcmf_pcie_intr_enable(struct brcmf_pciedev_info *devinfo);
++
++/* BCM4360 test.278: re-read console struct at struct_ptr, validate, dump
++ * [buf_addr + *prev_idx .. buf_addr + write_idx) as ASCII-escaped 128 B
++ * chunks (capped at 1024 B per call), advance *prev_idx. On any validation
++ * failure or empty delta, log a one-line reason and return. */
++static void
++bcm4360_t278_dump_console_delta(struct brcmf_pciedev_info *devinfo,
++				const char *stage_tag,
++				u32 struct_ptr,
++				u32 *prev_idx_p)
++{
++	u32 t278_struct[BCM4360_T277_STRUCT_DWORDS];
++	u32 buf_addr, buf_size, write_idx;
++	u32 prev = *prev_idx_p;
++	u32 delta, to_dump, i, off;
++
++	if (struct_ptr == 0 || struct_ptr >= devinfo->ci->ramsize) {
++		pr_emerg("BCM4360 test.278: %s struct_ptr 0x%08x invalid; skipping\n",
++			 stage_tag, struct_ptr);
++		return;
++	}
++	for (i = 0; i < BCM4360_T277_STRUCT_DWORDS; i++)
++		t278_struct[i] = brcmf_pcie_read_ram32(devinfo,
++						       struct_ptr + i * 4);
++	buf_addr  = t278_struct[0];
++	buf_size  = t278_struct[1];
++	write_idx = t278_struct[2];
++	if (buf_addr == 0 || buf_addr >= devinfo->ci->ramsize ||
++	    buf_size == 0 || buf_size > devinfo->ci->ramsize ||
++	    write_idx > buf_size) {
++		pr_emerg("BCM4360 test.278: %s struct invalid (buf_addr=0x%08x buf_size=0x%08x wr_idx=0x%08x); skipping\n",
++			 stage_tag, buf_addr, buf_size, write_idx);
++		return;
++	}
++	if (write_idx == prev) {
++		pr_emerg("BCM4360 test.278: %s no new log (wr_idx=%u unchanged)\n",
++			 stage_tag, write_idx);
++		return;
++	}
++	if (write_idx < prev) {
++		/* Ring wrapped or reset. Log and restart from 0. */
++		pr_emerg("BCM4360 test.278: %s wr_idx=%u < prev=%u (wrap or reset); restarting cursor at 0\n",
++			 stage_tag, write_idx, prev);
++		prev = 0;
++	}
++	delta = write_idx - prev;
++	to_dump = min_t(u32, delta, (u32)BCM4360_T278_MAX_BYTES_PER_CALL);
++	pr_emerg("BCM4360 test.278: %s wr_idx=%u prev=%u delta=%u dumping=%u bytes\n",
++		 stage_tag, write_idx, prev, delta, to_dump);
++
++	for (off = 0; off < to_dump; off += BCM4360_T278_CHUNK_BYTES) {
++		u8 chunk[BCM4360_T278_CHUNK_BYTES];
++		u32 *u32p = (u32 *)chunk;
++		u32 this_bytes = min_t(u32, (u32)BCM4360_T278_CHUNK_BYTES,
++				       to_dump - off);
++		u32 this_dwords = (this_bytes + 3) / 4;
++		u32 j;
++
++		for (j = 0; j < this_dwords; j++)
++			u32p[j] = brcmf_pcie_read_ram32(
++				devinfo, buf_addr + prev + off + j * 4);
++		pr_emerg("BCM4360 test.278: %s chunk@+%u (%u B): %*pE\n",
++			 stage_tag, prev + off, this_bytes,
++			 this_bytes, chunk);
++	}
++	if (delta > BCM4360_T278_MAX_BYTES_PER_CALL)
++		pr_emerg("BCM4360 test.278: %s ... truncated %u bytes (wr_idx=%u, dumped up to %u)\n",
++			 stage_tag, delta - BCM4360_T278_MAX_BYTES_PER_CALL,
++			 write_idx,
++			 prev + BCM4360_T278_MAX_BYTES_PER_CALL);
++	*prev_idx_p = write_idx;
++}
++
++/* BCM4360 test.298: walk the RTE scheduler ISR list at TCM[0x629A4],
++ * log each node {next, fn, arg, mask}, then sched_ctx[+0xCC] and the
++ * pending-events word. BAR2-only (no BAR0/select_core/wrapper MMIO). */
++#define BCM4360_T298_ISR_WALK(tag) do { \
++	if (bcm4360_test298_isr_walk) { \
++		u32 _t298_head = brcmf_pcie_read_ram32(devinfo, \
++			BCM4360_T298_LIST_HEAD_ADDR); \
++		u32 _t298_sched = brcmf_pcie_read_ram32(devinfo, \
++			BCM4360_T298_SCHED_PTR_ADDR); \
++		u32 _t298_node = _t298_head; \
++		u32 _t298_n; \
++		u32 _t298_cc = 0xFFFFFFFF; \
++		u32 _t298_evp = 0, _t298_pending = 0; \
++		pr_emerg("BCM4360 test.298: %s head=0x%08x sched_ctx=0x%08x\n", \
++			 tag, _t298_head, _t298_sched); \
++		for (_t298_n = 0; _t298_n < BCM4360_T298_MAX_NODES; _t298_n++) { \
++			u32 _t298_next, _t298_fn, _t298_arg, _t298_mask; \
++			if (_t298_node == 0 || \
++			    _t298_node >= BCM4360_T298_RAMSIZE_BOUND) { \
++				pr_emerg("BCM4360 test.298: %s node[%u] end ptr=0x%08x\n", \
++					 tag, _t298_n, _t298_node); \
++				break; \
++			} \
++			_t298_next = brcmf_pcie_read_ram32(devinfo, \
++				_t298_node + 0x0); \
++			_t298_fn   = brcmf_pcie_read_ram32(devinfo, \
++				_t298_node + 0x4); \
++			_t298_arg  = brcmf_pcie_read_ram32(devinfo, \
++				_t298_node + 0x8); \
++			_t298_mask = brcmf_pcie_read_ram32(devinfo, \
++				_t298_node + 0xC); \
++			pr_emerg("BCM4360 test.298: %s node[%u]@0x%08x next=0x%08x fn=0x%08x arg=0x%08x mask=0x%08x\n", \
++				 tag, _t298_n, _t298_node, _t298_next, \
++				 _t298_fn, _t298_arg, _t298_mask); \
++			_t298_node = _t298_next; \
++		} \
++		if (_t298_sched != 0 && \
++		    _t298_sched < BCM4360_T298_RAMSIZE_BOUND) { \
++			_t298_cc = brcmf_pcie_read_ram32(devinfo, \
++				_t298_sched + 0xCC); \
++			_t298_evp = brcmf_pcie_read_ram32(devinfo, \
++				_t298_sched + 0x358); \
++			if (_t298_evp != 0 && \
++			    _t298_evp < BCM4360_T298_RAMSIZE_BOUND) \
++				_t298_pending = brcmf_pcie_read_ram32(devinfo, \
++					_t298_evp + 0x100); \
++		} \
++		pr_emerg("BCM4360 test.298: %s SUMMARY count=%u sched_cc=0x%08x events_p=0x%08x pending=0x%08x\n", \
++			 tag, _t298_n, _t298_cc, _t298_evp, _t298_pending); \
++	} \
++} while (0)
++
++/* BCM4360 test.305: pre-set_active MAILBOXMASK enable with explicit
++ * select_core(PCIE2) before brcmf_pcie_intr_enable (bcmdhd pattern:
++ * si_corereg selects the bus core before writing PCIMailBoxMask). */
++static void bcm4360_t305_premask_probe(struct brcmf_pciedev_info *devinfo)
++{
++	u32 win_before, win_after, mbm_pre, mbm_post;
++	u32 expected = devinfo->reginfo->int_d2h_db |
++		       devinfo->reginfo->int_fn0;
++	const char *verdict;
++
++	pci_read_config_dword(devinfo->pdev, BRCMF_PCIE_BAR0_WINDOW,
++			      &win_before);
++	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
++	pci_read_config_dword(devinfo->pdev, BRCMF_PCIE_BAR0_WINDOW,
++			      &win_after);
++	pr_emerg("BCM4360 test.305: BAR0_WINDOW before=0x%08x after=0x%08x (expect PCIE2 core base 0x18102000)\n",
++		 win_before, win_after);
++	mbm_pre = brcmf_pcie_read_reg32(devinfo,
++					devinfo->reginfo->mailboxmask);
++	pr_emerg("BCM4360 test.305: pre-enable MAILBOXMASK=0x%08x (expect 0x318 if PCIE2 reachable)\n",
++		 mbm_pre);
++	brcmf_pcie_intr_enable(devinfo);
++	mbm_post = brcmf_pcie_read_reg32(devinfo,
++					 devinfo->reginfo->mailboxmask);
++	if (mbm_post == expected)
++		verdict = "WRITE_LANDED";
++	else if (mbm_post == mbm_pre)
++		verdict = "WRITE_DROPPED";
++	else
++		verdict = "UNEXPECTED_VALUE";
++	pr_emerg("BCM4360 test.305: SUMMARY win_before=0x%08x win_after=0x%08x mbm_pre=0x%08x mbm_post=0x%08x verdict=%s\n",
++		 win_before, win_after, mbm_pre, mbm_post, verdict);
++}
++
++/* BCM4360 test.306: read-only PCI config dump 0x40..0xFF (48 dwords) with
++ * the vendor-area 0x94/0xB4/0xB8 highlighted; three stages. */
++static void bcm4360_t306_cfg_dump(struct brcmf_pciedev_info *devinfo,
++				  const char *stage)
++{
++	static u32 s_cfg94[3], s_cfgB4[3], s_cfgB8[3];
++	static int s_idx;
++	u32 cfg94, cfgB4, cfgB8;
++	int i, j;
++
++	for (i = 0; i < 6; i++) {
++		u32 d[8];
++		u32 base = 0x40 + i * 0x20;
++
++		for (j = 0; j < 8; j++)
++			pci_read_config_dword(devinfo->pdev, base + j * 4,
++					      &d[j]);
++		pr_emerg("BCM4360 test.306: %s cfg[0x%02x..0x%02x] %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			 stage, base, base + 0x1c, d[0], d[1], d[2], d[3],
++			 d[4], d[5], d[6], d[7]);
++	}
++	pci_read_config_dword(devinfo->pdev, 0x94, &cfg94);
++	pci_read_config_dword(devinfo->pdev, 0xB4, &cfgB4);
++	pci_read_config_dword(devinfo->pdev, 0xB8, &cfgB8);
++	if (s_idx < 3) {
++		s_cfg94[s_idx] = cfg94;
++		s_cfgB4[s_idx] = cfgB4;
++		s_cfgB8[s_idx] = cfgB8;
++	}
++	s_idx++;
++	pr_emerg("BCM4360 test.306: %s SUMMARY cfg94=0x%08x cfgB4=0x%08x cfgB8=0x%08x\n",
++		 stage, cfg94, cfgB4, cfgB8);
++	if (s_idx >= 3)
++		pr_emerg("BCM4360 test.306: SUMMARY cfg94=[0x%08x/0x%08x/0x%08x] cfgB4=[0x%08x/0x%08x/0x%08x] cfgB8=[0x%08x/0x%08x/0x%08x] (stages: pre-set_active/post-set_active/post-T276-poll)\n",
++			 s_cfg94[0], s_cfg94[1], s_cfg94[2],
++			 s_cfgB4[0], s_cfgB4[1], s_cfgB4[2],
++			 s_cfgB8[0], s_cfgB8[1], s_cfgB8[2]);
++}
++
++
+ static void
+ brcmf_pcie_copy_dev_tomem(struct brcmf_pciedev_info *devinfo, u32 mem_offset,
+ 			  void *dstaddr, u32 len)
+@@ -1750,6 +2050,127 @@ static int brcmf_pcie_download_fw_nvram(struct brcmf_pciedev_info *devinfo,
+ 			  devinfo->nvram_name);
+ 	}
+ 
++	/* ==== BCM4360 phase5 test instrumentation: pre-ARM-release ==== */
++	if (devinfo->ci->chip == BRCM_CC_4360_CHIP_ID) {
++		if (bcm4360_test276_shared_info) {
++			u32 t276_base = devinfo->ci->ramsize -
++					BCM4360_T276_SHARED_INFO_OFFSET;
++			void *t276_buf = NULL;
++			dma_addr_t t276_dma = 0;
++			u32 t276_i;
++
++			/* test.277: pre-write dump of the Phase 4B observed
++			 * console struct pointer 0x9af88. */
++			if (bcm4360_test277_console_decode) {
++				u32 t277_struct[BCM4360_T277_STRUCT_DWORDS];
++				u32 t277_j;
++
++				for (t277_j = 0;
++				     t277_j < BCM4360_T277_STRUCT_DWORDS;
++				     t277_j++)
++					t277_struct[t277_j] =
++						brcmf_pcie_read_ram32(
++							devinfo,
++							0x9af88 +
++							t277_j * 4);
++				pr_emerg("BCM4360 test.277: PRE-WRITE struct@0x9af88 buf_addr=0x%08x buf_size=0x%08x write_idx=0x%08x read_addr=0x%08x\n",
++					 t277_struct[0], t277_struct[1],
++					 t277_struct[2], t277_struct[3]);
++			}
++
++			t276_buf = dma_alloc_coherent(&devinfo->pdev->dev,
++						      BCM4360_T276_OLMSG_BUF_SIZE,
++						      &t276_dma, GFP_KERNEL);
++			if (!t276_buf) {
++				pr_emerg("BCM4360 test.276: dma_alloc_coherent FAILED; skipping shared_info write\n");
++			} else {
++				__le32 *p = (__le32 *)t276_buf;
++
++				memset(t276_buf, 0, BCM4360_T276_OLMSG_BUF_SIZE);
++				/* olmsg ring header: ring0 (host->fw),
++				 * ring1 (fw->host). Each {data_off, size,
++				 * rd_ptr, wr_ptr}. */
++				p[0] = cpu_to_le32(BCM4360_T276_OLMSG_HDR_SIZE);
++				p[1] = cpu_to_le32(BCM4360_T276_OLMSG_RING_SIZE);
++				p[2] = 0;
++				p[3] = 0;
++				p[4] = cpu_to_le32(BCM4360_T276_OLMSG_HDR_SIZE +
++						   BCM4360_T276_OLMSG_RING_SIZE);
++				p[5] = cpu_to_le32(BCM4360_T276_OLMSG_RING_SIZE);
++				p[6] = 0;
++				p[7] = 0;
++
++				/* Zero shared_info TCM region before writing
++				 * known fields. */
++				for (t276_i = 0;
++				     t276_i < BCM4360_T276_SHARED_INFO_SIZE / 4;
++				     t276_i++)
++					brcmf_pcie_write_ram32(devinfo,
++						t276_base + t276_i * 4, 0);
++
++				brcmf_pcie_write_ram32(devinfo,
++					t276_base + BCM4360_T276_SI_MAGIC_START,
++					BCM4360_T276_MAGIC_START_VAL);
++				brcmf_pcie_write_ram32(devinfo,
++					t276_base + BCM4360_T276_SI_DMA_LO,
++					lower_32_bits(t276_dma));
++				brcmf_pcie_write_ram32(devinfo,
++					t276_base + BCM4360_T276_SI_DMA_HI,
++					upper_32_bits(t276_dma));
++				brcmf_pcie_write_ram32(devinfo,
++					t276_base + BCM4360_T276_SI_BUF_SIZE,
++					BCM4360_T276_OLMSG_BUF_SIZE);
++				brcmf_pcie_write_ram32(devinfo,
++					t276_base + BCM4360_T276_SI_FW_INIT_DONE,
++					0);
++				brcmf_pcie_write_ram32(devinfo,
++					t276_base + BCM4360_T276_SI_MAGIC_END,
++					BCM4360_T276_MAGIC_END_VAL);
++
++				pr_emerg("BCM4360 test.276: shared_info written at TCM[0x%05x] olmsg_dma=0x%llx size=%d\n",
++					 t276_base,
++					 (unsigned long long)t276_dma,
++					 BCM4360_T276_OLMSG_BUF_SIZE);
++				pr_emerg("BCM4360 test.276: readback magic_start=0x%08x (exp 0x%08x) dma_lo=0x%08x (exp 0x%08x) dma_hi=0x%08x (exp 0x%08x)\n",
++					 brcmf_pcie_read_ram32(devinfo,
++						t276_base),
++					 BCM4360_T276_MAGIC_START_VAL,
++					 brcmf_pcie_read_ram32(devinfo,
++						t276_base +
++						BCM4360_T276_SI_DMA_LO),
++					 lower_32_bits(t276_dma),
++					 brcmf_pcie_read_ram32(devinfo,
++						t276_base +
++						BCM4360_T276_SI_DMA_HI),
++					 upper_32_bits(t276_dma));
++				pr_emerg("BCM4360 test.276: readback buf_size=0x%08x (exp 0x%08x) fw_init_done=0x%08x (exp 0) magic_end=0x%08x (exp 0x%08x)\n",
++					 brcmf_pcie_read_ram32(devinfo,
++						t276_base +
++						BCM4360_T276_SI_BUF_SIZE),
++					 BCM4360_T276_OLMSG_BUF_SIZE,
++					 brcmf_pcie_read_ram32(devinfo,
++						t276_base +
++						BCM4360_T276_SI_FW_INIT_DONE),
++					 brcmf_pcie_read_ram32(devinfo,
++						t276_base +
++						BCM4360_T276_SI_MAGIC_END),
++					 BCM4360_T276_MAGIC_END_VAL);
++
++				devinfo->t276_olmsg_buf = t276_buf;
++				devinfo->t276_olmsg_dma = t276_dma;
++			}
++		}
++
++		if (bcm4360_test305_premask_with_select)
++			bcm4360_t305_premask_probe(devinfo);
++
++		if (bcm4360_test306_cfg_dump)
++			bcm4360_t306_cfg_dump(devinfo, "pre-set_active");
++
++		if (bcm4360_test298_isr_walk)
++			BCM4360_T298_ISR_WALK("pre-set_active");
++	}
++
+ 	sharedram_addr_written = brcmf_pcie_read_ram32(devinfo,
+ 						       devinfo->ci->ramsize -
+ 						       4);
+@@ -1758,6 +2179,163 @@ static int brcmf_pcie_download_fw_nvram(struct brcmf_pciedev_info *devinfo,
+ 	if (err)
+ 		return err;
+ 
++	/* ==== BCM4360 phase5 test instrumentation: post-ARM-release ==== */
++	if (devinfo->ci->chip == BRCM_CC_4360_CHIP_ID) {
++		u32 t276_base = devinfo->ci->ramsize -
++				BCM4360_T276_SHARED_INFO_OFFSET;
++
++		if (bcm4360_test306_cfg_dump)
++			bcm4360_t306_cfg_dump(devinfo, "post-set_active");
++
++		if (bcm4360_test298_isr_walk)
++			BCM4360_T298_ISR_WALK("post-set_active");
++
++		/* test.276: 2 s post-ARM-release poll of shared_info
++		 * response fields. Log on any change, continue for the
++		 * full 2 s (Phase 4B showed both TCM updates and mailbox
++		 * signals). */
++		if (bcm4360_test276_shared_info && devinfo->t276_olmsg_buf) {
++			u32 last_fw_status = 0xdeadbeef;
++			u32 last_fw_init = 0xdeadbeef;
++			u32 last_mbxint = 0xdeadbeef;
++			u32 t276_i;
++
++			pr_emerg("BCM4360 test.276: entering 2s poll post-set_active\n");
++			for (t276_i = 0; t276_i < 200; t276_i++) {
++				u32 fw_status = brcmf_pcie_read_ram32(
++					devinfo,
++					t276_base + BCM4360_T276_SI_FW_STATUS);
++				u32 fw_init = brcmf_pcie_read_ram32(
++					devinfo,
++					t276_base + BCM4360_T276_SI_FW_INIT_DONE);
++				u32 mbxint = brcmf_pcie_read_reg32(
++					devinfo,
++					BRCMF_PCIE_PCIE2REG_MAILBOXINT);
++
++				if (fw_status != last_fw_status ||
++				    fw_init != last_fw_init ||
++				    mbxint != last_mbxint) {
++					pr_emerg("BCM4360 test.276: t+%dms si[+0x010]=0x%08x fw_done=0x%08x mbxint=0x%08x\n",
++						 t276_i * 10, fw_status,
++						 fw_init, mbxint);
++					last_fw_status = fw_status;
++					last_fw_init = fw_init;
++					last_mbxint = mbxint;
++				}
++				msleep(10);
++			}
++			pr_emerg("BCM4360 test.276: poll-end si[+0x010]=0x%08x fw_done=0x%08x mbxint=0x%08x\n",
++				 brcmf_pcie_read_ram32(devinfo,
++					t276_base + BCM4360_T276_SI_FW_STATUS),
++				 brcmf_pcie_read_ram32(devinfo,
++					t276_base + BCM4360_T276_SI_FW_INIT_DONE),
++				 brcmf_pcie_read_reg32(devinfo,
++					BRCMF_PCIE_PCIE2REG_MAILBOXINT));
++
++			/* test.277: post-poll console decode. */
++			if (bcm4360_test277_console_decode) {
++				u32 t277_ptr = brcmf_pcie_read_ram32(
++					devinfo,
++					t276_base + BCM4360_T276_SI_FW_STATUS);
++				u32 t277_struct[BCM4360_T277_STRUCT_DWORDS];
++				u32 t277_j;
++
++				pr_emerg("BCM4360 test.277: POST-POLL struct-ptr from si[+0x010]=0x%08x\n",
++					 t277_ptr);
++
++				if (t277_ptr == 0 ||
++				    t277_ptr >= devinfo->ci->ramsize) {
++					pr_emerg("BCM4360 test.277: POST-POLL struct-ptr not a valid TCM address (ramsize=0x%x); skipping struct read\n",
++						 devinfo->ci->ramsize);
++				} else {
++					for (t277_j = 0;
++					     t277_j < BCM4360_T277_STRUCT_DWORDS;
++					     t277_j++)
++						t277_struct[t277_j] =
++							brcmf_pcie_read_ram32(
++								devinfo,
++								t277_ptr +
++								t277_j * 4);
++					pr_emerg("BCM4360 test.277: POST-POLL struct@0x%08x buf_addr=0x%08x buf_size=0x%08x write_idx=0x%08x read_addr=0x%08x\n",
++						 t277_ptr, t277_struct[0],
++						 t277_struct[1], t277_struct[2],
++						 t277_struct[3]);
++
++					/* If buf_addr is a valid TCM address,
++					 * dump 128 B of the buffer with
++					 * ASCII escaping. */
++					if (t277_struct[0] != 0 &&
++					    t277_struct[0] <
++							devinfo->ci->ramsize &&
++					    t277_struct[1] >=
++						BCM4360_T277_BUFFER_DUMP_BYTES) {
++						u8 chunk[BCM4360_T277_BUFFER_DUMP_BYTES];
++						u32 *u32p = (u32 *)chunk;
++						u32 t277_k;
++
++						for (t277_k = 0;
++						     t277_k < BCM4360_T277_BUFFER_DUMP_BYTES / 4;
++						     t277_k++)
++							u32p[t277_k] =
++								brcmf_pcie_read_ram32(
++									devinfo,
++									t277_struct[0] +
++									t277_k * 4);
++						pr_emerg("BCM4360 test.277: POST-POLL console buffer @0x%08x: %*pE\n",
++							 t277_struct[0],
++							 BCM4360_T277_BUFFER_DUMP_BYTES,
++							 chunk);
++					}
++				}
++			}
++		}
++
++		if (bcm4360_test306_cfg_dump)
++			bcm4360_t306_cfg_dump(devinfo, "post-T276-poll");
++
++		if (bcm4360_test298_isr_walk)
++			BCM4360_T298_ISR_WALK("post-T276-poll");
++
++		/* test.278: seed the console-delta cursor (prev=0 -> full
++		 * dump), then periodic delta dumps at t+500ms..t+90s. */
++		if (bcm4360_test278_console_periodic &&
++		    bcm4360_test277_console_decode)
++			bcm4360_t278_dump_console_delta(devinfo,
++				"post-T276-poll",
++				brcmf_pcie_read_ram32(devinfo,
++					t276_base + BCM4360_T276_SI_FW_STATUS),
++				&devinfo->t278_prev_write_idx);
++
++		if (bcm4360_test278_console_periodic ||
++		    bcm4360_test298_isr_walk) {
++			int t278_stage;
++
++			for (t278_stage = 0; t278_stage < 4; t278_stage++) {
++				const char *t278_tag;
++				u32 t278_delay;
++
++				switch (t278_stage) {
++				case 0: t278_tag = "t+500ms"; t278_delay = 500; break;
++				case 1: t278_tag = "t+5s"; t278_delay = 4500; break;
++				case 2: t278_tag = "t+30s"; t278_delay = 25000; break;
++				case 3: t278_tag = "t+90s"; t278_delay = 60000; break;
++				default: t278_tag = "?"; t278_delay = 0; break;
++				}
++				msleep(t278_delay);
++				if (bcm4360_test298_isr_walk)
++					BCM4360_T298_ISR_WALK(t278_tag);
++				if (bcm4360_test278_console_periodic &&
++				    bcm4360_test277_console_decode)
++					bcm4360_t278_dump_console_delta(
++						devinfo, t278_tag,
++						brcmf_pcie_read_ram32(devinfo,
++							t276_base +
++							BCM4360_T276_SI_FW_STATUS),
++						&devinfo->t278_prev_write_idx);
++			}
++		}
++	}
++
+ 	brcmf_dbg(PCIE, "Wait for FW init\n");
+ 	sharedram_addr = sharedram_addr_written;
+ 	loop_counter = BRCMF_PCIE_FW_UP_TIMEOUT / 50;
+--
+2.39.2

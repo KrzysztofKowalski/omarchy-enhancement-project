@@ -1,0 +1,195 @@
+diff --git a/reclocked/reclocked.cpp b/reclocked/reclocked.cpp
+index 7163b56..955d778 100644
+--- a/reclocked/reclocked.cpp
++++ b/reclocked/reclocked.cpp
+@@ -93,6 +93,16 @@
+ //      thermal > title priority). CEILING DOWN stays (low-power terminal
+ //      with focus > title-match — see the low-power gate). UP-TITLE is NOT gated
+ //      by GR-idle (a rising clock is safer).
++//
++// v4.4 (2026-08-26):
++//   J. [caps] — per-class policy. Syntax: "class = floor=0a, max=0e, busy-up=50".
++//      floor = resting state (IDLE never drops below it), max = ceiling (own),
++//      busy-up = own UP-LOAD threshold (%, 0 = the global busy-up 80). A class
++//      with an entry is preferred (when focused) and does NOT take title-priority.
++//      Desktop Discord (Electron "discord" + PWA "chrome-discord.com__channels_@me-Default"):
++//      base 0a, busy>50% → 0e, idle → 0a. TERMAL stays top priority (may drop
++//      below the floor). A Discord card in the browser (chromium/firefox)
++//      is not in [caps] → title-priority force-0e unchanged.
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -109,6 +119,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <getopt.h>
++#include <map>
+ #include <set>
+ #include <string>
+ #include <sys/ioctl.h>
+@@ -207,6 +218,15 @@ struct Config {
+     // force the default profile (cap=07) with priority over preferred (even if
+     // Discord/YouTube generates background load, the focused terminal holds 07).
+     std::set<std::string> low_power_classes;
++    // v4.4: per-class policy [caps] — floor (resting state, IDLE never drops
++    // below), max (ceiling), busy-up (own UP-LOAD threshold, %; 0 = global).
++    // Syntax: "class = floor=0a, max=0e, busy-up=50" (each key optional).
++    struct ClassCap {
++        int floor   = -1;   // idx w LADDER; -1 = brak floor (IDLE do 07)
++        int max     = -1;   // idx w LADDER; -1 = ceiling profilu
++        int busy_up = 0;    // % busy do UP-LOAD; 0 = globalny busy-up (80)
++    };
++    std::map<std::string, ClassCap> class_caps;
+ 
+     Profile def;       // profil default (apka nie-preferred)
+     Profile preferred; // profil preferred (apka z listy)
+@@ -388,6 +408,33 @@ static bool load_config(const std::string& path, Config& cfg)
+             cfg.low_power_classes.insert(t);
+             continue;
+         }
++        // v4.4: sekcja "caps" — per-klasowa polityka: "klasa = floor=0a, max=0e, busy-up=50".
++        if (section == "caps") {
++            size_t eqc = t.find('=');
++            if (eqc == std::string::npos) continue;
++            std::string kc = trim(t.substr(0, eqc));
++            std::string vc = trim(t.substr(eqc + 1));
++            Config::ClassCap cc;
++            size_t p0 = 0;
++            while (p0 <= vc.size()) {
++                size_t csep = vc.find(',', p0);
++                std::string tok = trim(vc.substr(p0, csep == std::string::npos
++                    ? std::string::npos : csep - p0));
++                if (!tok.empty()) {
++                    size_t eq = tok.find('=');
++                    std::string k, v;
++                    if (eq == std::string::npos) { k = tok; v = ""; }
++                    else { k = trim(tok.substr(0, eq)); v = trim(tok.substr(eq + 1)); }
++                    if      (k == "floor")     cc.floor   = parse_state(v);
++                    else if (k == "max")       cc.max     = parse_state(v);
++                    else if (k == "busy-up")   cc.busy_up = parse_int(v);
++                }
++                if (csep == std::string::npos) break;
++                p0 = csep + 1;
++            }
++            cfg.class_caps[kc] = cc;
++            continue;
++        }
+         // v4.2: [fan] section — key=value keys (enable/temp-min/temp-max).
+         if (section == "fan") {
+             size_t eqf = t.find('=');
+@@ -1348,14 +1395,24 @@ int main(int argc, char** argv)
+         // z focusem trzyma 07.
+         bool low_power_focused = hypr_alive && !focused_class.empty() &&
+                                  g_cfg.low_power_classes.count(focused_class) > 0;
++        // v4.4: klasa z wpisem [caps] — per-klasowa polityka (floor/max/busy-up).
++        // Applied when the class is FOCUSED; a browser tab (chromium etc.)
++        // nie ma wpisu → title-priority force-0e bez zmian.
++        const Config::ClassCap* ccap = nullptr;
++        if (hypr_alive && !focused_class.empty()) {
++            auto cit = g_cfg.class_caps.find(focused_class);
++            if (cit != g_cfg.class_caps.end()) ccap = &cit->second;
++        }
++        bool cap_class_focused = (ccap != nullptr);
+ 
+         bool pref_sig = false;
+         if (hypr_alive && !low_power_focused) {
+-            // focused ∈ lista?
++            // focused ∈ lista ([preferred] lub [caps])?
+             if (!focused_class.empty() &&
+-                g_cfg.preferred_classes.count(focused_class))
++                (g_cfg.preferred_classes.count(focused_class) ||
++                 cap_class_focused))
+                 pref_sig = true;
+-            // running ∈ lista AND busy > busy_up?
++            // running ∈ lista ([preferred]) AND busy > busy_up?  [caps] tylko gdy focused.
+             if (!pref_sig && (int)busy_avg > busy_up_pp) {
+                 for (auto& r : running_classes) {
+                     if (g_cfg.preferred_classes.count(r)) { pref_sig = true; break; }
+@@ -1365,7 +1422,11 @@ int main(int argc, char** argv)
+             // are browser tabs — detection by window title, case-insensitive.)
+             // v4.3: title-match has the TOP priority — sets title_pref=true, which
+             // wymusza UP do ceiling bez busy-gate i suppress IDLE (patrz UP-LOAD/IDLE).
+-            if (!focused_title.empty()) {
++            // v4.4: skip title-match for [caps] classes — desktop Discord is
++            // handled by [caps] (floor/busy-gate), not a title force-0e.
++            // A Discord card in the browser (chromium etc., NOT in [caps]) keeps
++            // title-priority force-0e.
++            if (!focused_title.empty() && !cap_class_focused) {
+                 for (auto& t : g_cfg.preferred_titles) {
+                     if (icontains(focused_title, t)) { pref_sig = true; title_pref = true; break; }
+                 }
+@@ -1386,6 +1447,20 @@ int main(int argc, char** argv)
+ 
+         const Profile& prof = pref_active ? g_cfg.preferred : g_cfg.def;
+         int ceiling = state_to_idx(prof.max_pstate);
++        // v4.4: [caps] — ceiling (max), floor (resting state) and an own busy-up.
++        int cap_floor = -1;                       // idx w LADDER; -1 = brak
++        int class_busy_up_pp = busy_up_pp;        // ‰ busy do UP-LOAD
++        if (ccap) {
++            if (ccap->max >= 0) {
++                int max_idx = state_to_idx(ccap->max);
++                if (max_idx >= 0 && max_idx < ceiling) ceiling = max_idx;
++            }
++            if (ccap->floor >= 0) {
++                int fl = state_to_idx(ccap->floor);
++                if (fl >= 0 && fl <= ceiling) cap_floor = fl;
++            }
++            if (ccap->busy_up > 0) class_busy_up_pp = ccap->busy_up * 10;
++        }
+         int busy_boost_pp = prof.busy_boost * 10;
+ 
+         // boost aktywny gdy: zdefiniowany, poprawny, OFF-LADDER (state_to_idx<0,
+@@ -1489,14 +1564,13 @@ int main(int argc, char** argv)
+             if (temp >= 0 && temp_high_dwell >= g_cfg.temp_dwell_ms && g_cur_idx > 0) {
+                 target = g_cur_idx - 1;
+                 reason = "TERMAL";
+-                needs_gr_idle = true;            // DOWN
++                needs_gr_idle = true;            // DOWN — TERMAL may go BELOW the [caps] floor
+             } else if (g_cur_idx > 0 && idle_dwell >= g_cfg.idle_dwell_ms &&
+-                       !title_pref) {
+-                // v4.3: !title_pref — suppress IDLE downshift on title-match
+-                // (Discord/YouTube with focus holds the 0e ceiling; a drop from
+-                // low busy is unwanted — these are memory-bound apps, GR idle
+-                // ≠ lack of need for memory clocks). TERMAL DOWN (above) stays —
+-                // thermal protection > title priority.
++                       !title_pref &&
++                       (cap_floor < 0 || g_cur_idx > cap_floor)) {
++                // v4.3: !title_pref — suppress IDLE downshift on title-match.
++                // v4.4: [caps] — IDLE stops at the floor (e.g. 0a); a class without
++                // floor (cap_floor<0) keeps the old behavior (IDLE down to 07).
+                 target = g_cur_idx - 1;
+                 reason = "IDLE";
+                 needs_gr_idle = true;            // DOWN
+@@ -1508,20 +1582,22 @@ int main(int argc, char** argv)
+                 reason = "CEILING";
+                 needs_gr_idle = true;            // DOWN
+             }
+-            // UP (by 1 level, never a 07→0e jump). Shared load/temp thresholds for both
+-            // steps 07→0a and 0a→0e.
+-            // v4.3: title_pref bypasses busy_up — Discord/YouTube are memory-bound (GR
+-            // busy 16-36%, never >80%), so without this path they were stuck at 0a. When
+-            // title-match AND temp<temp_up for a dwell AND below the ceiling → UP without
+-            // a busy-gate. UP stays NOT gated by GR-idle (a rising memory clock is
+-            // safer than a falling one, Kepler tolerates UP mid-render).
++            // UP (o 1 poziom, nigdy skok 07→0e).
++            // v4.4: UP-FLOOR — a [caps] class returns to its resting floor
++            // (e.g. 0a) without a busy-gate (needs only temp_low; no jump >1 here).
++            else if (cap_floor >= 0 && g_cur_idx < ceiling && g_cur_idx < cap_floor &&
++                     temp >= 0 && temp_low_dwell >= g_cfg.temp_dwell_ms) {
++                target = g_cur_idx + 1;
++                reason = "UP-FLOOR";
++            }
++            // v4.3: title_pref bypasses busy_up (Discord/YouTube in the browser).
++            // v4.4: [caps] has its own busy-up (e.g. 50%) instead of the global (80%).
++            // UP stays NOT gated by GR-idle (a rising clock is safer).
+             else if (g_cur_idx < ceiling &&
+                      temp >= 0 && temp_low_dwell >= g_cfg.temp_dwell_ms &&
+-                     ((int)busy_avg > busy_up_pp || title_pref)) {
++                     ((int)busy_avg > class_busy_up_pp || title_pref)) {
+                 target = g_cur_idx + 1;
+                 reason = title_pref ? "UP-TITLE" : "UP-LOAD";
+-                // UP — NOT gated (needs busy>busy_up OR title_pref; a rising
+-                // memory clock is safer than a falling one).
+             }
+         }
+ 

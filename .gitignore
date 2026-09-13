@@ -1,0 +1,31 @@
+# Chronicles/notes — local only, not published
+notes/
+
+# Build artifacts and logs
+*.log
+tmp/
+build/
+output/
+*.o
+*.ko
+*.cmd
+*.mod
+*.mod.c
+modules.order
+Module.symvers
+.vbuiltin/
+
+# Binaria i firmware
+*.elf
+*.bin
+*.so
+*.a
+/gpu/reclocked/reclocked
+/gpu/gmux-io/gmux-io
+/aec/aec-host
+/aec/bench
+/gaming/scroll-tester
+
+# Dane sesji
+.claude/
+__pycache__/

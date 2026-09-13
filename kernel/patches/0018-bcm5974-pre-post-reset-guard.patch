@@ -1,0 +1,56 @@
+From 9f1c3a2b4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a Mon Sep 17 00:00:00 2001
+From: Omarchy Workshop <workshop@omarchy.local>
+Date: Sun Aug 31 11:57:00 2026 +0200
+Subject: [PATCH] Input: bcm5974 - guard against composite device reset
+
+---
+
+--- a/drivers/input/mouse/bcm5974.c
++++ b/drivers/input/mouse/bcm5974.c
+@@ -940,6 +940,37 @@
+ 	return 0;
+ }
+ 
++static int bcm5974_pre_reset(struct usb_interface *iface)
++{
++	struct bcm5974 *dev = usb_get_intfdata(iface);
++
++	guard(mutex)(&dev->pm_mutex);
++
++	/*
++	 * Called before usb_reset_device() (e.g. runtime reset of the composite
++	 * keyboard/trackpad device by usbhid) -- kill in-flight URBs and leave the
++	 * Wellspring mode, otherwise the reset poisons the state and the next URB
++	 * completes on a dead device.
++	 */
++	if (dev->opened)
++		bcm5974_pause_traffic(dev);
++
++	return 0;
++}
++
++static int bcm5974_post_reset(struct usb_interface *iface)
++{
++	struct bcm5974 *dev = usb_get_intfdata(iface);
++
++	guard(mutex)(&dev->pm_mutex);
++
++	/* Device came back in HID mode; redo the mode switch and resubmit URBs. */
++	if (dev->opened)
++		return bcm5974_start_traffic(dev);
++
++	return 0;
++}
++
+ static int bcm5974_probe(struct usb_interface *iface,
+ 			 const struct usb_device_id *id)
+ {
+@@ -1078,6 +1109,8 @@
+ 	.suspend		= bcm5974_suspend,
+ 	.resume			= bcm5974_resume,
+ 	.reset_resume		= bcm5974_reset_resume,
++	.pre_reset		= bcm5974_pre_reset,
++	.post_reset		= bcm5974_post_reset,
+ 	.id_table		= bcm5974_table,
+ 	.supports_autosuspend	= 1,
+ };

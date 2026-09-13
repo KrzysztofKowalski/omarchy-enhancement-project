@@ -1,0 +1,184 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 11/11] brcmfmac: pcie: BCM4360 test.311 skip phase-1 fw_init_done poll + post-poll bracketing
+
+Fire T308b (experiment #4 report, fire #5, 14:27) with patches 0009+0010 and
+test278=0 hard-wedged the host AGAIN, and the heartbeat nailed the death
+point: pr_emerg heartbeats iter=0,25,...,175/200 (si[+0x2028]=0x00000000
+throughout), last print 14:27:44, the loop's terminal "poll done" pr_emerg
+never appeared, reboot forced at 14:28:17. The poll had run ~175 clean reads
+of the identical address (and fire #4 ran ~2000 of them) -- the read itself
+is exonerated. What both wedges share is the poll-loop EXIT: fire #4 died at
+the end of a ~3 s 1 kHz poll at t+~93 s, fire #5 at the end of a ~3 s 100 Hz
+poll at t+~3.5 s -- independent of cadence AND absolute t. The stock msgbuf
+variant (fire #3, T307) survived the very same wall-clock region because it
+NEVER entered the phase-2 path: its wait loop (TCM reads @20 Hz, 5 s) ended
+in -ENODEV and the T307 hold (BAR0+0x4C:=0, 1 Hz BAR0+0x48 reads) touches
+none of the phase-2 entry MMIO.
+
+What executes within microseconds..~100 ms of the phase-1 poll end
+(brcmf_pcie_setup after download_fw_nvram returns 0): devinfo->state=UP,
+init_waitqueue_head (no MMIO) -> brcmf_pcie_select_core(PCIE2) (config
+0x80 write+read) -> brcmf_pcie_request_irq (BAR0+0x4C:=0 posted write,
+pci_enable_msi, request_threaded_irq) -> brcmf_attach -> brcmf_bus_start ->
+brcmf_pcie_preinit (BAR0+0x4C |= 0x100: D2H unmasked) -> first dcmd ->
+brcmf_pcie_tx_ctlpkt -> bcm4360_olmsg_write: RMW BAR0+0x48 |= 0x1 (FIRST H2D
+doorbell -- first mailbox RMW since ARM release, to a fw frozen in WFI that
+has never armed its doorbell handler).
+
+Two changes:
+
+1. New module param bcm4360_test311_skip_fwinit_poll (default 0), gated
+   bcm4360_olmsg_active() (test308=1 + chip 4360): with test311=1 the ENTIRE
+   phase-1 poll is skipped -- jump straight to the poll-end return 0, with
+   a pr_emerg "SKIPPED by test311" before and after the skip window. The
+   poll is best-effort CONTINUE and fw_init_done is not a protocol gate
+   (report sec.9; si[+0x2028] has no known writer in the fw image), so it
+   delivers zero information while both wedges died in its window -- the
+   next fire runs the setup path with ZERO MMIO in that window.
+
+2. Post-poll bracketing prints (gated bcm4360_test310_olmsg_poll_heartbeat,
+   independent of test311): pr_emerg naming each step of the phase-2 entry
+   -- "select_core(PCIE2) + request_irq enter", "request_irq ok (irq=%d)",
+   "brcmf_attach enter (preinit MBM|=0x100, then first dcmd)",
+   "brcmf_attach ok", and "before first doorbell H2D" in
+   brcmf_pcie_tx_ctlpkt before the olmsg_write RMW. pr_emerg so journald
+   syncs each line to disk; a repeat of the wedge names the exact step.
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 65 insertions(+), 24 deletions(-)
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -234,6 +234,10 @@
+ module_param(bcm4360_test310_olmsg_poll_heartbeat, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test310_olmsg_poll_heartbeat, "BCM4360 test.310: heartbeat in the test.308 phase-1 fw_init_done poll -- pr_emerg (not brcmf_dbg, so journald syncs the journal to disk and it survives a hard wedge) every 25 iterations (~250 ms) with the iteration number and si[+0x2028], so the freeze point of a repeat of the fire T308 wedge is bracketed to a single iteration. Requires bcm4360_test308_olmsg_cdc=1. (1=enable, 0=off)");
+ 
++static int bcm4360_test311_skip_fwinit_poll;
++module_param(bcm4360_test311_skip_fwinit_poll, int, 0644);
++MODULE_PARM_DESC(bcm4360_test311_skip_fwinit_poll, "BCM4360 test.311: skip the test.308 phase-1 fw_init_done poll entirely (jump straight to poll-end return 0). The poll is best-effort CONTINUE and fw_init_done is NOT a protocol gate (report sec.9; the constant si[+0x2028] has no known writer in the fw image), so it delivers zero information -- and BOTH hard wedges (fire #4 and fire #5, experiment #4 report sec.7) died in its time window regardless of cadence (1 kHz in #4, 100 Hz in #5) and absolute t. With test311=1 the setup path runs with ZERO MMIO in the former poll window and goes straight to IRQ/attach/doorbell, with test.310 post-poll bracketing prints naming each step. Gated: chip 4360 + test308 (bcm4360_olmsg_active). (1=enable, 0=off)");
++
+ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4360_CHIP_ID, 0xFFFFFFFF, 4360),
+@@ -2186,6 +2190,12 @@
+ 	devinfo->olmsg_resp_pending = true;
+ 	devinfo->olmsg_resp_len = 0;
+ 
++	/* test.310: bracket the FIRST doorbell H2D (RMW BAR0+0x48 |= 0x1) --
++	 * the first mailbox RMW since ARM release, prime wedge suspect from
++	 * fires #4/#5 (experiment #4 report sec.7). */
++	if (bcm4360_test310_olmsg_poll_heartbeat)
++		pr_emerg("BCM4360 test.310: before first doorbell H2D (olmsg_write type=0x%x len=%u)\n",
++			 BCM4360_OLMSG_TYPE_CDC_DCMD, len);
+ 	ret = bcm4360_olmsg_write(devinfo, BCM4360_OLMSG_TYPE_CDC_DCMD,
+ 				  msg, len);
+ 	if (ret) {
+@@ -2837,31 +2847,44 @@
+ 		u32 fw_done = 0;
+ 		u32 t308_loop;
+ 
+-		for (t308_loop = 0;
+-		     t308_loop < BCM4360_OLMSG_FW_INIT_DONE_POLL_MAX;
+-		     t308_loop++) {
+-			fw_done = brcmf_pcie_read_ram32(devinfo,
+-				t308_base + BCM4360_T276_SI_FW_INIT_DONE);
+-			if (fw_done)
+-				break;
+-			/* test.310: heartbeat every 25 iterations (~250 ms).
+-			 * pr_emerg, NOT brcmf_dbg: journald syncs the journal
+-			 * file to disk on KERN_EMERG, so the last heartbeat
+-			 * survives a hard wedge and brackets the iteration
+-			 * the host died in (fire T308 died in this loop with
+-			 * no terminal print -- nothing bracketed it). */
+-			if (bcm4360_test310_olmsg_poll_heartbeat &&
+-			    (t308_loop % BCM4360_T310_HEARTBEAT_EVERY) == 0)
+-				pr_emerg("BCM4360 test.310: fw_init_done poll heartbeat iter=%u/%d si[+0x2028]=0x%08x\n",
+-					 t308_loop,
+-					 BCM4360_OLMSG_FW_INIT_DONE_POLL_MAX,
+-					 fw_done);
+-			usleep_range(BCM4360_OLMSG_FW_INIT_DONE_POLL_US,
+-				     BCM4360_OLMSG_FW_INIT_DONE_POLL_US * 2);
++		if (bcm4360_test311_skip_fwinit_poll) {
++			/* test.311: skip the whole poll. fw_init_done is not a
++			 * protocol gate (report sec.9) and the poll delivers
++			 * zero information (it can only ever time out, and
++			 * both fires #4/#5 wedged inside its window --
++			 * experiment #4 report sec.7) -- so run this window
++			 * with ZERO MMIO and go straight to setup. The two
++			 * prints bracket the skip point ("before"/"after"). */
++			pr_emerg("BCM4360 test.311: phase-1 fw_init_done poll SKIPPED by test311 (entering zero-MMIO skip window)\n");
++		} else {
++			for (t308_loop = 0;
++			     t308_loop < BCM4360_OLMSG_FW_INIT_DONE_POLL_MAX;
++			     t308_loop++) {
++				fw_done = brcmf_pcie_read_ram32(devinfo,
++					t308_base + BCM4360_T276_SI_FW_INIT_DONE);
++				if (fw_done)
++					break;
++				/* test.310: heartbeat every 25 iterations (~250 ms).
++				 * pr_emerg, NOT brcmf_dbg: journald syncs the journal
++				 * file to disk on KERN_EMERG, so the last heartbeat
++				 * survives a hard wedge and brackets the iteration
++				 * the host died in (fire T308 died in this loop with
++				 * no terminal print -- nothing bracketed it). */
++				if (bcm4360_test310_olmsg_poll_heartbeat &&
++				    (t308_loop % BCM4360_T310_HEARTBEAT_EVERY) == 0)
++					pr_emerg("BCM4360 test.310: fw_init_done poll heartbeat iter=%u/%d si[+0x2028]=0x%08x\n",
++						 t308_loop,
++						 BCM4360_OLMSG_FW_INIT_DONE_POLL_MAX,
++						 fw_done);
++				usleep_range(BCM4360_OLMSG_FW_INIT_DONE_POLL_US,
++					     BCM4360_OLMSG_FW_INIT_DONE_POLL_US * 2);
++			}
++			pr_emerg("BCM4360 test.308: fw_init_done poll done after %u ms: si[+0x2028]=0x%08x (best-effort, continuing)\n",
++				 (t308_loop + 1) * BCM4360_OLMSG_FW_INIT_DONE_POLL_US,
++				 fw_done);
+ 		}
+-		pr_emerg("BCM4360 test.308: fw_init_done poll done after %u ms: si[+0x2028]=0x%08x (best-effort, continuing)\n",
+-			 (t308_loop + 1) * BCM4360_OLMSG_FW_INIT_DONE_POLL_US,
+-			 fw_done);
++		if (bcm4360_test311_skip_fwinit_poll)
++			pr_emerg("BCM4360 test.311: phase-1 poll window done (skipped, zero MMIO) -- continuing to setup (select_core/IRQ/attach/doorbell)\n");
+ 		return 0;
+ 	}
+ 
+@@ -3324,10 +3347,23 @@
+ 			goto fail;
+ 	}
+ 
++	/* test.310: post-poll bracketing. Fire #4 and fire #5 both wedged at
++	 * the poll-loop EXIT (experiment #4 report sec.7) -- the very next
++	 * MMIO steps are these: config-space select_core, BAR0+0x4C write,
++	 * MSI/request_irq, later preinit MBM|=0x100 and the first H2D
++	 * doorbell. pr_emerg (journald syncs on KERN_EMERG) so each step is
++	 * named on disk and a repeat of the wedge names the exact step. */
++	if (bcm4360_test310_olmsg_poll_heartbeat &&
++	    bcm4360_olmsg_active(devinfo))
++		pr_emerg("BCM4360 test.310: post-poll step: select_core(PCIE2) + request_irq enter\n");
+ 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
+ 	ret = brcmf_pcie_request_irq(devinfo);
+ 	if (ret)
+ 		goto fail;
++	if (bcm4360_test310_olmsg_poll_heartbeat &&
++	    bcm4360_olmsg_active(devinfo))
++		pr_emerg("BCM4360 test.310: post-poll step: request_irq ok (irq=%d)\n",
++			 devinfo->pdev->irq);
+ 
+ 	/* hook the commonrings in the bus structure. */
+ 	if (!bcm4360_olmsg_active(devinfo)) {
+@@ -3351,9 +3387,15 @@
+ 
+ 	init_waitqueue_head(&devinfo->mbdata_resp_wait);
+ 
++	if (bcm4360_test310_olmsg_poll_heartbeat &&
++	    bcm4360_olmsg_active(devinfo))
++		pr_emerg("BCM4360 test.310: post-poll step: brcmf_attach enter (preinit MBM|=0x100, then first dcmd)\n");
+ 	ret = brcmf_attach(&devinfo->pdev->dev);
+ 	if (ret)
+ 		goto fail;
++	if (bcm4360_test310_olmsg_poll_heartbeat &&
++	    bcm4360_olmsg_active(devinfo))
++		pr_emerg("BCM4360 test.310: post-poll step: brcmf_attach ok\n");
+ 
+ 	brcmf_pcie_bus_console_read(devinfo, false);
+ 

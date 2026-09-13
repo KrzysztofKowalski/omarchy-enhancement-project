@@ -1,0 +1,60 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 1/5] brcmfmac: add BCM4360 chip and PCIe device IDs
+
+Add the BCM4360 (14e4:43a0) chip/device IDs and firmware name mapping,
+ported from kimptoc/bcm4360-re phase3 patch 0001 (base v6.12). The
+BCM4360 is the 802.11ac FullMAC chip found in 2013-2015 MacBook Pro
+units; it shares the BCM43602 PCIe/BCMA architecture (ARM CR4 core,
+D11 core rev 42) and uses the same host transport.
+
+- brcm_hw_ids.h: BRCM_CC_4360_CHIP_ID (0x4360), BRCM_PCIE_4360_DEVICE_ID
+  (0x43a0). Upstream mainline (v6.12 and 7.1.8) has neither.
+- pcie.c: BRCMF_FW_DEF(4360, "brcmfmac4360-pcie"), fwnames entry
+  (chiprev wildcard), and pci_device_id table entry (WCC vendor
+  family, same as BCM43602).
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 2 files changed, 4 insertions(+), 0 deletions(-)
+diff --git a/brcmfmac/pcie.c b/brcmfmac/pcie.c
+index 9a0bdc8..c4a4faf 100644
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -49,6 +49,7 @@ enum brcmf_pcie_state {
+ 	BRCMFMAC_PCIE_STATE_UP
+ };
+ 
++BRCMF_FW_DEF(4360, "brcmfmac4360-pcie");
+ BRCMF_FW_DEF(43602, "brcmfmac43602-pcie");
+ BRCMF_FW_DEF(4350, "brcmfmac4350-pcie");
+ BRCMF_FW_DEF(4350C, "brcmfmac4350c2-pcie");
+@@ -2746,6 +3324,7 @@ static const struct pci_device_id brcmf_pcie_devid_table[] = {
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_43602_2G_DEVICE_ID, WCC),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_43602_5G_DEVICE_ID, WCC),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_43602_RAW_DEVICE_ID, WCC),
++	BRCMF_PCIE_DEVICE(BRCM_PCIE_4360_DEVICE_ID, WCC),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4364_DEVICE_ID, WCC_SEED),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4365_DEVICE_ID, BCA),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4365_2G_DEVICE_ID, BCA),
+diff --git a/include/brcm_hw_ids.h b/include/brcm_hw_ids.h
+index df3b67b..6340d98 100644
+--- a/include/brcm_hw_ids.h
++++ b/include/brcm_hw_ids.h
+@@ -46,6 +46,7 @@
+ #define BRCM_CC_4358_CHIP_ID		0x4358
+ #define BRCM_CC_4359_CHIP_ID		0x4359
+ #define BRCM_CC_43602_CHIP_ID		43602
++#define BRCM_CC_4360_CHIP_ID		0x4360
+ #define BRCM_CC_4364_CHIP_ID		0x4364
+ #define BRCM_CC_4365_CHIP_ID		0x4365
+ #define BRCM_CC_4366_CHIP_ID		0x4366
+@@ -83,6 +84,7 @@
+ #define BRCM_PCIE_4358_DEVICE_ID	0x43e9
+ #define BRCM_PCIE_4359_DEVICE_ID	0x43ef
+ #define BRCM_PCIE_43602_DEVICE_ID	0x43ba
++#define BRCM_PCIE_4360_DEVICE_ID	0x43a0
+ #define BRCM_PCIE_43602_2G_DEVICE_ID	0x43bb
+ #define BRCM_PCIE_43602_5G_DEVICE_ID	0x43bc
+ #define BRCM_PCIE_43602_RAW_DEVICE_ID	43602
+--
+2.39.2

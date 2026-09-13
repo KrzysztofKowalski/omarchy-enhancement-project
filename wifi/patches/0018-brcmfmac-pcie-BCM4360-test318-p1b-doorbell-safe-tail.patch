@@ -1,0 +1,194 @@
+From 86f8dcd575d6135aae6c3b4316da1458ee495f0e Mon Sep 17 00:00:00 2001
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Date: Wed, 9 Sep 2026 15:58:22 +0200
+Subject: [PATCH 18/18] brcmfmac: pcie: BCM4360 test.318 P1b post-release doorbell +
+ safe console TAIL10
+
+Fire #11 (0017) rozwazyl ostatnie nieprzetestowane roznice host-side wzgledem
+test.28 kimptoca: R4 (no_sharedinfo) + R5 (no_olmsg) OBALONE -- wr_idx konsoli
+NADAL 0x27d=637 B przy maksymalnej replikacji test.28 (host pisal tylko
+blob + write_ram32(ramsize-4,0) + resetcore + P1 + MBM:=0 w holdzie).
+Zostaje JEDNA roznica kimptoc-vs-nas i jest ona PO JEGO stronie: jego
+release NIE czyscil mailboxa, a nasz brcmf_chip_set_active CZYSCI (fire #9:
+mbint=0 po set_active) -- jego fw obudzilo sie z PENDING doorbellem D2H
+(0x3 = wzorzec pcie_mask_irqs 0xFFFFFFFF zapisany pre-release), ktory moze
+popychac boot wylamujaco z freeze (dispatch przerwan / PCI-CCB init); nasze
+fw wstaje z mailbox=0 (fire #11 mbint=0).
+
+Latka 0018 (parametry bcm4360_test318_p1b_doorbell i bcm4360_test318_cons_tail10;
+domyslnie 0 -> latka inerta, zero roznicy behawioralnej jak wszystkie poprzednie):
+
+a) P1b: PLAIN write MAILBOXINT (BAR0+0x48) := 0xFFFFFFFF BEZPOSREDNIO PO
+   brcmf_chip_set_active, PRZED discriminatorem test.315 (t~0; fw bootuje
+   t+10 ms i publikuje si[+0x010]=0x9af88, wiec pending doorbell JEST na
+   czipie, gdy fw go czyta -- w przeciwieznosci do P1 pre-release, ktore
+   set_active czysci, i fire #7, ktore poked t+5-8 s po freeze). Ten sam
+   mechanizm co blok P1/P1-T z latki 0015: brcmf_pcie_write_reg32 /
+   brcmf_pcie_read_reg32 z makrem BRCMF_PCIE_PCIE2REG_MAILBOXINT (BAR0+0x48),
+   kazdy krok z bramka pr_emerg. Biegnie PRZED discriminatorem CELOWO:
+   discriminator mierzy potem efekt (mbint zalatchowany 0x3? intstatus?).
+   Gated: chip 4360 + wlasny parametr (nie wymaga test315). Fire #12
+   dyskryminator: konsola > 0x27d (1404 B + TRAP err 15 jak u kimptoca)
+   => pending doorbell dzwignia -> bring-up; == 0x27d => R1: deep-dive
+   bootu fw (SP/TCM dump via BAR2, breadcrumbs 0x62E20/0x18/0x88).
+
+b) TAIL10: bezpieczna wersja console TAIL. Fire #10 pokazal, ze 25-dwordowa
+   burta test316_console_tail zabija printk jadra (nowa klasa zawieszen przy
+   zywej maszynie), wiec okno jest tu obciete do min(wr_idx & ~3, 40) B
+   (<=10 dwordow), czytane tym samym mechanizmem co TAIL test.316
+   (brcmf_pcie_read_ram32 do stack chunka); start 4 B-aligned (bez
+   polowkowego dworda z przodu), koniec na ostatnim PELNYM dwordzie <= wr_idx
+   (<=3 B nowszego tekstu z tylu). Wydruki DOKLADNIE dwie linie w stylu
+   HEAD dump (ta klasa zawsze przetrwala; printk umarl w srodku 25 dwordow):
+   jedna %*ph hex + jedna %*pE ascii, prefiks BCM4360 test.318: POST-POLL
+   console TAIL10. Walidacje jak w test.316 (test.278-style): wr_idx=0 lub
+   struct invalid (buf_addr poza TCM / wr_idx>buf_size) -> skip z linia.
+   Blok ma wylacznie wlasne zmienne (t10_*) z zakresu POST-POLL struct
+   (t277_struct[0..2]), poza klamra bloku test.316, nic nie dotyka poza
+   swoim zakresem. NIEZALEZNY od bcm4360_test316_console_tail i od
+   bcm4360_test316 -- biegnie, gdy biegna tez test.277 POST-POLL dump.
+
+Bezpieczenstwo: jedyny nowy zapis MMIO to pojedynczy windowed write P1b
+(klasa 0015 P1, proven live na zywym urzadzeniu w fire #2/#9; zapis w oknie
+t+0 po release, fw nie moze byc w WFI jeszcze przez ~10 ms). TAIL10 to same
+odczyty TCM klasy T277/T316 read, proven w fire #6/#7; brak petli bez dolnej
+granicy, maks. 8 odczytow. (1=enable, 0=off dla obu parametrow)
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ brcmfmac/pcie.c | 106 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 106 insertions(+)
+
+diff --git a/brcmfmac/pcie.c b/brcmfmac/pcie.c
+index 274a81c..649cefb 100644
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -302,6 +302,13 @@ static uint bcm4360_test317_no_olmsg;
+ module_param(bcm4360_test317_no_olmsg, uint, 0644);
+ MODULE_PARM_DESC(bcm4360_test317_no_olmsg, "BCM4360 test.317 fire #11: skip the ENTIRE olmsg post-release side -- select_core, request_irq (incl. the test.312b MBM RMW |=0x100), commonring hookup, brcmf_attach (preinit dcmds + the first H2D doorbell), the test.312 liveness gate, the test.314 autopsy, the fwcon timer: the host does ZERO writes after the ARM release + the test.315 discriminator reads. Instead: pr_emerg bracket + (if test309=1) bcm4360_t309_olmsg_zero_teardown_hold -- MBM:=0 (BAR0+0x4C, proven safe on fire #3) + 10 s 1 Hz mailbox poll + SUMMARY; the device stays bound, no wiphy, no IRQ armed, reboot clears, do NOT rmmod. The fire ends with evidence reads only (test.276 poll-end + test.277 POST-POLL struct/HEAD; console TAIL stays OFF -- the 25-dword burst killed printk in fire #10). Requires test308=1 + test309=1 (+ test276=1/test277=1 for the evidence); discriminator: console wr_idx > 0x27d (637) => side-writes/bus master were the culprit (fw goes to 1404 B + TRAP err 15 like kimptoc); == 0x27d => kimptoc's release/timing. (1=skip, 0=default)");
+ 
++static uint bcm4360_test318_p1b_doorbell;
++module_param(bcm4360_test318_p1b_doorbell, uint, 0644);
++MODULE_PARM_DESC(bcm4360_test318_p1b_doorbell, "BCM4360 test.318 fire #12 (P1b hypothesis): the kimptoc reference release did NOT clear the H2D mailbox, but brcmf_chip_set_active DOES (fire #9: mbint=0 after set_active) -- so his fw woke with a PENDING D2H doorbell (0x3, the pcie_mask_irqs 0xFFFFFFFF pattern he wrote pre-release) and that pending doorbell may be what pushes the boot past the freeze (IRQ dispatch / PCI-CCB init); our fw wakes with mailbox=0 (fire #11 mbint=0). P1b: PLAIN write MAILBOXINT (BAR0+0x48) := 0xFFFFFFFF IMMEDIATELY AFTER brcmf_chip_set_active and BEFORE the test.315 post-set_active DISCRIMINATOR (t~0; the fw boots at t+10 ms and publishes si[+0x010]=0x9af88, so the pending doorbell IS on the chip when the fw reads it -- unlike P1 pre-release which chip_set_active clears, unlike fire #7 which poked t+5-8 s after the freeze). Bracketed pr_emerg + readback line. Execution BEFORE the discriminator on purpose: the discriminator then measures the effect (mbint latched 0x3? intstatus?). (1=enable, 0=off)");
++static uint bcm4360_test318_cons_tail10;
++module_param(bcm4360_test318_cons_tail10, uint, 0644);
++MODULE_PARM_DESC(bcm4360_test318_cons_tail10, "BCM4360 test.318 fire #12 safe console TAIL: the test316_console_tail 25-dword read killed printk in fire #10 (new hang class) -- this param is its safe replacement (INDEPENDENT of bcm4360_test316_console_tail; runs when 1 and the test.277 POST-POLL struct dump executed): read the LAST min(wr_idx, 40) bytes of the fw console buffer ENDING at wr_idx (4 B-aligned start, <=3 B of older text in front, <=10 dwords, same TCM read-ram32 chunk mechanism as the test316 TAIL), print EXACTLY: one %*ph hex pr_emerg line + one %*pE ascii pr_emerg line in the exact style of the HEAD dump lines (that print class always survived; fire #10 printk died inside the 25-dword TAIL). Skipped with log lines when wr_idx=0 / struct invalid (buf_addr not in TCM, wr_idx>buf_size), test.278-style, same as test316. (1=enable, 0=off)");
++
+ static int bcm4360_test308_olmsg_cdc;
+ module_param(bcm4360_test308_olmsg_cdc, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test308_olmsg_cdc, "BCM4360 test.308: PCI-CDC (olmsg) transport, phase 1+2. Phase 1: replace the msgbuf sharedram-ptr handshake poll (TCM[ramsize-4], guaranteed -ENODEV on this fw) with a best-effort si[+0x2028] poll (10 ms x 200, then CONTINUE), skip msgbuf shared-struct/ring setup, proto_type=BCDC. Phase 2: txctl/rxctl over the olmsg ring (T276 DMA buffer -- requires bcm4360_test276_shared_info=1), D2H drain in the threaded ISR on BAR0+0x48 bit 8, per-cycle mask BAR0+0x4C |= 0x100. txdata stays a stub until phase 3. Gated: only for chip 4360; all other chips keep the msgbuf path. (1=enable, 0=off)");
+@@ -1916,6 +1923,33 @@ static int brcmf_pcie_exit_download_state(struct brcmf_pciedev_info *devinfo,
+ 
+ 	t315_active = brcmf_chip_set_active(devinfo->ci, resetintr);
+ 
++	/* test.318 P1b: PLAIN write MAILBOXINT (BAR0+0x48) := 0xFFFFFFFF
++	 * immediately AFTER brcmf_chip_set_active, BEFORE the test.315
++	 * discriminator. kimptoc's release did NOT clear the H2D mailbox
++	 * (so his fw woke with a pending doorbell 0x3 -- pcie_mask_irqs
++	 * wrote 0xFFFFFFFF pre-release); OUR brcmf_chip_set_active DOES
++	 * clear it (fire #9: mbint=0 after set_active) -- the pending
++	 * doorbell may be exactly what pushes the fw boot past the
++	 * freeze (IRQ dispatch / PCI-CCB init). At t~0 the fw boots at
++	 * t+10 ms, so the doorbell is still ON the chip when the fw
++	 * first reads it (unlike P1 pre-release, cleared by
++	 * set_active, and unlike the fire #7 doorbell at t+5-8 s,
++	 * after the WFI freeze). Runs BEFORE the discriminator on
++	 * purpose: the discriminator then measures the effect. */
++	if (bcm4360_test318_p1b_doorbell &&
++	    devinfo->ci->chip == BRCM_CC_4360_CHIP_ID) {
++		u32 dbv;
++
++		pr_emerg("BCM4360 test.318 P1b: plain MAILBOXINT:=0xFFFFFFFF immediately after chip_set_active (t~0 -- fw boots in ~10 ms; pending doorbell reachable, unlike P1 pre-release which set_active clears)\n");
++		dbv = 0xFFFFFFFF;
++		brcmf_pcie_write_reg32(devinfo, BRCMF_PCIE_PCIE2REG_MAILBOXINT,
++				       dbv);
++		dbv = brcmf_pcie_read_reg32(devinfo,
++					    BRCMF_PCIE_PCIE2REG_MAILBOXINT);
++		pr_emerg("BCM4360 test.318 P1b: MAILBOXINT readback=0x%08x (latched doorbell bits)\n",
++			 dbv);
++	}
++
+ 	/* test.315 DISCRIMINATOR: immediately after the ARM release,
+ 	 * ALWAYS when test315=1 (before the test.312 gate and before any
+ 	 * 0012/0013 doorbell) -- the fire #9 verdict read. */
+@@ -3552,6 +3586,78 @@ static int brcmf_pcie_download_fw_nvram(struct brcmf_pciedev_info *devinfo,
+ 									 t316_valid);
+ 						}
+ 					}
++					/* BCM4360 test.318 TAIL10: safe replacement for
++					 * the test.316 console TAIL -- fire #10 showed
++					 * the 25-dword burst kill kernel printk (new
++					 * hang class), so this window is capped at
++					 * 40 B (<=10 dwords) of the LAST diagnostic
++					 * text before the stall (wr_idx=0x27d=637 in
++					 * fires #6-#11). Same TCM dword-read
++					 * mechanism as the test.316 TAIL
++					 * (brcmf_pcie_read_ram32 into a stack
++					 * chunk); the span is 4 B aligned (start =
++					 * (wr_idx & ~3) - min(wr_idx & ~3, 40), no
++					 * partial dword in front) and ends at the
++					 * last full dword <= wr_idx (<=3 B of
++					 * newer text in back). INDEPENDENT of
++					 * bcm4360_test316_console_tail and of
++					 * bcm4360_test316 -- runs whenever this
++					 * POST-POLL dump runs. */
++					if (bcm4360_test318_cons_tail10) {
++						u32 t10_buf = t277_struct[0];
++						u32 t10_bsz = t277_struct[1];
++						u32 t10_wr = t277_struct[2];
++						u32 t10_end = t10_wr & ~3u;
++						u32 t10_n = min_t(u32, t10_end,
++								  (u32)40);
++						u32 t10_start = t10_end - t10_n;
++						u32 t10_dwords = t10_n / 4;
++						u8 t10_chunk[40];
++						u32 *t10_u32 = (u32 *)t10_chunk;
++						u32 t10_k;
++
++						if (t10_wr == 0) {
++							pr_emerg("BCM4360 test.318: POST-POLL console TAIL10 skipped (wr_idx=0 -- the fw never wrote the console)\n");
++						} else if (t10_buf == 0 ||
++							   t10_buf >=
++								devinfo->ci->ramsize ||
++							   t10_bsz == 0 ||
++							   t10_bsz >
++								devinfo->ci->ramsize ||
++							   t10_wr > t10_bsz) {
++							pr_emerg("BCM4360 test.318: POST-POLL console TAIL10 struct invalid (buf_addr=0x%08x buf_size=0x%08x wr_idx=0x%08x ramsize=0x%x) -- skipped\n",
++								 t10_buf,
++								 t10_bsz,
++								 t10_wr,
++								 devinfo->ci->ramsize);
++						} else if (t10_n < 4) {
++							pr_emerg("BCM4360 test.318: POST-POLL console TAIL10 skipped (wr_idx=%u -- fewer than one full dword of tail)\n",
++								 t10_wr);
++						} else {
++							pr_emerg("BCM4360 test.318: POST-POLL console TAIL10 read (TCM @0x%08x, last %u B ending at the last full dword <=wr_idx=%u, %u dwords) now\n",
++								 t10_buf + t10_start,
++								 t10_n,
++								 t10_wr,
++								 t10_dwords);
++							for (t10_k = 0;
++							     t10_k < t10_dwords;
++							     t10_k++)
++								t10_u32[t10_k] =
++									brcmf_pcie_read_ram32(
++										devinfo,
++										t10_buf +
++										t10_start +
++										t10_k * 4);
++							pr_emerg("BCM4360 test.318: POST-POLL console TAIL10 end @0x%08x hex: %*ph\n",
++								 t10_buf + t10_wr,
++								 (int)t10_n,
++								 t10_chunk);
++							pr_emerg("BCM4360 test.318: POST-POLL console TAIL10 end @0x%08x ascii: %*pE\n",
++								 t10_buf + t10_wr,
++								 (int)t10_n,
++								 t10_chunk);
++						}
++					}
+ 				}
+ 			}
+ 		}
+-- 
+2.55.0
+

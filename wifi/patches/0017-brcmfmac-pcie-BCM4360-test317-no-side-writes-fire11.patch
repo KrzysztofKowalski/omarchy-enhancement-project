@@ -1,0 +1,175 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 17/17] brcmfmac: pcie: BCM4360 test.317 no side-writes fire #11
+
+Fire #10 (0016) gave three results: (1) R3b -- ZERO NVRAM (replica of kimptoc's
+test.28 substrate: no vars, no token at TCM[ramsize-4], varsz=0) -- console
+wr_idx STILL 0x27d=637: NVRAM (content and presence) is excluded as cause
+and lever; (2) P1-T -- SB intstatus=0x300 measured PRE-release, right after
+the PLAIN write MAILBOXINT:=0xFFFFFFFF (masked to 0x3):
+0x300 at kimptoc = mirror HW of his OWN pre-release write (his 'release' did
+not clear the mailbox, so it survived; our chip_set_active clears it), NOT a
+fw-side latch -- the "0x300 = fw sign of life" theory is DEFINITIVELY dead;
+(3) console TAIL (25x read_ram32 @0x97194) -- a new class: kernel printk died
+exactly on the "...TAIL ... now" line on a live machine (8/8 CPU, sysrq-511
+zero lines, no AER/stuck task; insmod returned, module bound, T309 not
+reached).
+
+After fire #10 ONE untested difference vs kimptoc's test.28 remains: our
+side-writes (T276 shared_info + olmsg ring + MAILBOXMASK RMW |=0x100 in
+request_irq + H2D doorbell preinit dcmd) + pci_set_master (kimptoc ran with
+BM-off). Patch 0017 does the MAXIMAL test.28 replication in one fire (test.317)
+-- after release the host does ZERO writes:
+
+a) bcm4360_test317_no_sharedinfo: skips the WHOLE test.276 pre-release write --
+   no dma_alloc of the 64 KB olmsg ring, no ring header writes, no zeroing
+   of the shared_info TCM region, no magic/dma_lo/dma_hi/buf_size/varsz/
+   vars16/fw_init_done/magic_end. The substrate = fw blob + write_ram32
+   (ramsize-4, 0) + resetcore INTERNAL_MEM + kimptoc's P1. READS stay:
+   test.277 PRE-WRITE dump, 2 s poll, POST-POLL struct+HEAD -- si[+0x010]
+   is published by the FW regardless of the host; when the fw does not
+   publish (si[+0x010]=0), POST-POLL falls back to the Phase-4B-observed
+   pointer 0x9af88 (test.317 branch) so the wr_idx discriminator survives
+   without shared_info.
+
+b) bcm4360_test317_no_olmsg: in brcmf_pcie_setup() skips the WHOLE
+   post-release olmsg side -- select_core, request_irq (and the test.312b MBM
+   RMW |=0x100), commonring hookup, brcmf_attach (preinit dcmds + the first
+   H2D doorbell), test.312 gate, test.314 autopsies, fwcon timer -- and
+   (with test309=1) enters bcm4360_t309_olmsg_zero_teardown_hold
+   (MBM:=0, 10 s poll 1 Hz of the mailbox, SUMMARY; the device stays bound,
+   no wiphy, no IRQ; reboot clears, do NOT rmmod). All evidence (poll end,
+   POST-POLL struct/HEAD) is already on disk -- T276 2 s poll and T277
+   POST-POLL run in brcmf_pcie_download_fw_nvram before this point.
+   Console TAIL deliberately NOT ARMED (fire #10: full 25 dwords).
+
+c) The test.276 poll gate (condition devinfo->t276_olmsg_buf) extended with
+   bcm4360_test317_no_sharedinfo -- the poll READS si[+0x010]/fw_init_done/
+   mbxint from the same addresses the fw fills anyway; with the value
+   0x9af88 done. The change is exclusively in the gate condition, zero MMIO.
+
+d) Independent parameters (like test.316_console_tail): they work on their
+   own; no_sharedinfo requires test276=1/277=1 (evidence), no_olmsg requires
+   test308=1+test309=1. Fire #11 discriminator:
+   - console > 0x27d (1404 B + TRAP err 15 like at kimptoc) => our
+     side-writes/bus master were the culprit (next bisect: side-writes OFF
+     alone / no_master alone);
+   - console == 0x27d => kimptoc's own 'release' (which did not clear the
+     mailbox) and/or timing were to blame -- then R1: deep dive of the fw
+     boot (SP/TCM dump via BAR2, breadcrumbs 0x62E20/0x18/0x88).
+
+e) The fire #10 script updated for fire #11 (LOG_BASE test.317):
+   bcm4360_test315=1 added (kimptoc P1 + no_master + discriminator),
+   bcm4360_test315_no_master=1 (BM-off control), no_sharedinfo/no_olmsg
+   =1; bcm4360_test316=1 stays (R3b -- test.28 substrate had no NVRAM);
+   console_tail REMOVED. Setpci (ASPM off + CTO 10-100 ms) is applied by the
+   main session before the fire, verified by readback.
+diff --git i/brcmfmac/pcie.c w/brcmfmac/pcie.c
+index 41c9338..274a81c 100644
+--- i/brcmfmac/pcie.c
++++ w/brcmfmac/pcie.c
+@@ -295,6 +295,13 @@ static uint bcm4360_test316_console_tail;
+ module_param(bcm4360_test316_console_tail, uint, 0644);
+ MODULE_PARM_DESC(bcm4360_test316_console_tail, "BCM4360 test.316 console TAIL (INDEPENDENT of bcm4360_test316 -- runs whenever the test.277 POST-POLL console dump runs, i.e. with test277=1): after the existing first-128-B HEAD dump, read the LAST min(wr_idx, 96) bytes of the fw console buffer ending at wr_idx -- only the HEAD of the console is known so far and the last fw print before the stall is the key evidence (wr_idx=0x27d=637 in fires #6-#9). Same TCM dword-read mechanism as the HEAD dump (brcmf_pcie_read_ram32 into a stack chunk), read from the 4 B aligned start (<=3 B of earlier console text in front; the printed span ends exactly at wr_idx), printed as %*ph hex (<=64 B per line, one continuation line) + one %*pE ASCII-escaped line. Skipped with a log line when wr_idx=0 or the struct fails validation (buf_addr in TCM, wr_idx <= buf_size, test.278-style). (1=enable, 0=off)");
+ 
++static uint bcm4360_test317_no_sharedinfo;
++module_param(bcm4360_test317_no_sharedinfo, uint, 0644);
++MODULE_PARM_DESC(bcm4360_test317_no_sharedinfo, "BCM4360 test.317 fire #11 (maximal kimptoc test.28 replication, disc H3+H4): skip the WHOLE test.276 pre-release WRITE -- no dma_alloc of the 64 KB olmsg ring buffer, no ring-header memset/writes, no zeroing of the shared_info TCM region, no magic/dma_lo/dma_hi/buf_size/varsz/vars16/fw_init_done/magic_end writes (t276_olmsg_buf stays NULL and the 0016/0015/0014 post-release paths that need it are not reached -- no_olmsg skips them). The boot substrate becomes host-write-clean except: the fw blob copy, the core write_ram32(ramsize-4, 0), the INTERNAL_MEM resetcore, the test.315 P1 pre-release doorbell (kimptoc pcie_mask_irqs pattern) and the T309-hold MBM:=0 (post-evidence). READS stay: the test.277 PRE-WRITE dump, the 2 s poll, the POST-POLL struct + HEAD dump -- si[+0x010] is fw-published (the fw writes its own console ptr regardless of the host magic); when the fw skips publishing (si[+0x010]=0), the POST-POLL block falls back to the Phase-4B-observed 0x9af88 (test.317 branch) so the wr_idx discriminator survives. kimptoc test.28: no shared_info, no olmsg ring, BM-off -- his fw ran to 1404 B and TRAPped (err 15). (1=skip shared_info + ring writes, 0=default)");
++static uint bcm4360_test317_no_olmsg;
++module_param(bcm4360_test317_no_olmsg, uint, 0644);
++MODULE_PARM_DESC(bcm4360_test317_no_olmsg, "BCM4360 test.317 fire #11: skip the ENTIRE olmsg post-release side -- select_core, request_irq (incl. the test.312b MBM RMW |=0x100), commonring hookup, brcmf_attach (preinit dcmds + the first H2D doorbell), the test.312 liveness gate, the test.314 autopsy, the fwcon timer: the host does ZERO writes after the ARM release + the test.315 discriminator reads. Instead: pr_emerg bracket + (if test309=1) bcm4360_t309_olmsg_zero_teardown_hold -- MBM:=0 (BAR0+0x4C, proven safe on fire #3) + 10 s 1 Hz mailbox poll + SUMMARY; the device stays bound, no wiphy, no IRQ armed, reboot clears, do NOT rmmod. The fire ends with evidence reads only (test.276 poll-end + test.277 POST-POLL struct/HEAD; console TAIL stays OFF -- the 25-dword burst killed printk in fire #10). Requires test308=1 + test309=1 (+ test276=1/test277=1 for the evidence); discriminator: console wr_idx > 0x27d (637) => side-writes/bus master were the culprit (fw goes to 1404 B + TRAP err 15 like kimptoc); == 0x27d => kimptoc's release/timing. (1=skip, 0=default)");
++
+ static int bcm4360_test308_olmsg_cdc;
+ module_param(bcm4360_test308_olmsg_cdc, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test308_olmsg_cdc, "BCM4360 test.308: PCI-CDC (olmsg) transport, phase 1+2. Phase 1: replace the msgbuf sharedram-ptr handshake poll (TCM[ramsize-4], guaranteed -ENODEV on this fw) with a best-effort si[+0x2028] poll (10 ms x 200, then CONTINUE), skip msgbuf shared-struct/ring setup, proto_type=BCDC. Phase 2: txctl/rxctl over the olmsg ring (T276 DMA buffer -- requires bcm4360_test276_shared_info=1), D2H drain in the threaded ISR on BAR0+0x48 bit 8, per-cycle mask BAR0+0x4C |= 0x100. txdata stays a stub until phase 3. Gated: only for chip 4360; all other chips keep the msgbuf path. (1=enable, 0=off)");
+@@ -3196,11 +3203,21 @@ static int brcmf_pcie_download_fw_nvram(struct brcmf_pciedev_info *devinfo,
+ 					 t277_struct[2], t277_struct[3]);
+ 			}
+ 
+-			t276_buf = dma_alloc_coherent(&devinfo->pdev->dev,
+-						      BCM4360_T276_OLMSG_BUF_SIZE,
+-						      &t276_dma, GFP_KERNEL);
++			/* test.317: no_sharedinfo -- the host performs ZERO
++			 * pre-release writes into TCM/DMA (no ring buffer, no
++			 * shared_info): maximal kimptoc test.28 substrate. The
++			 * NULL t276_buf takes the !t276_buf branch below with
++			 * its own log line. */
++			t276_buf = NULL;
++			if (!bcm4360_test317_no_sharedinfo)
++				t276_buf = dma_alloc_coherent(&devinfo->pdev->dev,
++							      BCM4360_T276_OLMSG_BUF_SIZE,
++							      &t276_dma, GFP_KERNEL);
+ 			if (!t276_buf) {
+-				pr_emerg("BCM4360 test.276: dma_alloc_coherent FAILED; skipping shared_info write\n");
++				if (bcm4360_test317_no_sharedinfo)
++					pr_emerg("BCM4360 test.317: shared_info + olmsg ring writes SKIPPED (no_sharedinfo=1 -- zero host TCM/DMA writes pre-release, kimptoc test.28 substrate; T276 poll + T277 POST-POLL dump below stay as READS on the fw-published si[+0x010])\n");
++				else
++					pr_emerg("BCM4360 test.276: dma_alloc_coherent FAILED; skipping shared_info write\n");
+ 			} else {
+ 				__le32 *p = (__le32 *)t276_buf;
+ 
+@@ -3343,7 +3360,8 @@ static int brcmf_pcie_download_fw_nvram(struct brcmf_pciedev_info *devinfo,
+ 		 * response fields. Log on any change, continue for the
+ 		 * full 2 s (Phase 4B showed both TCM updates and mailbox
+ 		 * signals). */
+-		if (bcm4360_test276_shared_info && devinfo->t276_olmsg_buf) {
++		if (bcm4360_test276_shared_info &&
++		    (devinfo->t276_olmsg_buf || bcm4360_test317_no_sharedinfo)) {
+ 			u32 last_fw_status = 0xdeadbeef;
+ 			u32 last_fw_init = 0xdeadbeef;
+ 			u32 last_mbxint = 0xdeadbeef;
+@@ -3392,11 +3410,24 @@ static int brcmf_pcie_download_fw_nvram(struct brcmf_pciedev_info *devinfo,
+ 				pr_emerg("BCM4360 test.277: POST-POLL struct-ptr from si[+0x010]=0x%08x\n",
+ 					 t277_ptr);
+ 
++				/* test.317 fallback: on a no-write boot the fw may
++				 * skip publishing si[+0x010] -- fall back to the
++				 * Phase-4B-observed struct ptr so the wr_idx
++				 * discriminator survives (fires #6-#10: si reads
++				 * 0x9af88, struct buf_addr=0x96f78, wr_idx=0x27d). */
+ 				if (t277_ptr == 0 ||
+ 				    t277_ptr >= devinfo->ci->ramsize) {
+-					pr_emerg("BCM4360 test.277: POST-POLL struct-ptr not a valid TCM address (ramsize=0x%x); skipping struct read\n",
+-						 devinfo->ci->ramsize);
+-				} else {
++					if (bcm4360_test317_no_sharedinfo) {
++						pr_emerg("BCM4360 test.317: si[+0x010]=0x%08x -- fw did not publish the console ptr on a no-write boot; FALLBACK to the observed Phase-4B struct ptr 0x9af88\n",
++							 t277_ptr);
++						t277_ptr = 0x9af88;
++					} else {
++						pr_emerg("BCM4360 test.277: POST-POLL struct-ptr not a valid TCM address (ramsize=0x%x); skipping struct read\n",
++							 devinfo->ci->ramsize);
++					}
++				}
++				if (t277_ptr != 0 &&
++				    t277_ptr < devinfo->ci->ramsize) {
+ 					for (t277_j = 0;
+ 					     t277_j < BCM4360_T277_STRUCT_DWORDS;
+ 					     t277_j++)
+@@ -4096,6 +4127,27 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
+ 			goto fail;
+ 	}
+ 
++	/* BCM4360 test.317 fire #11 (no_olmsg): skip the ENTIRE post-release
++	 * olmsg side -- select_core, request_irq (incl. the test.312b MBM RMW
++	 * |=0x100), commonring hookup, brcmf_attach (preinit dcmds + the first
++	 * H2D doorbell), the test.312 liveness gate, the test.314 ring autopsy,
++	 * the fwcon timer: after the ARM release + the test.315 discriminator
++	 * reads the host does ZERO MMIO writes. The T276 2 s poll + the T277
++	 * POST-POLL struct/HEAD dump already ran inside
++	 * brcmf_pcie_download_fw_nvram (before this point), so the evidence is
++	 * on disk; the console TAIL is deliberately OFF (fire #10: the 25-dword
++	 * burst killed kernel printk). The T309 hold gives the same end state
++	 * as every previous fire: device bound, no wiphy, no IRQ armed --
++	 * reboot clears, do NOT rmmod. */
++	if (bcm4360_test317_no_olmsg &&
++	    devinfo->ci->chip == BRCM_CC_4360_CHIP_ID &&
++	    bcm4360_olmsg_active(devinfo)) {
++		pr_emerg("BCM4360 test.317: no_olmsg=1 -- select_core/request_irq/attach/doorbell/mask-RMW/autopsy SKIPPED (zero host writes post-release, maximal kimptoc test.28 replication: bare download+release+reads) -- holding device\n");
++		if (bcm4360_test309_olmsg_zero_teardown)
++			bcm4360_t309_olmsg_zero_teardown_hold(devinfo, 0);
++		return;
++	}
++
+ 	/* test.310: post-poll bracketing. Fire #4 and fire #5 both wedged at
+ 	 * the poll-loop EXIT (experiment #4 report sec.7) -- the very next
+ 	 * MMIO steps are these: config-space select_core, BAR0+0x4C write,

@@ -1,0 +1,191 @@
+From 6852cc43be6192fc629a48f2b3e1d31bf2137347 Mon Sep 17 00:00:00 2001
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Date: Wed, 9 Sep 2026 16:20:42 +0200
+Subject: [PATCH 19/19] test319: full console dump (<=10-dword chunks) + peek0/1/2
+ TCM helper
+
+---
+ brcmfmac/pcie.c | 160 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 160 insertions(+)
+
+diff --git a/brcmfmac/pcie.c b/brcmfmac/pcie.c
+index 649cefb..e9fb78b 100644
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -309,6 +309,19 @@ static uint bcm4360_test318_cons_tail10;
+ module_param(bcm4360_test318_cons_tail10, uint, 0644);
+ MODULE_PARM_DESC(bcm4360_test318_cons_tail10, "BCM4360 test.318 fire #12 safe console TAIL: the test316_console_tail 25-dword read killed printk in fire #10 (new hang class) -- this param is its safe replacement (INDEPENDENT of bcm4360_test316_console_tail; runs when 1 and the test.277 POST-POLL struct dump executed): read the LAST min(wr_idx, 40) bytes of the fw console buffer ENDING at wr_idx (4 B-aligned start, <=3 B of older text in front, <=10 dwords, same TCM read-ram32 chunk mechanism as the test316 TAIL), print EXACTLY: one %*ph hex pr_emerg line + one %*pE ascii pr_emerg line in the exact style of the HEAD dump lines (that print class always survived; fire #10 printk died inside the 25-dword TAIL). Skipped with log lines when wr_idx=0 / struct invalid (buf_addr not in TCM, wr_idx>buf_size), test.278-style, same as test316. (1=enable, 0=off)");
+ 
++static uint bcm4360_test319_console_dump;
++module_param(bcm4360_test319_console_dump, uint, 0644);
++MODULE_PARM_DESC(bcm4360_test319_console_dump, "BCM4360 test.319 fire #13 (phase R1, full console evidence): dump the WHOLE fw console content (wr_idx bytes, up to buf_size) in chunks of <=40 B (<=10 dwords -- the safe class; the 25-dword test316 TAIL died in fire #10; TAIL10 in fire #12/12b verified safe). Runs when 1 and the test.277 POST-POLL struct dump executed and validates (wr_idx>0, buf_addr in TCM, wr_idx<=buf_size, test.278-style) -- reads AFTER the fw re-published its struct (SBR does NOT clear TCM -- experiment-12: read the fresh publication, not stale pre-boot data). Each chunk: one %*ph hex pr_emerg line + one %*pE ascii pr_emerg line with absolute offset [0xXXXX..0xXXXX) -- the HEAD+TAIL10 windows already known (fires #6-#12); this fills the unseen middle (fire #12: 469 B between offset 128 and 597 -- the boot sequence printout, freeze fingerprint = second Chipc line '...pmucaps 0x10a22b11\\r' ending at wr_idx). (1=enable, 0=off)");
++static uint bcm4360_test319_peek0;
++module_param(bcm4360_test319_peek0, uint, 0644);
++MODULE_PARM_DESC(bcm4360_test319_peek0, "BCM4360 test.319 fire #13 (phase R1): peek0 helper -- when nonzero, dump 16 dwords (64 B) at this TCM-absolute address via brcmf_pcie_read_ram32, one pr_emerg line per dword ('  +0xNN: 0x%08x'), bracketed; for the R1 breakcrumbs/SP/wl_struct/sched_ctx evidence (addresses resolved by fw-static analysis; 0 = skip). Runs where the POST-POLL dump runs (test277=1). (default 0, 0=skip)");
++static uint bcm4360_test319_peek1;
++module_param(bcm4360_test319_peek1, uint, 0644);
++MODULE_PARM_DESC(bcm4360_test319_peek1, "BCM4360 test.319 fire #13 (phase R1): peek1 helper -- when nonzero, dump 16 dwords (64 B) at this TCM-absolute address via brcmf_pcie_read_ram32, one pr_emerg line per dword ('  +0xNN: 0x%08x'), bracketed; for the R1 breakcrumbs/SP/wl_struct/sched_ctx evidence (addresses resolved by fw-static analysis; 0 = skip). Runs where the POST-POLL dump runs (test277=1). (default 0, 0=skip)");
++static uint bcm4360_test319_peek2;
++module_param(bcm4360_test319_peek2, uint, 0644);
++MODULE_PARM_DESC(bcm4360_test319_peek2, "BCM4360 test.319 fire #13 (phase R1): peek2 helper -- when nonzero, dump 16 dwords (64 B) at this TCM-absolute address via brcmf_pcie_read_ram32, one pr_emerg line per dword ('  +0xNN: 0x%08x'), bracketed; for the R1 breakcrumbs/SP/wl_struct/sched_ctx evidence (addresses resolved by fw-static analysis; 0 = skip). Runs where the POST-POLL dump runs (test277=1). (default 0, 0=skip)");
++
+ static int bcm4360_test308_olmsg_cdc;
+ module_param(bcm4360_test308_olmsg_cdc, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test308_olmsg_cdc, "BCM4360 test.308: PCI-CDC (olmsg) transport, phase 1+2. Phase 1: replace the msgbuf sharedram-ptr handshake poll (TCM[ramsize-4], guaranteed -ENODEV on this fw) with a best-effort si[+0x2028] poll (10 ms x 200, then CONTINUE), skip msgbuf shared-struct/ring setup, proto_type=BCDC. Phase 2: txctl/rxctl over the olmsg ring (T276 DMA buffer -- requires bcm4360_test276_shared_info=1), D2H drain in the threaded ISR on BAR0+0x48 bit 8, per-cycle mask BAR0+0x4C |= 0x100. txdata stays a stub until phase 3. Gated: only for chip 4360; all other chips keep the msgbuf path. (1=enable, 0=off)");
+@@ -3658,6 +3671,153 @@ static int brcmf_pcie_download_fw_nvram(struct brcmf_pciedev_info *devinfo,
+ 								 t10_chunk);
+ 						}
+ 					}
++					/* BCM4360 test.319 fire #13 (phase R1): FULL console
++					 * dump. The HEAD (first 128 B) and TAIL10 (last
++					 * 40 B) windows are already known (fires #6-#12);
++					 * this fills the unseen middle (fire #12: 469 B
++					 * between offset 128 and 597 -- the boot sequence
++					 * printout, freeze fingerprint: the second Chipc
++					 * line '...pmucaps 0x10a22b11\r' under wr_idx=637).
++					 * The WHOLE wr_idx content (wr_idx bytes, up to
++					 * buf_size) is read in chunks of <=40 B (<=10
++					 * dwords -- the safe class: the 25-dword test316
++					 * TAIL burst killed kernel printk in fire #10;
++					 * TAIL10 verified safe in fire #12/12b) and every
++					 * chunk is printed IMMEDIATELY (one %*ph hex + one
++					 * %*pE ascii pr_emerg line, absolute offsets)
++					 * BEFORE the next chunk is read -- reads stay
++					 * interleaved with printk, never 10+ dwords in a
++					 * single burst. Reads only AFTER the fw re-published
++					 * its struct (SBR does NOT clear TCM -- experiment
++					 * -12: read the fresh publication, not stale
++					 * pre-boot data). INDEPENDENT of
++					 * bcm4360_test316/317/318 -- runs whenever this
++					 * POST-POLL dump runs. */
++					if (bcm4360_test319_console_dump) {
++						u32 cd_buf = t277_struct[0];
++						u32 cd_bsz = t277_struct[1];
++						u32 cd_wr = t277_struct[2];
++						u32 cd_bytes;
++						u32 cd_chunks;
++						u32 cd_off;
++						u32 cd_n;
++						u32 cd_k;
++						u8 cd_chunk[40];
++						u32 *cd_u32 = (u32 *)cd_chunk;
++
++						if (cd_wr == 0) {
++							pr_emerg("BCM4360 test.319: full console dump skipped (wr_idx=0 -- the fw never wrote the console)\n");
++						} else if (cd_buf == 0 || cd_buf >=
++								   devinfo->ci->ramsize || cd_bsz == 0 ||
++								   cd_bsz > devinfo->ci->ramsize ||
++								   cd_wr > cd_bsz) {
++							pr_emerg("BCM4360 test.319: full console dump struct invalid (buf_addr=0x%08x buf_size=0x%08x wr_idx=0x%08x ramsize=0x%x) -- skipped\n",
++									 cd_buf, cd_bsz, cd_wr,
++									 devinfo->ci->ramsize);
++						} else {
++							cd_bytes = cd_wr;
++							cd_chunks = (cd_bytes + 39) / 40;
++							pr_emerg("BCM4360 test.319: full console dump START (wr_idx=%u @0x%08x, %u chunks of <=40 B)\n",
++									 cd_wr, cd_buf, cd_chunks);
++							for (cd_off = 0; cd_off < cd_bytes;
++								 cd_off += 40) {
++								cd_n = min_t(u32, cd_bytes - cd_off,
++											 (u32)40);
++								for (cd_k = 0; cd_k < (cd_n + 3) / 4;
++									 cd_k++)
++									cd_u32[cd_k] =
++										brcmf_pcie_read_ram32(
++											devinfo, cd_buf + cd_off +
++											cd_k * 4);
++								pr_emerg("BCM4360 test.319: console [+0x%04x..+0x%04x) hex: %*ph\n",
++										 cd_off, cd_off + cd_n,
++										 (int)cd_n, cd_chunk);
++								pr_emerg("BCM4360 test.319: console [+0x%04x..+0x%04x) ascii: %*pE\n",
++										 cd_off, cd_off + cd_n,
++										 (int)cd_n, cd_chunk);
++							}
++							pr_emerg("BCM4360 test.319: full console dump END (%u chunks)\n",
++									 cd_chunks);
++						}
++					}
++					/* BCM4360 test.319 fire #13 (phase R1): peek0
++					 * helper -- R1 evidence probe: 16 dwords (64 B) at
++					 * a TCM-absolute address resolved by fw-static
++					 * analysis (breakcrumbs / SP / wl_struct /
++					 * sched_ctx). Same read mechanism as the
++					 * struct/HEAD dumps. 0 = skip. */
++					if (bcm4360_test319_peek0 != 0) {
++						u32 pk0_addr = bcm4360_test319_peek0;
++						u32 pk0_i;
++						u32 pk0_v;
++
++						if (pk0_addr >= devinfo->ci->ramsize) {
++							pr_emerg("BCM4360 test.319: peek0 skipped (TCM@0x%08x >= ramsize=0x%x)\n",
++									 pk0_addr, devinfo->ci->ramsize);
++						} else {
++							pr_emerg("BCM4360 test.319: peek0 TCM@0x%08x (16 dwords)\n",
++									 pk0_addr);
++							for (pk0_i = 0; pk0_i < 16; pk0_i++) {
++								pk0_v = brcmf_pcie_read_ram32(devinfo,
++									 pk0_addr +
++									 pk0_i * 4);
++								pr_emerg("BCM4360 test.319: peek0   +0x%02x: 0x%08x\n",
++										 pk0_i * 4, pk0_v);
++							}
++						}
++					}
++					/* BCM4360 test.319 fire #13 (phase R1): peek1
++					 * helper -- R1 evidence probe: 16 dwords (64 B) at
++					 * a TCM-absolute address resolved by fw-static
++					 * analysis (breakcrumbs / SP / wl_struct /
++					 * sched_ctx). Same read mechanism as the
++					 * struct/HEAD dumps. 0 = skip. */
++					if (bcm4360_test319_peek1 != 0) {
++						u32 pk1_addr = bcm4360_test319_peek1;
++						u32 pk1_i;
++						u32 pk1_v;
++
++						if (pk1_addr >= devinfo->ci->ramsize) {
++							pr_emerg("BCM4360 test.319: peek1 skipped (TCM@0x%08x >= ramsize=0x%x)\n",
++									 pk1_addr, devinfo->ci->ramsize);
++						} else {
++							pr_emerg("BCM4360 test.319: peek1 TCM@0x%08x (16 dwords)\n",
++									 pk1_addr);
++							for (pk1_i = 0; pk1_i < 16; pk1_i++) {
++								pk1_v = brcmf_pcie_read_ram32(devinfo,
++									 pk1_addr +
++									 pk1_i * 4);
++								pr_emerg("BCM4360 test.319: peek1   +0x%02x: 0x%08x\n",
++										 pk1_i * 4, pk1_v);
++							}
++						}
++					}
++					/* BCM4360 test.319 fire #13 (phase R1): peek2
++					 * helper -- R1 evidence probe: 16 dwords (64 B) at
++					 * a TCM-absolute address resolved by fw-static
++					 * analysis (breakcrumbs / SP / wl_struct /
++					 * sched_ctx). Same read mechanism as the
++					 * struct/HEAD dumps. 0 = skip. */
++					if (bcm4360_test319_peek2 != 0) {
++						u32 pk2_addr = bcm4360_test319_peek2;
++						u32 pk2_i;
++						u32 pk2_v;
++
++						if (pk2_addr >= devinfo->ci->ramsize) {
++							pr_emerg("BCM4360 test.319: peek2 skipped (TCM@0x%08x >= ramsize=0x%x)\n",
++									 pk2_addr, devinfo->ci->ramsize);
++						} else {
++							pr_emerg("BCM4360 test.319: peek2 TCM@0x%08x (16 dwords)\n",
++									 pk2_addr);
++							for (pk2_i = 0; pk2_i < 16; pk2_i++) {
++								pk2_v = brcmf_pcie_read_ram32(devinfo,
++									 pk2_addr +
++									 pk2_i * 4);
++								pr_emerg("BCM4360 test.319: peek2   +0x%02x: 0x%08x\n",
++										 pk2_i * 4, pk2_v);
++							}
++						}
++					}
+ 				}
+ 			}
+ 		}
+-- 
+2.55.0
+

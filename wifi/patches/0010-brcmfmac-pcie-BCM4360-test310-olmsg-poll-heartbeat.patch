@@ -1,0 +1,117 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 10/10] brcmfmac: pcie: BCM4360 test.310 olmsg phase-1 poll heartbeat + cadence
+
+Fire T308 (experiment #4) hard-wedged the host INSIDE the test.308 phase-1
+fw_init_done poll (report experiment-4-fire-t308-crash.md): the journal ends
+on "Wait for FW init", the loop's terminal pr_emerg never appeared, and no
+further brcmf_dbg line ever appeared either -- the loop started and never
+exited. Hypothesis 1 (sec.3, ~55%): the poll is the only NEW MMIO profile at
+that point -- ~1 kHz TCM/BAR1 reads against the fw frozen in WFI for 90 s;
+one read never completes, the CPU stays stuck in ioread32, the platform
+wedges silently and >TAbort+ goes sticky. The identical ADDRESS was read
+without incident at 100 Hz by the T276 post-release poll and at 20 Hz by
+fire #3 at the same post-freeze age -- cadence (1 kHz) is the differentiator.
+
+Two changes to the phase-1 poll, both confined to the olmsg branch (only
+runs with bcm4360_test308_olmsg_cdc=1 on chip 4360):
+
+1. Cadence 1 ms -> 10 ms: usleep_range(10000, 11000) -- the cadence proven
+   safe by the T276 poll (100 Hz over the identical si[+0x2028] address, 2 s
+   post-release, both fires clean). Iteration limit scaled 2000 x 1 ms ->
+   200 x 10 ms so the ~2 s time window is unchanged (fw_init_done is not a
+   protocol gate, report sec.9, so the poll stays best-effort/CONTINUE).
+
+2. New module param bcm4360_test310_olmsg_poll_heartbeat (default 0):
+   pr_emerg -- NOT brcmf_dbg, because journald syncs the journal file to
+   disk on KERN_EMERG messages, so the line survives a hard wedge -- every
+   25 iterations (~250 ms), printing the iteration number and the current
+   si[+0x2028] value. In fire T308 nothing bracketed the freeze: the loop's
+   only output came after the last iteration. With the heartbeat, a repeat
+   of the wedge names the exact iteration (and thus the exact read) the
+   host died in.
+
+The cadence change is unconditional inside the phase-1 branch (the branch
+itself is already gated on test308 + chip 4360); the heartbeat is gated on
+the new param so the plain test.308 profile is unchanged when test310=0.
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 37 insertions(+), 5 deletions(-)
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -195,8 +195,23 @@
+ /* EMPIRICAL (report sec.7.4): writer of si[+0x2028] (fw_init_done) not
+  * mapped; poll is best-effort like wl.ko (2 s) and NOT a protocol gate
+  * (report sec.9). si = shared_info base TCM[ramsize-0x2F5C] per test.276. */
+-#define BCM4360_OLMSG_FW_INIT_DONE_POLL_US	1000	/* 1 ms per iteration */
+-#define BCM4360_OLMSG_FW_INIT_DONE_POLL_MAX	2000	/* 2000 x 1 ms = 2 s */
++/* test.310: poll cadence 1 ms -> 10 ms, the cadence proven safe by the
++ * T276 post-release poll (100 Hz over the identical address, pcie.c T276
++ * loop). Fire T308 (experiment #4) hard-wedged the host INSIDE this loop
++ * (report experiment-4-fire-t308-crash.md sec.2/3, hypothesis 1: a ~1 kHz
++ * TCM/BAR1 read stream against the fw frozen in WFI is the only new MMIO
++ * profile at that point; the read never completes -> CPU stuck in
++ * ioread32 -> silent total wedge, >TAbort+ sticky). The iteration limit is
++ * scaled 2000 x 1 ms -> 200 x 10 ms so the ~2 s time window is unchanged.
++ * The heartbeat (bcm4360_test310_olmsg_poll_heartbeat) pr_emerg's every
++ * 25 iterations (~250 ms): pr_emerg makes journald sync the journal file
++ * to disk, so after a hard wedge the last heartbeat brackets the exact
++ * iteration where the host died (1 kHz polling with no heartbeat left the
++ * freeze point unresolvable -- the terminal print of the loop never made
++ * it). */
++#define BCM4360_OLMSG_FW_INIT_DONE_POLL_US	10000	/* 10 ms per iteration */
++#define BCM4360_OLMSG_FW_INIT_DONE_POLL_MAX	200	/* 200 x 10 ms = 2 s */
++#define BCM4360_T310_HEARTBEAT_EVERY		25	/* ~250 ms between beats */
+ /* fw read helper caps a message at 0x400 B total (report sec.2/8,
+  * message_read_helper @0x2E10); larger dcmds must be split (phase 3). */
+ #define BCM4360_OLMSG_MAX_MSG		0x400
+@@ -209,12 +224,16 @@
+ 
+ static int bcm4360_test308_olmsg_cdc;
+ module_param(bcm4360_test308_olmsg_cdc, int, 0644);
+-MODULE_PARM_DESC(bcm4360_test308_olmsg_cdc, "BCM4360 test.308: PCI-CDC (olmsg) transport, phase 1+2. Phase 1: replace the msgbuf sharedram-ptr handshake poll (TCM[ramsize-4], guaranteed -ENODEV on this fw) with a best-effort si[+0x2028] poll (1 ms x 2000, then CONTINUE), skip msgbuf shared-struct/ring setup, proto_type=BCDC. Phase 2: txctl/rxctl over the olmsg ring (T276 DMA buffer -- requires bcm4360_test276_shared_info=1), D2H drain in the threaded ISR on BAR0+0x48 bit 8, per-cycle mask BAR0+0x4C |= 0x100. txdata stays a stub until phase 3. Gated: only for chip 4360; all other chips keep the msgbuf path. (1=enable, 0=off)");
++MODULE_PARM_DESC(bcm4360_test308_olmsg_cdc, "BCM4360 test.308: PCI-CDC (olmsg) transport, phase 1+2. Phase 1: replace the msgbuf sharedram-ptr handshake poll (TCM[ramsize-4], guaranteed -ENODEV on this fw) with a best-effort si[+0x2028] poll (10 ms x 200, then CONTINUE), skip msgbuf shared-struct/ring setup, proto_type=BCDC. Phase 2: txctl/rxctl over the olmsg ring (T276 DMA buffer -- requires bcm4360_test276_shared_info=1), D2H drain in the threaded ISR on BAR0+0x48 bit 8, per-cycle mask BAR0+0x4C |= 0x100. txdata stays a stub until phase 3. Gated: only for chip 4360; all other chips keep the msgbuf path. (1=enable, 0=off)");
+ 
+ static int bcm4360_test309_olmsg_zero_teardown;
+ module_param(bcm4360_test309_olmsg_zero_teardown, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test309_olmsg_zero_teardown, "BCM4360 test.309: olmsg zero-teardown fail path. When the test.308 (olmsg) variant fails anywhere in brcmf_pcie_setup() (fw-init, IRQ, attach), the fail path must NOT run the teardown (brcmf_fw_crashed + device_release_driver -> brcmf_pcie_remove -> chip_set_passive/reset_device/release_*): fire T308 wedged the host hard, and experiment #1 wedged exactly on this teardown. Instead: MAILBOXMASK (BAR0+0x4C):=0 (no IRQ can fire), a 10 s passive 1 Hz poll of PCIMailBoxInt (BAR0+0x48), log SUMMARY, and return -- the device stays bound (brcmf_pcie_probe already returned 0), no wiphy. Reboot clears state -- do NOT rmmod. Gated: chip 4360 + test308 (bcm4360_olmsg_active). (1=enable, 0=off)");
+ 
++static int bcm4360_test310_olmsg_poll_heartbeat;
++module_param(bcm4360_test310_olmsg_poll_heartbeat, int, 0644);
++MODULE_PARM_DESC(bcm4360_test310_olmsg_poll_heartbeat, "BCM4360 test.310: heartbeat in the test.308 phase-1 fw_init_done poll -- pr_emerg (not brcmf_dbg, so journald syncs the journal to disk and it survives a hard wedge) every 25 iterations (~250 ms) with the iteration number and si[+0x2028], so the freeze point of a repeat of the fire T308 wedge is bracketed to a single iteration. Requires bcm4360_test308_olmsg_cdc=1. (1=enable, 0=off)");
++
+ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4360_CHIP_ID, 0xFFFFFFFF, 4360),
+@@ -2809,8 +2828,10 @@
+ 		 * msgbuf handshake can never complete -- the 5 s poll would
+ 		 * always -ENODEV. Follow wl.ko (wlc_ol_up @0x80e20): best-
+ 		 * effort poll of si[+0x2028] (fw_init_done, shared_info
+-		 * offset 0x2028) 1 ms x 2000, then CONTINUE regardless --
+-		 * fw_init_done is not a protocol gate (report sec.9). */
++		 * offset 0x2028) 10 ms x 200 (test.310: the T276-proven
++		 * cadence; fire T308 wedged inside this loop at 1 ms), then
++		 * CONTINUE regardless -- fw_init_done is not a protocol gate
++		 * (report sec.9). */
+ 		u32 t308_base = devinfo->ci->ramsize -
+ 				BCM4360_T276_SHARED_INFO_OFFSET;
+ 		u32 fw_done = 0;
+@@ -2823,6 +2844,18 @@
+ 				t308_base + BCM4360_T276_SI_FW_INIT_DONE);
+ 			if (fw_done)
+ 				break;
++			/* test.310: heartbeat every 25 iterations (~250 ms).
++			 * pr_emerg, NOT brcmf_dbg: journald syncs the journal
++			 * file to disk on KERN_EMERG, so the last heartbeat
++			 * survives a hard wedge and brackets the iteration
++			 * the host died in (fire T308 died in this loop with
++			 * no terminal print -- nothing bracketed it). */
++			if (bcm4360_test310_olmsg_poll_heartbeat &&
++			    (t308_loop % BCM4360_T310_HEARTBEAT_EVERY) == 0)
++				pr_emerg("BCM4360 test.310: fw_init_done poll heartbeat iter=%u/%d si[+0x2028]=0x%08x\n",
++					 t308_loop,
++					 BCM4360_OLMSG_FW_INIT_DONE_POLL_MAX,
++					 fw_done);
+ 			usleep_range(BCM4360_OLMSG_FW_INIT_DONE_POLL_US,
+ 				     BCM4360_OLMSG_FW_INIT_DONE_POLL_US * 2);
+ 		}

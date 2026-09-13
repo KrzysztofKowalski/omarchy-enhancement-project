@@ -1,0 +1,523 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 8/8] brcmfmac: pcie: BCM4360 PCI-CDC (olmsg) transport -- phase 1+2 (T308)
+
+The 4360 firmware ("RTE (PCI-CDC) 6.30.223 (TOB)") does not speak msgbuf:
+it never publishes a sharedram pointer at TCM[ramsize-4] (notes/
+wl-cdc-handshake.md sec.3), so the msgbuf handshake can never complete and
+the 5 s poll always ends in -ENODEV. The transport is an olmsg ring in host
+RAM (the T276 64 KB DMA buffer -- fw reads dma_lo from shared_info[+0x04]
+and programs the PCIE2 window itself) plus PCIE2 mailbox doorbells, per
+wl.ko bcm_olmsg_* (ground truth, report sec.2).
+
+Phase 1 (handshake bypass, gated on chip 4360 + bcm4360_test308_olmsg_cdc):
+- replace the TCM[ramsize-4] poll with a best-effort si[+0x2028]
+  (fw_init_done) poll of 1 ms x 2000 like wl.ko, then CONTINUE (fw_init_done
+  is not a protocol gate, report sec.9);
+- skip the msgbuf shared-struct/ring setup (init_ringbuffers,
+  init_scratchbuffers, commonring/flowring hookup) and
+  init_share_ram_info;
+- proto_type = BRCMF_PROTO_BCDC (brcmf_proto_attach() then installs
+  brcmf_proto_bcdc_attach() instead of brcmf_proto_msgbuf_attach, proto.c).
+
+Phase 2 (olmsg transport):
+- txctl: {type, seq, len} + payload into the H2D half of the ring
+  (header {0x20,0x7800,0,0} @+0x00, data @0x20..0x7820), publish wr_ptr in
+  the ring header (+0x0C), doorbell BAR0+0x48 |= 0x1 (wl.ko @0x7ef9e);
+- rxctl: wait_event on the response waitqueue, return the seq-matched D2H
+  payload (multi-fragment append supported);
+- threaded ISR: on BAR0+0x48 bit 0x100 -- W1C that bit only, drain the D2H
+  half (header {0x7820,0x7800,0,0} @+0x10, data @0x7820..0xF020);
+  seq-matched messages wake rxctl, everything else goes to bcdc via
+  brcmf_rx_frame(dev, skb, true, true); per-cycle mask RMW BAR0+0x4C |= 0x100
+  (wl.ko wlc_ol_enable_intrs pattern).
+- txdata stays a stub until phase 3 (dcmds first).
+
+All empirically uncertain values are #defines annotated with the report
+sec.7 item they await (D2H bit, H2D doorbell bit, dngl CDC device type,
+fw_init_done writer): resolved on fire, not guessed. Requires
+bcm4360_test276_shared_info=1 for the ring buffer (the T276 DMA buffer is
+the olmsg ring). Every other chip keeps the msgbuf path unchanged.
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 360 insertions(+), 29 deletions(-)
+diff --git a/brcmfmac/pcie.c b/brcmfmac/pcie.c
+index e7bedb3..06060b8 100644
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -148,6 +148,69 @@
+ module_param(bcm4360_test307_zero_teardown, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test307_zero_teardown, "BCM4360 test.307: zero-teardown fail path. On fw-init timeout (download_fw_nvram returns -ENODEV): MAILBOXMASK (BAR0+0x4C):=0 so no IRQ can ever fire, then poll BAR0+0x48 (PCIMailBoxInt) every 1 s for 60 s to observe whether fw signals D2H (bit 8) at all. Probe returns success, device stays bound, NO teardown (no device_release_driver -> no wedge window, experiment #1). Reboot clears state -- do NOT rmmod. (1=enable, 0=off)");
+ 
++/* ==== BCM4360 test.308: PCI-CDC (olmsg) transport -- phase 1 + 2 ====
++ * The 4360 fw ("RTE (PCI-CDC) 6.30.223") does not speak msgbuf: it never
++ * publishes a sharedram pointer at TCM[ramsize-4] (report wl-cdc-handshake.md
++ * sec.3), so the msgbuf handshake can never complete. The transport is an
++ * olmsg ring in host RAM (the T276 64 KB DMA buffer, fw reads dma_lo from
++ * shared_info[+0x04] and programs the PCIE2 window itself) plus PCIE2
++ * mailbox doorbells. Protocol ground truth: wl.ko bcm_olmsg_* (report sec.2).
++ *
++ * Ring layout (64 KB coherent buffer; the fw-side bcm_olmsg_init parses the
++ * two 16 B headers inside the buffer, so the T276 pre-release writes them):
++ *   +0x000 H2D header {data_off=0x20, size=0x7800, rd_ptr, wr_ptr}
++ *   +0x020..0x7820 H2D data (host writes, fw reads)
++ *   +0x010 D2H header {data_off=0x7820, size=0x7800, rd_ptr, wr_ptr}
++ *   +0x7820..0xF020 D2H data (fw writes, host reads)
++ *   message: {type u32, seq u32, len u32} + payload; total = len + 12.
++ * H2D signal: BAR0+0x48 |= 0x1 (wl.ko @0x7ef9e).
++ * D2H signal: BAR0+0x48 bit 8 (0x100); W1C that bit; per-cycle mask
++ * BAR0+0x4C |= 0x100 (wl.ko wlc_ol_intstatus/wlc_ol_enable_intrs @0x7f6be).
++ *
++ * The empirically uncertain values are #defines below, each annotated with
++ * the report sec.7 item it awaits -- resolved on fire, not guessed here.
++ */
++#define BCM4360_OLMSG_MSG_HDR_LEN	12	/* {type, seq, len} u32s */
++#define BCM4360_OLMSG_H2D_DATA_OFF	0x20	/* == BCM4360_T276_OLMSG_HDR_SIZE */
++#define BCM4360_OLMSG_D2H_DATA_OFF	0x7820	/* H2D hdr + H2D ring size */
++#define BCM4360_OLMSG_RING_SIZE		0x7800	/* == BCM4360_T276_OLMSG_RING_SIZE */
++/* EMPIRICAL (report sec.7.5): dngl device type for the CDC device in dcmd
++ * (dongle) mode -- index into the fw dngl device table ([dev+0x40], count
++ * [dev+0x48], dngl_finddev @0x2038). wl-split mode uses 0x4/0x10/0x11/0x12/
++ * 0x15, but the dongle-mode CDC index is not statically known; on fire the
++ * fw console will report an unknown type if this is wrong (phase 3). */
++#define BCM4360_OLMSG_TYPE_CDC_DCMD	0x4
++/* EMPIRICAL (report sec.7.2): H2D doorbell. wl.ko does RMW BAR0+0x48 |= 0x1;
++ * candidate PCIH2D_DB1 (0x144, bcmdhd naming) -- resolve on fire. */
++#define BCM4360_OLMSG_DB_H2D		0x00000001
++/* EMPIRICAL (report sec.7.1): D2H interrupt bit. wl.ko tests BAR0+0x48 bit 8
++ * (0x100, == BRCMF_PCIE_MB_INT_FN0_0); kimptoc saw intstatus 0x300 /
++ * mailboxint 0x03 -- possible different register views; the ISR reads the
++ * whole word and only this bit is W1C'ed/drained. */
++#define BCM4360_OLMSG_INT_D2H		0x00000100
++/* D2H mask re-armed per ISR cycle (wl.ko wlc_ol_enable_intrs): RMW
++ * BAR0+0x4C |= 0x100. Empirically 0x100 on wl.ko, 0x103 on bcmdhd,
++ * 0x300|0xFF0000 on brcmfmac msgbuf (sec.7.1). */
++#define BCM4360_OLMSG_INT_MASK		0x00000100
++/* EMPIRICAL (report sec.7.4): writer of si[+0x2028] (fw_init_done) not
++ * mapped; poll is best-effort like wl.ko (2 s) and NOT a protocol gate
++ * (report sec.9). si = shared_info base TCM[ramsize-0x2F5C] per test.276. */
++#define BCM4360_OLMSG_FW_INIT_DONE_POLL_US	1000	/* 1 ms per iteration */
++#define BCM4360_OLMSG_FW_INIT_DONE_POLL_MAX	2000	/* 2000 x 1 ms = 2 s */
++/* fw read helper caps a message at 0x400 B total (report sec.2/8,
++ * message_read_helper @0x2E10); larger dcmds must be split (phase 3). */
++#define BCM4360_OLMSG_MAX_MSG		0x400
++/* ctl response wait budget for brcmf_pcie_rx_ctlpkt (txctl returns after the
++ * doorbell; the response arrives asynchronously via the D2H ring). */
++#define BCM4360_OLMSG_CTL_RESP_TIMEOUT_MS	5000
++/* internal ctl response buffer: max BCDC dcmd payload + 16 B dcmd header;
++ * multi-fragment D2H responses (same seq) are appended up to this size. */
++#define BCM4360_OLMSG_CTL_RESP_SIZE	(BRCMF_DCMD_MAXLEN + 16)
++
++static int bcm4360_test308_olmsg_cdc;
++module_param(bcm4360_test308_olmsg_cdc, int, 0644);
++MODULE_PARM_DESC(bcm4360_test308_olmsg_cdc, "BCM4360 test.308: PCI-CDC (olmsg) transport, phase 1+2. Phase 1: replace the msgbuf sharedram-ptr handshake poll (TCM[ramsize-4], guaranteed -ENODEV on this fw) with a best-effort si[+0x2028] poll (1 ms x 2000, then CONTINUE), skip msgbuf shared-struct/ring setup, proto_type=BCDC. Phase 2: txctl/rxctl over the olmsg ring (T276 DMA buffer -- requires bcm4360_test276_shared_info=1), D2H drain in the threaded ISR on BAR0+0x48 bit 8, per-cycle mask BAR0+0x4C |= 0x100. txdata stays a stub until phase 3. Gated: only for chip 4360; all other chips keep the msgbuf path. (1=enable, 0=off)");
++
+ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4360_CHIP_ID, 0xFFFFFFFF, 4360),
+@@ -430,6 +493,15 @@
+ 	dma_addr_t t276_olmsg_dma;
+ 	/* BCM4360 test.278: cursor for delta console dumps. */
+ 	u32 t278_prev_write_idx;
++	/* BCM4360 test.308: olmsg transport state (PCI-CDC variant). */
++	u32 olmsg_h2d_wr;		/* H2D ring write ptr, bytes in data area */
++	u32 olmsg_d2h_rd;		/* D2H ring read ptr, bytes in data area */
++	u32 olmsg_seq;			/* outgoing message sequence counter */
++	wait_queue_head_t olmsg_resp_wait;
++	u32 olmsg_resp_seq;		/* seq of the outstanding ctl (if pending) */
++	bool olmsg_resp_pending;	/* true while a ctl waits for a response */
++	u32 olmsg_resp_len;		/* bytes accumulated in olmsg_resp_data */
++	u8 olmsg_resp_data[BCM4360_OLMSG_CTL_RESP_SIZE];
+ #ifdef DEBUG
+ 	u32 console_interval;
+ 	bool console_active;
+@@ -919,6 +991,149 @@
+ 		 max_val, last);
+ }
+ 
++/* ==== BCM4360 test.308: olmsg transport (phase 2) ====
++ * H2D ring: host appends {type, seq, len} + payload at H2D_DATA_OFF + w,
++ * publishes the new wr_ptr into the ring header (+0x0C), then doorbells
++ * BAR0+0x48 |= 0x1. D2H ring: fw appends and publishes wr_ptr (+0x1C); the
++ * host drains from its rd_ptr and publishes rd_ptr back (+0x18). Both
++ * pointers are byte offsets into the 0x7800 data area; wrap restarts at 0
++ * (no partial message at the tail -- wl.ko bcm_olmsg behaves likewise;
++ * see report sec.7.9 uncertainty).
++ */
++static bool bcm4360_olmsg_active(struct brcmf_pciedev_info *devinfo)
++{
++	return bcm4360_test308_olmsg_cdc &&
++	       devinfo->ci && devinfo->ci->chip == BRCM_CC_4360_CHIP_ID;
++}
++
++static int bcm4360_olmsg_write(struct brcmf_pciedev_info *devinfo, u32 type,
++			       const u8 *payload, u32 len)
++{
++	struct brcmf_bus *bus = dev_get_drvdata(&devinfo->pdev->dev);
++	u8 *buf = devinfo->t276_olmsg_buf;
++	__le32 *hdr;
++	u32 mlen = len + BCM4360_OLMSG_MSG_HDR_LEN;
++	u32 w;
++
++	if (!buf) {
++		brcmf_err(bus, "olmsg: ring buffer missing (need bcm4360_test276_shared_info=1)\n");
++		return -EIO;
++	}
++	if (mlen > BCM4360_OLMSG_MAX_MSG) {
++		/* fw message_read_helper caps a message at 0x400 B; dcmds
++		 * beyond that need splitting (deferred to phase 3). */
++		brcmf_err(bus, "olmsg: message %u B exceeds fw cap 0x%x\n",
++			  mlen, BCM4360_OLMSG_MAX_MSG);
++		return -E2BIG;
++	}
++	w = devinfo->olmsg_h2d_wr;
++	if (w + mlen > BCM4360_OLMSG_RING_SIZE)
++		w = 0;	/* wrap: restart at ring start (report sec.7.9) */
++
++	hdr = (__le32 *)(buf + BCM4360_OLMSG_H2D_DATA_OFF + w);
++	hdr[0] = cpu_to_le32(type);
++	hdr[1] = cpu_to_le32(devinfo->olmsg_seq);
++	hdr[2] = cpu_to_le32(len);
++	if (len)
++		memcpy(buf + BCM4360_OLMSG_H2D_DATA_OFF + w +
++		       BCM4360_OLMSG_MSG_HDR_LEN, payload, len);
++	w += mlen;
++	if (w >= BCM4360_OLMSG_RING_SIZE)
++		w -= BCM4360_OLMSG_RING_SIZE;
++	devinfo->olmsg_h2d_wr = w;
++
++	/* publish the new wr_ptr in the H2D ring header, then ring the
++	 * doorbell (wl.ko RMW BAR0+0x48 |= 0x1, @0x7ef9e). */
++	wmb();
++	*(__le32 *)(buf + 0x0C) = cpu_to_le32(w);
++	wmb();
++	brcmf_pcie_write_reg32(devinfo, BRCMF_PCIE_PCIE2REG_MAILBOXINT,
++			       brcmf_pcie_read_reg32(devinfo,
++					BRCMF_PCIE_PCIE2REG_MAILBOXINT) |
++			       BCM4360_OLMSG_DB_H2D);
++	brcmf_dbg(PCIE, "olmsg: H2D type=0x%x seq=%u len=%u w_ptr=%u\n",
++		  type, devinfo->olmsg_seq, len, w);
++	return 0;
++}
++
++/* Drain one D2H message: a seq match against the outstanding ctl delivers
++ * the payload to rxctl's response buffer (appended across fragments, same
++ * seq); anything else is handed to brcmf_rx_frame() so bcdc gets
++ * events/frames (BCDC hdrpull drops non-BCDC payloads with a log). */
++static void bcm4360_olmsg_handle_msg(struct brcmf_pciedev_info *devinfo,
++				     u32 type, u32 seq, const u8 *data, u32 len)
++{
++	struct brcmf_bus *bus = dev_get_drvdata(&devinfo->pdev->dev);
++
++	if (devinfo->olmsg_resp_pending && seq == devinfo->olmsg_resp_seq) {
++		u32 room = BCM4360_OLMSG_CTL_RESP_SIZE -
++			   devinfo->olmsg_resp_len;
++		u32 n = min(len, room);
++
++		memcpy(devinfo->olmsg_resp_data + devinfo->olmsg_resp_len,
++		       data, n);
++		devinfo->olmsg_resp_len += n;
++		devinfo->olmsg_resp_pending = false;
++		wake_up(&devinfo->olmsg_resp_wait);
++		brcmf_dbg(PCIE, "olmsg: ctl resp seq=%u len=%u (of %u)\n",
++			  seq, n, len);
++	} else if (len) {
++		struct sk_buff *skb = brcmu_pkt_buf_get_skb(len);
++
++		if (!skb) {
++			brcmf_err(bus, "olmsg: skb alloc failed len=%u\n", len);
++		} else {
++			memcpy(skb_put(skb, len), data, len);
++			brcmf_rx_frame(&devinfo->pdev->dev, skb, true, true);
++		}
++	}
++}
++
++static void bcm4360_olmsg_drain_d2h(struct brcmf_pciedev_info *devinfo)
++{
++	struct brcmf_bus *bus = dev_get_drvdata(&devinfo->pdev->dev);
++	u8 *buf = devinfo->t276_olmsg_buf;
++	u32 wr, r;
++
++	if (!buf)
++		return;
++	wr = le32_to_cpu(*(__le32 *)(buf + 0x1C));	/* D2H wr_ptr */
++	r = devinfo->olmsg_d2h_rd;
++	while (r != wr) {
++		__le32 *hdr = (__le32 *)(buf + BCM4360_OLMSG_D2H_DATA_OFF + r);
++		u32 type = le32_to_cpu(hdr[0]);
++		u32 seq = le32_to_cpu(hdr[1]);
++		u32 len = le32_to_cpu(hdr[2]);
++		u32 mlen = len + BCM4360_OLMSG_MSG_HDR_LEN;
++
++		if (mlen > BCM4360_OLMSG_RING_SIZE) {
++			/* corrupt header -- resync read ptr to writer. */
++			brcmf_err(bus, "olmsg: bogus D2H len=%u (type=0x%x); resyncing\n",
++				  len, type);
++			r = wr;
++			break;
++		}
++		if (r + mlen > BCM4360_OLMSG_RING_SIZE) {
++			/* partial message at ring end: writer restarts at 0
++			 * (report sec.7.9), so follow the same rule. */
++			if (r == 0)
++				break;
++			r = 0;
++			continue;
++		}
++		bcm4360_olmsg_handle_msg(devinfo, type, seq,
++					 buf + BCM4360_OLMSG_D2H_DATA_OFF +
++					 r + BCM4360_OLMSG_MSG_HDR_LEN, len);
++		r += mlen;
++		if (r >= BCM4360_OLMSG_RING_SIZE)
++			r -= BCM4360_OLMSG_RING_SIZE;
++	}
++	devinfo->olmsg_d2h_rd = r;
++	/* publish the host read ptr in the D2H ring header (fw reclaims). */
++	wmb();
++	*(__le32 *)(buf + 0x18) = cpu_to_le32(r);
++}
++
+ 
+ static void
+ brcmf_pcie_copy_dev_tomem(struct brcmf_pciedev_info *devinfo, u32 mem_offset,
+@@ -1282,6 +1497,16 @@
+ 
+ static void brcmf_pcie_intr_enable(struct brcmf_pciedev_info *devinfo)
+ {
++	if (bcm4360_olmsg_active(devinfo)) {
++		/* BCM4360 test.308: wl.ko pattern -- per-cycle RMW
++		 * BAR0+0x4C |= 0x100 (wlc_ol_enable_intrs @0x7f6be+). */
++		u32 mask = brcmf_pcie_read_reg32(devinfo,
++						 devinfo->reginfo->mailboxmask);
++
++		brcmf_pcie_write_reg32(devinfo, devinfo->reginfo->mailboxmask,
++				       mask | BCM4360_OLMSG_INT_MASK);
++		return;
++	}
+ 	brcmf_pcie_write_reg32(devinfo, devinfo->reginfo->mailboxmask,
+ 			       devinfo->reginfo->int_d2h_db |
+ 			       devinfo->reginfo->int_fn0);
+@@ -1316,14 +1541,27 @@
+ 	status = brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->mailboxint);
+ 	brcmf_dbg(PCIE, "Enter %x\n", status);
+ 	if (status) {
+-		brcmf_pcie_write_reg32(devinfo, devinfo->reginfo->mailboxint,
+-				       status);
+-		if (status & devinfo->reginfo->int_fn0)
+-			brcmf_pcie_handle_mb_data(devinfo);
+-		if (status & devinfo->reginfo->int_d2h_db) {
+-			if (devinfo->state == BRCMFMAC_PCIE_STATE_UP)
+-				brcmf_proto_msgbuf_rx_trigger(
++		if (bcm4360_olmsg_active(devinfo)) {
++			/* BCM4360 test.308: W1C only the D2H bit (wl.ko
++			 * wlc_ol_intstatus @0x7f6e1) and drain the D2H ring;
++			 * ctl responses wake rxctl, everything else goes to
++			 * bcdc via brcmf_rx_frame(). */
++			brcmf_pcie_write_reg32(devinfo,
++					       devinfo->reginfo->mailboxint,
++					       status & BCM4360_OLMSG_INT_D2H);
++			if (status & BCM4360_OLMSG_INT_D2H)
++				bcm4360_olmsg_drain_d2h(devinfo);
++		} else {
++			brcmf_pcie_write_reg32(devinfo,
++					       devinfo->reginfo->mailboxint,
++					       status);
++			if (status & devinfo->reginfo->int_fn0)
++				brcmf_pcie_handle_mb_data(devinfo);
++			if (status & devinfo->reginfo->int_d2h_db) {
++				if (devinfo->state == BRCMFMAC_PCIE_STATE_UP)
++					brcmf_proto_msgbuf_rx_trigger(
+ 							&devinfo->pdev->dev);
++			}
+ 		}
+ 	}
+ 	brcmf_pcie_bus_console_read(devinfo, false);
+@@ -1838,6 +2076,9 @@
+ 	return 0;
+ }
+ 
++/* BCM4360 test.308 phase 3: txdata over the olmsg ring (type 0x11 TX frame
++ * per wl.ko wlc_ol_armtx @0x7f8b4) is deferred until dcmds work -- keep the
++ * stub so nothing accidentally pushes data on an unverified transport. */
+ static int brcmf_pcie_tx(struct device *dev, struct sk_buff *skb)
+ {
+ 	return 0;
+@@ -1847,6 +2088,27 @@
+ static int brcmf_pcie_tx_ctlpkt(struct device *dev, unsigned char *msg,
+ 				uint len)
+ {
++	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
++	struct brcmf_pciedev_info *devinfo = bus_if->bus_priv.pcie->devinfo;
++	int ret;
++
++	if (!bcm4360_olmsg_active(devinfo))
++		return 0;	/* msgbuf path does not use txctl */
++
++	/* At most one outstanding ctl (bcdc serializes queries); arm the
++	 * pending state BEFORE the doorbell so an immediate D2H response
++	 * (ISR runs in a thread) still matches. */
++	devinfo->olmsg_resp_seq = devinfo->olmsg_seq;
++	devinfo->olmsg_resp_pending = true;
++	devinfo->olmsg_resp_len = 0;
++
++	ret = bcm4360_olmsg_write(devinfo, BCM4360_OLMSG_TYPE_CDC_DCMD,
++				  msg, len);
++	if (ret) {
++		devinfo->olmsg_resp_pending = false;
++		return ret;
++	}
++	devinfo->olmsg_seq++;
+ 	return 0;
+ }
+ 
+@@ -1854,7 +2116,28 @@
+ static int brcmf_pcie_rx_ctlpkt(struct device *dev, unsigned char *msg,
+ 				uint len)
+ {
+-	return 0;
++	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
++	struct brcmf_pciedev_info *devinfo = bus_if->bus_priv.pcie->devinfo;
++	int timeleft;
++
++	if (!bcm4360_olmsg_active(devinfo))
++		return 0;	/* msgbuf path does not use rxctl */
++
++	timeleft = wait_event_interruptible_timeout(
++		devinfo->olmsg_resp_wait, !devinfo->olmsg_resp_pending,
++		msecs_to_jiffies(BCM4360_OLMSG_CTL_RESP_TIMEOUT_MS));
++	if (timeleft == 0) {
++		devinfo->olmsg_resp_pending = false;
++		brcmf_err(bus_if, "olmsg: ctl response timeout\n");
++		return -ETIMEDOUT;
++	}
++	if (timeleft < 0) {
++		devinfo->olmsg_resp_pending = false;
++		return -ERESTARTSYS;
++	}
++	memcpy(msg, devinfo->olmsg_resp_data,
++	       min(len, devinfo->olmsg_resp_len));
++	return devinfo->olmsg_resp_len;
+ }
+ 
+ 
+@@ -2455,6 +2738,35 @@
+ 	}
+ 
+ 	brcmf_dbg(PCIE, "Wait for FW init\n");
++	if (bcm4360_olmsg_active(devinfo)) {
++		/* BCM4360 test.308 phase 1: the PCI-CDC fw never publishes a
++		 * sharedram pointer at TCM[ramsize-4] (report sec.3), so the
++		 * msgbuf handshake can never complete -- the 5 s poll would
++		 * always -ENODEV. Follow wl.ko (wlc_ol_up @0x80e20): best-
++		 * effort poll of si[+0x2028] (fw_init_done, shared_info
++		 * offset 0x2028) 1 ms x 2000, then CONTINUE regardless --
++		 * fw_init_done is not a protocol gate (report sec.9). */
++		u32 t308_base = devinfo->ci->ramsize -
++				BCM4360_T276_SHARED_INFO_OFFSET;
++		u32 fw_done = 0;
++		u32 t308_loop;
++
++		for (t308_loop = 0;
++		     t308_loop < BCM4360_OLMSG_FW_INIT_DONE_POLL_MAX;
++		     t308_loop++) {
++			fw_done = brcmf_pcie_read_ram32(devinfo,
++				t308_base + BCM4360_T276_SI_FW_INIT_DONE);
++			if (fw_done)
++				break;
++			usleep_range(BCM4360_OLMSG_FW_INIT_DONE_POLL_US,
++				     BCM4360_OLMSG_FW_INIT_DONE_POLL_US * 2);
++		}
++		pr_emerg("BCM4360 test.308: fw_init_done poll done after %u ms: si[+0x2028]=0x%08x (best-effort, continuing)\n",
++			 (t308_loop + 1) * BCM4360_OLMSG_FW_INIT_DONE_POLL_US,
++			 fw_done);
++		return 0;
++	}
++
+ 	sharedram_addr = sharedram_addr_written;
+ 	loop_counter = BRCMF_PCIE_FW_UP_TIMEOUT / 50;
+ 	while ((sharedram_addr == sharedram_addr_written) && (loop_counter)) {
+@@ -2898,13 +3210,21 @@
+ 
+ 	devinfo->state = BRCMFMAC_PCIE_STATE_UP;
+ 
+-	ret = brcmf_pcie_init_ringbuffers(devinfo);
+-	if (ret)
+-		goto fail;
++	if (bcm4360_olmsg_active(devinfo)) {
++		/* BCM4360 test.308 phase 1: no msgbuf shared struct exists on
++		 * PCI-CDC (no sharedram publication), so no ring/scratch
++		 * buffers and no commonring hookup -- the olmsg ring is the
++		 * T276 DMA buffer already handed to the fw via shared_info. */
++		init_waitqueue_head(&devinfo->olmsg_resp_wait);
++	} else {
++		ret = brcmf_pcie_init_ringbuffers(devinfo);
++		if (ret)
++			goto fail;
+ 
+-	ret = brcmf_pcie_init_scratchbuffers(devinfo);
+-	if (ret)
+-		goto fail;
++		ret = brcmf_pcie_init_scratchbuffers(devinfo);
++		if (ret)
++			goto fail;
++	}
+ 
+ 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
+ 	ret = brcmf_pcie_request_irq(devinfo);
+@@ -2912,21 +3232,24 @@
+ 		goto fail;
+ 
+ 	/* hook the commonrings in the bus structure. */
+-	for (i = 0; i < BRCMF_NROF_COMMON_MSGRINGS; i++)
+-		bus->msgbuf->commonrings[i] =
+-				&devinfo->shared.commonrings[i]->commonring;
+-
+-	flowrings = kzalloc_objs(*flowrings, devinfo->shared.max_flowrings);
+-	if (!flowrings)
+-		goto fail;
++	if (!bcm4360_olmsg_active(devinfo)) {
++		for (i = 0; i < BRCMF_NROF_COMMON_MSGRINGS; i++)
++			bus->msgbuf->commonrings[i] =
++					&devinfo->shared.commonrings[i]->commonring;
++
++		flowrings = kzalloc_objs(*flowrings,
++					 devinfo->shared.max_flowrings);
++		if (!flowrings)
++			goto fail;
+ 
+-	for (i = 0; i < devinfo->shared.max_flowrings; i++)
+-		flowrings[i] = &devinfo->shared.flowrings[i].commonring;
+-	bus->msgbuf->flowrings = flowrings;
+-
+-	bus->msgbuf->rx_dataoffset = devinfo->shared.rx_dataoffset;
+-	bus->msgbuf->max_rxbufpost = devinfo->shared.max_rxbufpost;
+-	bus->msgbuf->max_flowrings = devinfo->shared.max_flowrings;
++		for (i = 0; i < devinfo->shared.max_flowrings; i++)
++			flowrings[i] = &devinfo->shared.flowrings[i].commonring;
++		bus->msgbuf->flowrings = flowrings;
++
++		bus->msgbuf->rx_dataoffset = devinfo->shared.rx_dataoffset;
++		bus->msgbuf->max_rxbufpost = devinfo->shared.max_rxbufpost;
++		bus->msgbuf->max_flowrings = devinfo->shared.max_flowrings;
++	}
+ 
+ 	init_waitqueue_head(&devinfo->mbdata_resp_wait);
+ 
+@@ -3230,7 +3553,15 @@
+ 	bus->dev = &pdev->dev;
+ 	bus->bus_priv.pcie = pcie_bus_dev;
+ 	bus->ops = &brcmf_pcie_bus_ops;
+-	bus->proto_type = BRCMF_PROTO_MSGBUF;
++	if (bcm4360_olmsg_active(devinfo)) {
++		/* BCM4360 test.308 phase 1: the PCI-CDC fw speaks CDC, not
++		 * msgbuf -- brcmf_proto_attach() dispatches on proto_type
++		 * and will install brcmf_proto_bcdc_attach() instead of
++		 * brcmf_proto_msgbuf_attach() (proto.c). */
++		bus->proto_type = BRCMF_PROTO_BCDC;
++	} else {
++		bus->proto_type = BRCMF_PROTO_MSGBUF;
++	}
+ 	bus->chip = devinfo->coreid;
+ 	bus->wowl_supported = pci_pme_capable(pdev, PCI_D3hot);
+ 	bus->fwvid = drvdata[id->driver_data].vendor;

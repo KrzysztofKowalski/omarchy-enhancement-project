@@ -1,0 +1,41 @@
+# reclocked v5.15 — auto-reclocking of the GT 750M under nouveau (systemd unit, NOT installed)
+# Installation (after a user decision):
+#   sudo cp reclocked.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now reclocked
+# Removal: sudo systemctl disable --now reclocked && sudo rm /etc/systemd/system/reclocked.service
+#
+# The daemon auto-detects a Hyprland session (scans /run/user/*/hypr/*/hyprland.lock)
+# and sets XDG_RUNTIME_DIR + HYPRLAND_INSTANCE_SIGNATURE so hyprctl (root)
+# connects to the user's socket. No Hyprland → fallback to the default profile.
+# Config: /etc/reclocked.conf (see the --config flag). Override: /run/reclocked/override.
+
+[Unit]
+Description=GPU auto-reclock daemon v5.15 (GT 750M / nouveau, profile app-aware)
+After=graphical.target
+# v5.15 (report 116): anti-crash-loop. Restart=on-failure + RestartSec=5
+# brings the daemon back after an unexpected exit (e.g. killed by the kernel on a
+# switcheroo write — boot -2); StartLimit* closes the loop: 3 attempts in a 120 s
+# window, then the unit goes failed (no eternal crash-loop; exiting the dead gate
+# = reclockctl dgpu-on or a reboot, not a service restart).
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# Path to the reclocked binary — adjust to the install location
+# (e.g. built from gpu/reclocked/: make && sudo cp reclocked /usr/local/bin/).
+ExecStart=/usr/local/bin/reclocked --config /etc/reclocked.conf --exit-state 0a
+Restart=on-failure
+RestartSec=5
+# v5.14 (report 114): the daemon in D state (e.g. a vgaswitcheroo read poisoned after
+# a nouveau oops) ignores SIGTERM — without this, a stop takes 90 s, restart "doesn't help".
+# Consistent with the post-power-on recovery (max ~10 s sleep in wait_ready) and the
+# on-exit restore — 15 s is enough.
+TimeoutStopSec=15
+# Syslog → journald (stdout/stderr captured automatically).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical.target

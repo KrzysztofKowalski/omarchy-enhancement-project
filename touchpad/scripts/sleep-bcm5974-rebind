@@ -1,0 +1,173 @@
+#!/bin/sh
+# /usr/lib/systemd/system-sleep/010-bcm5974-rebind
+# bcm5974 touchpad recovery after S3 (MacBook Pro Late 2013, 05ac:0262, Omarchy).
+#
+# INTERIM LAYER — until the move to a kernel with the -omnkp patches
+# (see ../om-kernel: 0016 usb quirks RESET_RESUME + 0017 bcm5974 reset_resume).
+# After -omnkp lands this hook is redundant; remove it with:
+#   ./scripts/install-sleep-hook.sh --uninstall
+#
+# Why this works: after S3 the 05ac:0262 device is usually NOT re-enumerated,
+# so "modprobe -r/-i" does not trigger a probe (no device-add). The hook forces
+# interface REDISCOVERY through the /authorized toggle (usb_set_configuration ->
+# fresh probe of all drivers, evidence: hub.c:2752/2767), escalating to
+# bConfigurationValue, unbind/bind, port disable/enable (full re-enumeration).
+#
+# Full documentation: research/resume-recovery-design.md (design-agent report).
+#
+# systemd-sleep: $1 = pre|post, $2 = suspend|hibernate|...
+
+BCM_VID=05ac
+BCM_PID=0262
+
+log() { printf '%s\n' "bcm5974-rebind: $*" >&2; }
+
+find_dev() {
+    for vf in /sys/bus/usb/devices/*/idVendor; do
+        [ -r "$vf" ] || continue
+        d="${vf%/idVendor}"
+        [ "$(cat "$d/idVendor")" = "$BCM_VID" ] || continue
+        [ -e "$d/idProduct" ] || continue
+        [ "$(cat "$d/idProduct")" = "$BCM_PID" ] || continue
+        printf '%s\n' "$d"
+        return 0
+    done
+    return 1
+}
+
+find_bcm_intf() {
+    local d="$1" i
+    for i in "$d":1.*; do
+        [ -f "$i/modalias" ] || continue
+        case "$(cat "$i/modalias")" in
+            *ic03isc01ip02*) printf '%s\n' "$i"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+find_port() {
+    local rdev hif p
+    rdev=$(readlink -f "$1")
+    for hif in /sys/bus/usb/devices/*:1.0; do
+        [ -d "$hif" ] || continue
+        for p in "$hif"/usb*-port*; do
+            [ -e "$p/device" ] || continue
+            [ "$(readlink -f "$p/device")" = "$rdev" ] && { printf '%s\n' "$p"; return 0; }
+        done
+    done
+    return 1
+}
+
+# wait until $intf is bound to bcm5974 (up to $1 seconds in 0.2s steps)
+wait_bound() {
+    local intf="$1" want="$2" i=0 drv
+    while [ "$i" -lt "$((want*5))" ]; do
+        if [ -L "$intf/driver" ]; then
+            drv=$(basename "$(readlink "$intf/driver")")
+            [ "$drv" = "bcm5974" ] && return 0
+        fi
+        sleep 0.2
+        i=$((i+1))
+    done
+    return 1
+}
+
+case "$1" in
+    pre)
+        # DELIBERATELY DOES NOTHING. We do not detach the module before
+        # suspend:
+        # - modprobe -r fails silently when the module is busy (libinput),
+        # - it leaves the interface unbound -> the post-hook would have to
+        #   force a probe anyway.
+        exit 0
+        ;;
+    post|reload) ;;
+    *) exit 0 ;;
+esac
+
+# make sure the module is available once /authorized rediscovers the interfaces
+modprobe bcm5974 2>/dev/null
+
+# let the xHCI/hub finish resume (key: probing too early could theoretically
+# fire before the device is ready)
+sleep 1
+
+dev=$(find_dev)
+if [ -z "$dev" ]; then
+    log "device $BCM_VID:$BCM_PID not present after resume — no re-probe (device unplugged?)"
+    exit 0
+fi
+log "device: $dev"
+intf=$(find_bcm_intf "$dev")
+port=$(find_port "$dev")
+recovered=1
+
+# --- Metoda 1: toggle authorized na urzadzeniu (fresh probe wszystkich ifc) ---
+if [ -w "$dev/authorized" ]; then
+    if echo 0 > "$dev/authorized" 2>/dev/null; then
+        sleep 0.3
+        echo 1 > "$dev/authorized" 2>/dev/null
+        log "authorized toggle OK"
+        if [ -n "$intf" ] && wait_bound "$intf" 4; then
+            recovered=0
+        fi
+    fi
+fi
+
+# --- Metoda 2: bConfigurationValue 0->1 (ten sam usb_set_configuration) ------
+if [ "$recovered" -ne 0 ] && [ -w "$dev/bConfigurationValue" ]; then
+    if echo 0 > "$dev/bConfigurationValue" 2>/dev/null; then
+        sleep 0.3
+        echo 1 > "$dev/bConfigurationValue" 2>/dev/null
+        log "bConfigurationValue toggle OK"
+        if [ -n "$intf" ] && wait_bound "$intf" 4; then
+            recovered=0
+        fi
+    fi
+fi
+
+# --- Metoda 3: explicite unbind obcego + bind bcm5974 / drivers_probe --------
+if [ "$recovered" -ne 0 ] && [ -n "$intf" ]; then
+    iname=$(basename "$intf")
+    if [ -L "$intf/driver" ]; then
+        foreign=$(basename "$(readlink "$intf/driver")")
+        if [ "$foreign" != "bcm5974" ]; then
+            echo "$iname" > "/sys/bus/usb/drivers/$foreign/unbind" 2>/dev/null
+            log "unbind $iname from $foreign"
+        fi
+    else
+        echo "$iname" > /sys/bus/usb/drivers_probe 2>/dev/null
+        log "drivers_probe $iname"
+    fi
+    echo "$iname" > /sys/bus/usb/drivers/bcm5974/bind 2>/dev/null
+    if wait_bound "$intf" 4; then
+        recovered=0
+    fi
+fi
+
+# --- Method 4: port disable/enable -> full re-enumeration ---------------------
+if [ "$recovered" -ne 0 ] && [ -n "$port" ] && [ -w "$port/disable" ]; then
+    log "eskalacja: port disable/enable $port"
+    if echo 1 > "$port/disable" 2>/dev/null; then
+        sleep 1
+        echo 0 > "$port/disable" 2>/dev/null
+        sleep 1
+        dev=$(find_dev)
+        [ -n "$dev" ] && intf=$(find_bcm_intf "$dev")
+        if [ -n "$intf" ] && wait_bound "$intf" 6; then
+            recovered=0
+        else
+            # one more toggle on the freshly re-enumerated device
+            [ -n "$dev" ] && { echo 0 > "$dev/authorized" 2>/dev/null; sleep 0.3; echo 1 > "$dev/authorized" 2>/dev/null; }
+            [ -n "$intf" ] && wait_bound "$intf" 4 && recovered=0
+        fi
+    fi
+fi
+
+if [ "$recovered" -eq 0 ]; then
+    log "OK — touchpad re-probed ($intf)"
+else
+    log "FAIL — no method restored the touchpad; check dmesg"
+fi
+exit 0

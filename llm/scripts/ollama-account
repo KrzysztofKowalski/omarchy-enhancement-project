@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# ollama-account — switch ollama.com accounts WITHOUT restarting `ollama serve`.
+#
+# Mechanism (from reading the ollama v0.33.0-rc2 sources):
+#   - a credential is an ED25519 SSH key pair: ~/.ollama/id_ed25519{,.pub};
+#   - the server reads the key file on EVERY request (auth/auth.go:60) —
+#     swapping the file with an atomic `mv` takes effect immediately, for
+#     `serve` and running claude sessions alike;
+#   - an account is bound to a public key on the ollama.com side;
+#   - do NOT use `ollama signout` — it unbinds the key and requires a fresh connect.
+#
+# Usage:
+#   ollama-account status          # active account (from /api/me) + fingerprint + diagnostics
+#   ollama-account ls              # available accounts in ~/.ollama/accounts
+#   ollama-account switch <acct>   # atomic key swap, no restart
+#   ollama-account init <acct>     # new key pair + one-time signin (browser)
+#   ollama-account adopt <acct>    # save the CURRENT key pair as <acct> (no switch)
+#
+# Server port/URL: OLLAMA_API (default http://127.0.0.1:11434).
+
+set -euo pipefail
+
+OLLAMA_API="${OLLAMA_API:-http://127.0.0.1:11434}"
+OLLAMA_BIN="${OLLAMA_BIN:-$(cd "$(dirname "$0")/.." && pwd)/ollama/ollama}"
+HOME_OLLAMA="${HOME_OLLAMA:-$HOME/.ollama}"
+KEY="$HOME_OLLAMA/id_ed25519"
+KEY_PUB="$KEY.pub"
+ACCOUNTS="$HOME_OLLAMA/accounts"
+MARKER="$HOME_OLLAMA/current-account"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+whoami() {
+    # Prints the account name (one signed request through the server to ollama.com).
+    curl -fsS -X POST "$OLLAMA_API/api/me" 2>/dev/null | jq -r '.name // empty'
+}
+
+key_fingerprint() {
+    ssh-keygen -lf "$1" 2>/dev/null | awk '{print $2}'
+}
+
+account_dir() { echo "$ACCOUNTS/$1"; }
+
+# Active account: try /api/me first (the truth), fall back to the marker.
+active_account() {
+    local name
+    name="$(whoami)"
+    if [[ -n "$name" ]]; then
+        echo "$name"
+        return
+    fi
+    [[ -f "$MARKER" ]] && cat "$MARKER" && return
+    return 1
+}
+
+# Copies the currently-active keys into their account dir (if not there yet),
+# so a switch can never lose a working pair.
+save_current() {
+    local acct dir
+    acct="$(active_account 2>/dev/null || true)"
+    [[ -z "$acct" ]] && return 0
+    dir="$(account_dir "$acct")"
+    if [[ ! -f "$dir/id_ed25519" && -f "$KEY" ]]; then
+        mkdir -p "$dir"
+        chmod 700 "$ACCOUNTS"
+        cp "$KEY" "$dir/id_ed25519"
+        [[ -f "$KEY_PUB" ]] && cp "$KEY_PUB" "$dir/id_ed25519.pub"
+        chmod 600 "$dir/id_ed25519"
+        chmod 644 "$dir/id_ed25519.pub" 2>/dev/null || true
+        echo "  saved current key as account »$acct«"
+    fi
+}
+
+cmd_status() {
+    local name fp
+    name="$(whoami || true)"
+    if [[ -z "$name" ]]; then
+        echo "active account: (none signed in — 401 from $OLLAMA_API/api/me)"
+        [[ -f "$MARKER" ]] && echo "marker: $(cat "$MARKER")"
+        return 1
+    fi
+    echo "active account: $name"
+    curl -fsS -X POST "$OLLAMA_API/api/me" 2>/dev/null | jq -r '"  plan:      \(.plan // "?")"'
+    [[ -f "$KEY_PUB" ]] && echo "  key:       $(key_fingerprint "$KEY_PUB")"
+    saved_match "$name"
+    [[ -f "$MARKER" ]] && echo "  marker:    $(cat "$MARKER")"
+    return 0
+}
+
+# Diagnostics: compares the ACTIVE key's fingerprint against the saved account
+# copies. Reports a match (normally: the active account has a copy) plus a
+# rebind when the active key is a copy of a DIFFERENT account than /api/me
+# reports (ollama.com re-bound the key to another account — the old copy is
+# useless then).
+saved_match() {
+    local name="$1" kfp d acct fp found=""
+    [[ -f "$KEY_PUB" ]] || return 0
+    kfp="$(key_fingerprint "$KEY_PUB" || true)"
+    [[ -n "$kfp" ]] || return 0
+    for d in "$ACCOUNTS"/*/; do
+        [[ -d "$d" ]] || continue
+        acct="${d%/}"; acct="${acct##*/}"
+        [[ -f "$d/id_ed25519.pub" ]] || continue
+        fp="$(key_fingerprint "$d/id_ed25519.pub" || true)"
+        if [[ "$fp" == "$kfp" ]]; then
+            found=1
+            if [[ "$acct" == "$name" ]]; then
+                echo "  saved:     active key = saved copy »$acct«"
+            else
+                echo "  warning:   active key = saved copy »$acct«, but /api/me = »$name« — key re-bound on ollama.com (old copy no longer matches »$acct«)"
+            fi
+        fi
+    done
+    [[ -z "$found" ]] && echo "  saved:     active key has no copy in $ACCOUNTS (the first switch will store one)"
+    return 0
+}
+
+cmd_ls() {
+    local name
+    name="$(whoami || true)"
+    echo "accounts in $ACCOUNTS:"
+    if [[ -z "$(ls -A "$ACCOUNTS" 2>/dev/null || true)" ]]; then
+        echo "  (empty — use: ollama-account init <acct>)"
+    fi
+    for d in "$ACCOUNTS"/*/; do
+        [[ -d "$d" ]] || continue
+        local acct="${d%/}"; acct="${acct##*/}"
+        local mark="" fp=""
+        [[ "$acct" == "$name" ]] && mark="  ← active"
+        [[ -f "$d/id_ed25519.pub" ]] && fp="$(key_fingerprint "$d/id_ed25519.pub" || true)"
+        printf '  %-24s %s%s\n' "$acct" "${fp:-no key}" "$mark"
+    done
+    return 0
+}
+
+cmd_switch() {
+    local acct="${1:-}"
+    [[ -z "$acct" ]] && die "usage: ollama-account switch <acct>"
+    local dir; dir="$(account_dir "$acct")"
+    if [[ ! -f "$dir/id_ed25519" ]]; then
+        save_current   # e.g. first switch: store the current key under its account name
+        [[ -f "$dir/id_ed25519" ]] || die "account »$acct« has no key in $dir — use: ollama-account init $acct"
+    fi
+
+    # Atomic swap: mv inside ~/.ollama, visible to the server immediately.
+    install -m 600 "$dir/id_ed25519" "$HOME_OLLAMA/id_ed25519.swap"
+    mv -f "$HOME_OLLAMA/id_ed25519.swap" "$KEY"
+    if [[ -f "$dir/id_ed25519.pub" ]]; then
+        install -m 644 "$dir/id_ed25519.pub" "$HOME_OLLAMA/id_ed25519.pub.swap"
+        mv -f "$HOME_OLLAMA/id_ed25519.pub.swap" "$KEY_PUB"
+    fi
+    echo "$acct" > "$MARKER"
+
+    # Verify with one signed request.
+    local got
+    got="$(whoami || true)"
+    if [[ "$got" == "$acct" ]]; then
+        echo "switched to: $acct ✓ (no server restart)"
+    else
+        echo "⚠ key swapped, but /api/me returns: ${got:-<nothing — may require signin>}"
+    fi
+}
+
+cmd_adopt() {
+    local acct="${1:-}"
+    [[ -z "$acct" ]] && die "usage: ollama-account adopt <acct>"
+    local dir; dir="$(account_dir "$acct")"
+    if [[ -f "$dir/id_ed25519" ]]; then
+        die "account »$acct« already has a key ($dir) — adopt never overwrites"
+    fi
+    [[ -f "$KEY" ]] || die "no active key ($KEY)"
+
+    # Verify the active account via /api/me (same path as status):
+    # adopt stores ONLY the currently-signed-in account's key pair.
+    local got
+    got="$(whoami || true)"
+    if [[ -z "$got" ]]; then
+        die "could not determine the active account (no answer from $OLLAMA_API/api/me) — nothing changed"
+    fi
+    if [[ "$got" != "$acct" ]]; then
+        die "active account is »$got«, not »$acct« — nothing changed (adopt only stores the current account)"
+    fi
+
+    # Rebind diagnostics: the same key saved under a DIFFERENT account name
+    # means ollama.com re-bound the key to another account — the old copy may
+    # be broken.
+    warn_key_rebind "$acct"
+
+    # Copy the current pair — active files stay untouched (adopt does NOT switch).
+    mkdir -p "$dir"
+    chmod 700 "$ACCOUNTS" "$dir"
+    cp "$KEY" "$dir/id_ed25519"
+    [[ -f "$KEY_PUB" ]] && cp "$KEY_PUB" "$dir/id_ed25519.pub"
+    chmod 600 "$dir/id_ed25519"
+    chmod 644 "$dir/id_ed25519.pub" 2>/dev/null || true
+    echo "adopted: saved the active key pair as account »$acct« ($dir)"
+
+    # current-account marker by convention: the currently-active account's name.
+    echo "$acct" > "$MARKER"
+    echo "marker: $acct (active key unchanged, still »$got«)"
+}
+
+# Warns (on stderr, without aborting) when the ACTIVE key's fingerprint is
+# already saved under another account name — possible key rebind on ollama.com.
+warn_key_rebind() {
+    local acct="$1" kfp d other fp
+    [[ -f "$KEY_PUB" ]] || return 0
+    kfp="$(key_fingerprint "$KEY_PUB" || true)"
+    [[ -n "$kfp" ]] || return 0
+    for d in "$ACCOUNTS"/*/; do
+        [[ -d "$d" ]] || continue
+        other="${d%/}"; other="${other##*/}"
+        [[ "$other" != "$acct" && -f "$d/id_ed25519.pub" ]] || continue
+        fp="$(key_fingerprint "$d/id_ed25519.pub" || true)"
+        if [[ "$fp" == "$kfp" ]]; then
+            echo "⚠ WARNING: the active key is already saved as account »$other«" >&2
+            echo "  (same fingerprint — possible rebind: ollama.com re-bound the key" >&2
+            echo "   to »$acct«; the copy under »$other« probably no longer works. Consider" >&2
+            echo "   ollama-account init $other = new pair + fresh connect.)" >&2
+        fi
+    done
+    return 0
+}
+
+cmd_init() {
+    local acct="${1:-}"
+    [[ -z "$acct" ]] && die "usage: ollama-account init <acct>"
+    local dir; dir="$(account_dir "$acct")"
+    [[ -f "$dir/id_ed25519" ]] && die "account »$acct« already has a key ($dir)"
+
+    mkdir -p "$dir"
+    chmod 700 "$ACCOUNTS" "$dir"
+    save_current
+    ssh-keygen -t ed25519 -N '' -C "ollama-$acct" -f "$dir/id_ed25519" -q
+    chmod 600 "$dir/id_ed25519"; chmod 644 "$dir/id_ed25519.pub"
+    echo "created a new key pair for account »$acct«"
+
+    # Activate the key (atomically), then the standard ollama signin —
+    # it generates ollama.com/connect?... and opens the browser.
+    local cur=""
+    [[ -f "$MARKER" ]] && cur="$(cat "$MARKER")"
+    [[ -z "$cur" && -n "$(whoami || true)" ]] && cur="$(whoami)"
+    cmd_switch "$acct"
+
+    echo
+    echo "Now bind the key to account »$acct« once:"
+    echo "  1. log into the ollama.com account in the browser: $acct"
+    echo "  2. run: OLLAMA_HOST=$OLLAMA_API $OLLAMA_BIN signin"
+    echo "     (opens ollama.com/connect?... — click Connect)"
+    echo "  3. check: $(basename "$0") status  → should show »$acct«"
+}
+
+case "${1:-}" in
+    status) cmd_status ;;
+    ls|list) cmd_ls ;;
+    switch) shift; cmd_switch "$@" ;;
+    init) shift; cmd_init "$@" ;;
+    adopt) shift; cmd_adopt "$@" ;;
+    ""|-h|--help|help)
+        # Help = comment lines 2.. until the first line of code.
+        awk 'NR > 1 && $0 !~ /^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
+        ;;
+    *) die "unknown command: $1 (see: ollama-account help)" ;;
+esac

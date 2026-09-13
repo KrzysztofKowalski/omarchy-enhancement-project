@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ollama-usage-guard — watches the hourly limit of the active ollama.com account.
+
+Works with the project's existing tools (does NOT modify them):
+  - scripts/ollama-account status   -> active account (POST /api/me)
+  - scripts/ollama-account switch   -> the only way to change account (no signout/signin)
+  - scripts/ollama-usage --json     -> usage per account (firefox/chromium/firefox-developer)
+
+`check` logic (any number of accounts):
+  1. active account from ollama-account status,
+  2. hourly % from ollama-usage --json for all accounts,
+  3. hourly > 40  ->  candidates = all OTHER accounts with data and hourly <= 40;
+     the one with the LOWEST hourly is chosen (tie-break: name); no candidates
+     (no data or all other accounts > 40) -> no switch (anti-oscillation),
+  4. verification via /api/me after the switch,
+  5. any error (network, browser error, dead server) => no switch.
+     An account without hourly in the JSON (e.g. pro plan: /settings only has
+     a dollar monthly limit) is skipped fail-safe — never a candidate, and when
+     active the guard only reports missing data.
+
+Usage:
+  ollama-usage-guard [check] [--dry-run]   # check + --dry-run: decision only
+  ollama-usage-guard install               # systemd user timer (fallback: crontab */10)
+  ollama-usage-guard uninstall             # cleans up the timer AND the crontab entry
+  ollama-usage-guard status                # timer + crontab state + log tail
+
+Log: ~/.local/state/ol-has/usage-guard.log — never logs cookies/keys.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ACCOUNT = os.path.join(BASE_DIR, "scripts", "ollama-account")
+USAGE = os.path.join(BASE_DIR, "scripts", "ollama-usage")
+
+STATE_DIR = os.path.expanduser("~/.local/state/ol-has")
+LOG_FILE = os.path.join(STATE_DIR, "usage-guard.log")
+
+# Accounts are NOT hardcoded — the list emerges from `ollama-usage --json`
+# (each account = a session in one of the browsers: firefox/chromium/firefox-developer).
+THRESHOLD = 40.0  # % of the hourly limit
+
+CRON_MARK = "ollama-usage-guard"
+CRON_LINE = "*/10 * * * * %s check >/dev/null 2>&1  # %s" % (os.path.abspath(__file__), CRON_MARK)
+
+# ------------------------------------------------------- systemd user timer
+# Primary periodic-run mechanism (Omarchy/Arch: cronie is often absent).
+SYSTEMD_UNIT_DIR = os.path.expanduser("~/.config/systemd/user")
+SERVICE_NAME = "ollama-usage-guard.service"
+TIMER_NAME = "ollama-usage-guard.timer"
+
+SERVICE_UNIT = f"""[Unit]
+Description=Ollama usage guard (auto-switch >40% hourly)
+
+[Service]
+Type=oneshot
+ExecStart={os.path.abspath(__file__)} check
+"""
+
+TIMER_UNIT = """[Unit]
+Description=Run ollama-usage-guard every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def systemctl_user(*args, check=True):
+    """systemctl --user ...; returns CompletedProcess (check=True -> exception on error)."""
+    r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError("systemctl --user %s failed: %s"
+                           % (" ".join(args), (r.stderr or r.stdout or "").strip()[:200]))
+    return r
+
+
+def systemd_available():
+    """systemd user timer possible when systemctl exists and a user manager/session runs."""
+    if shutil.which("systemctl") is None:
+        return False
+    # Read-only query; 0=running, 1=degraded, 2=maintenance — the manager answers.
+    # 3 (offline/unknown) or no systemctl = no running user session -> fallback.
+    return subprocess.run(["systemctl", "--user", "is-system-running"],
+                          capture_output=True, text=True).returncode in (0, 1, 2)
+
+
+def write_unit(path, content):
+    os.makedirs(SYSTEMD_UNIT_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(content)
+
+
+def timer_files_present():
+    return (os.path.exists(os.path.join(SYSTEMD_UNIT_DIR, SERVICE_NAME))
+            and os.path.exists(os.path.join(SYSTEMD_UNIT_DIR, TIMER_NAME)))
+
+
+def timer_enabled():
+    return systemctl_user("is-enabled", TIMER_NAME, check=False).stdout.strip() == "enabled"
+
+
+def log(msg):
+    """Append a line with a timestamp; no cookies/keys (there are simply none here)."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    with open(LOG_FILE, "a") as f:
+        f.write("%s %s\n" % (ts, msg))
+
+
+def run(cmd, timeout=90):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def active_account():
+    """Active account from `ollama-account status` (parses 'active account: NAME')."""
+    r = run([ACCOUNT, "status"])
+    m = re.search(r"^active account:\s*(\S+)", r.stdout or "", re.M)
+    if not m:
+        return None, (r.stdout or r.stderr or "").strip() or "no answer"
+    return m.group(1), None
+
+
+def usage_map():
+    """account -> (hourly_pct, browser) from `ollama-usage --json`; None = no data.
+
+    An error or missing data of one browser must not break the whole run. When two
+    sources report the same account (e.g. two sessions of one account), the first
+    in JSON order wins (firefox, chromium, firefox-developer) — the account->browser
+    mapping should be unambiguous."""
+    r = run([USAGE, "--json"], timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError("ollama-usage --json failed: %s"
+                           % ((r.stderr or r.stdout or "").strip()[:200]))
+    out = {}
+    for entry in json.loads(r.stdout or "[]"):
+        if entry.get("error") or entry.get("hourly_pct") is None:
+            continue  # one browser's error must not break the whole run
+        if entry.get("account") and entry["account"] not in out:
+            out[entry["account"]] = (float(entry["hourly_pct"]), entry["browser"])
+    return out
+
+
+def choose_candidate(usage, name):
+    """Best target account: all OTHER accounts with data and hourly <= threshold,
+    sorted by (hourly, name) — first = lowest %, name tie-break.
+    Returns (pct, account) or None when there are no candidates."""
+    candidates = sorted((pct, acct) for acct, (pct, _b) in usage.items()
+                        if acct != name and pct <= THRESHOLD)
+    return candidates[0] if candidates else None
+
+
+def do_check(dry_run):
+    """Main logic; returns exit code (0 = ok, 1 = data error). No switch on errors."""
+    # 1. Active account — without it there is no decision.
+    try:
+        name, err = active_account()
+    except subprocess.TimeoutExpired:
+        name, err = None, "timeout: ollama-account status"
+    if not name:
+        log("check error: could not determine the active account (%s) — no switch" % err)
+        print("error: could not determine the active account (%s)" % err)
+        return 1
+
+    # 2. Usage of both accounts — switch only with complete, consistent data.
+    try:
+        usage = usage_map()
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+        log("check error: account=%s usage unavailable (%s) — no switch" % (name, e))
+        print("error: usage unavailable (%s)" % e)
+        return 1
+
+    mine = usage.get(name)
+    if mine is None:
+        log("check error: account=%s no hourly in usage — no switch" % name)
+        print("error: no usage data for the active account %s" % name)
+        return 1
+    my_pct = mine[0]
+
+    if my_pct <= THRESHOLD:
+        log("check ok: account=%s hourly=%.1f%% decision=none (<= threshold %g%%)"
+            % (name, my_pct, THRESHOLD))
+        print("account %s: hourly %.1f%% — ok (<= %g%%), nothing to do"
+              % (name, my_pct, THRESHOLD))
+        return 0
+
+    # 3. Threshold exceeded — candidate = best of the OTHER accounts (data + <= threshold).
+    others = sorted((pct, acct) for acct, (pct, _b) in usage.items() if acct != name)
+    if not others:
+        log("check warning: account=%s hourly=%.1f%% > %g%%, but no data "
+            "for other accounts — no switch" % (name, my_pct, THRESHOLD))
+        print("warning: %s %.1f%% > %g%%, no data for other accounts — no switch"
+              % (name, my_pct, THRESHOLD))
+        return 1
+    if all(pct > THRESHOLD for pct, _acct in others):
+        # Anti-oscillation: no other account is below the threshold.
+        listing = ", ".join("%s %.1f%%" % (acct, pct) for pct, acct in others)
+        log("check warning: account=%s hourly=%.1f%% > %g%%, all other accounts "
+            "also > %g%% (%s) — no switch (anti-oscillation)"
+            % (name, my_pct, THRESHOLD, THRESHOLD, listing))
+        print("warning: all accounts > %g%% (%s, %s %.1f%%) — no switch"
+              % (THRESHOLD, listing, name, my_pct))
+        return 0
+    their_pct, other = choose_candidate(usage, name)
+
+    msg = ("check switching: account=%s hourly=%.1f%% > %g%% -> %s (hourly=%.1f%%)"
+           % (name, my_pct, THRESHOLD, other, their_pct))
+    if dry_run:
+        print("DRY-RUN: " + msg)
+        log("dry-run: " + msg)
+        return 0
+
+    # 4. Only `ollama-account switch` (never signout/signin).
+    log(msg)
+    print(msg)
+    try:
+        r = run([ACCOUNT, "switch", other])
+    except subprocess.TimeoutExpired:
+        log("check error: timeout during switch to %s — verify with: %s status" % (other, ACCOUNT))
+        print("error: timeout during switch to %s" % other)
+        return 1
+    out = (r.stdout or r.stderr or "").strip()
+    if out:
+        print(out)
+
+    # Verification after the switch with one /api/me request.
+    try:
+        got, err = active_account()
+    except subprocess.TimeoutExpired:
+        got, err = None, "timeout"
+    if got == other:
+        log("check ok: switch confirmed, active account=%s (was %s, hourly %.1f%% -> %.1f%%)"
+            % (other, name, my_pct, their_pct))
+        print("verification ok: active account %s" % other)
+        return 0
+    log("check error: switch to %s unconfirmed (status: %s)" % (other, err or got or "?"))
+    print("error: switch unconfirmed (active: %s)" % (err or got or "?"))
+    return 1
+
+
+# ------------------------------------------------------------------- crontab
+
+def crontab_missing():
+    """crontab absent from the system (e.g. no cronie package)."""
+    return shutil.which("crontab") is None
+
+
+def crontab_get():
+    r = run(["crontab", "-l"])
+    return "" if r.returncode != 0 else (r.stdout or "")
+
+
+def crontab_set(content):
+    r = subprocess.run(["crontab", "-"], input=content, text=True, capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "").strip() or "crontab rejected the input")
+
+
+def cron_installed(content):
+    return any(CRON_MARK in line and "check" in line
+               for line in content.splitlines())
+
+
+def install_timer():
+    """Write the unit files, daemon-reload, enable --now the timer. Returns exit code."""
+    try:
+        write_unit(os.path.join(SYSTEMD_UNIT_DIR, SERVICE_NAME), SERVICE_UNIT)
+        write_unit(os.path.join(SYSTEMD_UNIT_DIR, TIMER_NAME), TIMER_UNIT)
+        systemctl_user("daemon-reload")
+        systemctl_user("enable", "--now", TIMER_NAME)
+    except RuntimeError as e:
+        print("error: systemd timer installation failed: %s" % e)
+        return 1
+    log("install: systemd user timer enabled (%s every 10 min)" % TIMER_NAME)
+    print("unit files written to %s:" % SYSTEMD_UNIT_DIR)
+    print("  %s" % SERVICE_NAME)
+    print("  %s" % TIMER_NAME)
+    print("timer enabled (enable --now): %s" % TIMER_NAME)
+    return 0
+
+
+def uninstall_timer():
+    """Disable the timer and remove the unit files. True = something was cleaned up."""
+    changed = False
+    if timer_files_present():
+        systemctl_user("disable", "--now", TIMER_NAME, check=False)
+        for name in (SERVICE_NAME, TIMER_NAME):
+            path = os.path.join(SYSTEMD_UNIT_DIR, name)
+            if os.path.exists(path):
+                os.remove(path)
+                changed = True
+        systemctl_user("daemon-reload", check=False)
+        log("uninstall: removed the systemd user timer (%s)" % TIMER_NAME)
+        print("removed the systemd user timer and unit files")
+    return changed
+
+
+def do_install():
+    # Primary: systemd user timer (Omarchy-native, no cronie).
+    if systemd_available():
+        if timer_enabled():
+            print("timer %s already enabled — nothing to do" % TIMER_NAME)
+            return 0
+        if install_timer() != 0:
+            return 1
+        # Hygiene: the old crontab entry, if any, so it cannot double the switches.
+        if not crontab_missing():
+            content = crontab_get()
+            if cron_installed(content):
+                kept = [ln for ln in content.splitlines()
+                        if not (CRON_MARK in ln and "check" in ln)]
+                try:
+                    crontab_set("\n".join(kept) + ("\n" if kept else ""))
+                    print("removed the old crontab entry (the timer is enough now)")
+                    log("install: removed the old crontab entry (primary = systemd timer)")
+                except RuntimeError as e:
+                    print("warning: could not remove the crontab entry: %s" % e)
+        return 0
+    # Fallback: the old crontab path (when systemctl / a user session is missing).
+    if crontab_missing():
+        print("error: neither systemd user nor crontab — cannot run check periodically")
+        return 1
+    content = crontab_get()
+    if cron_installed(content):
+        print("crontab entry already exists — nothing to do")
+        return 0
+    # Idempotently: append our line to the rest (the marker filter already removed nothing).
+    new = content.rstrip("\n")
+    new = (new + "\n" if new else "") + CRON_LINE + "\n"
+    try:
+        crontab_set(new)
+    except RuntimeError as e:
+        print("error: %s" % e)
+        return 1
+    log("install (fallback): added the crontab entry (*/10 * * * * check)")
+    print("added the crontab entry (fallback — systemd user unavailable):\n  %s" % CRON_LINE)
+    return 0
+
+
+def do_uninstall():
+    # Clean up both mechanisms — regardless of which one was used.
+    removed = False
+    if systemd_available():
+        removed = uninstall_timer() or removed
+    if not crontab_missing():
+        content = crontab_get()
+        if cron_installed(content):
+            kept = [ln for ln in content.splitlines()
+                    if not (CRON_MARK in ln and "check" in ln)]
+            try:
+                crontab_set("\n".join(kept) + ("\n" if kept else ""))
+                removed = True
+                log("uninstall: removed the crontab entry")
+                print("removed the crontab entry")
+            except RuntimeError as e:
+                print("warning: could not remove the crontab entry: %s" % e)
+        elif not removed:
+            print("no crontab entry present")
+    if not removed:
+        print("nothing to remove (no timer and no crontab entry)")
+    return 0
+
+
+def do_status():
+    # Primary: systemd user timer.
+    if systemd_available():
+        enabled = systemctl_user("is-enabled", TIMER_NAME, check=False).stdout.strip()
+        active = systemctl_user("is-active", TIMER_NAME, check=False).stdout.strip()
+        print("timer: %s (enabled=%s, active=%s)" % (TIMER_NAME, enabled or "?", active or "?"))
+        lt = systemctl_user("list-timers", "--all", TIMER_NAME, check=False)
+        rows = [ln for ln in (lt.stdout or "").splitlines()
+                if TIMER_NAME in ln]
+        for ln in rows:
+            print("  %s" % ln)
+        if not rows:
+            print("  (absent from list-timers)")
+    else:
+        print("timer: unavailable (no running systemd user session)")
+    # Fallback/legacy: the crontab entry, if anyone still has one.
+    if crontab_missing():
+        print("crontab: unavailable (no crontab command — skipping)")
+    else:
+        content = crontab_get()
+        installed = cron_installed(content)
+        print("crontab: %s" % ("installed" if installed else "no entry"))
+        if installed:
+            for ln in content.splitlines():
+                if CRON_MARK in ln and "check" in ln:
+                    print("  %s" % ln)
+    print("log: %s" % LOG_FILE)
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE) as f:
+            tail = f.read().splitlines()[-10:]
+        for ln in tail:
+            print("  %s" % ln)
+    else:
+        print("  (log does not exist yet)")
+    return 0
+
+
+def main(argv):
+    dry_run = "--dry-run" in argv
+    args = [a for a in argv if a != "--dry-run"]
+    cmd = args[0] if args else "check"
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if cmd == "check":
+        if len(args) > 1:
+            print("error: too many arguments for check")
+            return 1
+        return do_check(dry_run)
+    if cmd == "install":
+        return do_install()
+    if cmd == "uninstall":
+        return do_uninstall()
+    if cmd == "status":
+        return do_status()
+    print("error: unknown command: %s (check|install|uninstall|status)" % cmd)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -1,0 +1,18 @@
+From 9f1c3a2b4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a Mon Sep 17 00:00:00 2001
+From: Omarchy Workshop <workshop@omarchy.local>
+Date: Sun Aug 31 11:57:00 2026 +0200
+Subject: [PATCH] usb: quirks: force reset-resume for Apple bcm5974 touchpad
+
+---
+
+--- a/drivers/usb/core/quirks.c
++++ b/drivers/usb/core/quirks.c
+@@ -340,6 +340,8 @@
+ 
+ 	/* appletouch */
+ 	{ USB_DEVICE(0x05ac, 0x021a), .driver_info = USB_QUIRK_RESET_RESUME },
++	/* bcm5974: Apple internal multitouch trackpad (MacBook Pro Late 2013) */
++	{ USB_DEVICE(0x05ac, 0x0262), .driver_info = USB_QUIRK_RESET_RESUME },
+ 
+ 	/* Genesys Logic hub, internally used by KY-688 USB 3.1 Type-C Hub */
+ 	{ USB_DEVICE(0x05e3, 0x0612), .driver_info = USB_QUIRK_NO_LPM },

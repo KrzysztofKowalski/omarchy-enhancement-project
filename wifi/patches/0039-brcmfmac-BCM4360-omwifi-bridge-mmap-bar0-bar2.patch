@@ -1,0 +1,232 @@
+--- a/brcmfmac/omwifi_bridge.c
++++ b/brcmfmac/omwifi_bridge.c
+@@ -84,6 +84,7 @@
+ #include <linux/io.h>
+ #include <linux/interrupt.h>
+ #include <linux/init.h>
++#include <linux/mm.h>	/* remap_pfn_range, pgprot_device (mmap BAR-ow dla minihosta) */
+ 
+ /* ======================================================== identyfikacja karty */
+ 
+@@ -91,6 +92,7 @@
+ #define OM_DEVICE_4360		0x43a0u	/* BRCM_PCIE_4360_DEVICE_ID, brcm_hw_ids.h:87 */
+ #define OM_NAZWA		"omwifi_bridge"
+ #define OM_DEV			"/dev/omwifi"
++#define OM_DEV_TCM		"/dev/omwifi-tcm"	/* mmap BAR2 (RAM fw) dla minihosta */
+ 
+ /* BAR-y (logi fire'ow: resource0 = 0x8000, resource2 = 0x200000) */
+ #define OM_BAR0_ROZMIAR		0x8000u		/* 32 KiB: rejestry PCIE2 + okno */
+@@ -312,6 +314,8 @@
+ 	bool			resp_uciete;	/* czy odpowiedz dotknela limitu (jedna linia-markier) */
+ 
+ 	struct miscdevice	misc;
++	struct miscdevice	misc_tcm;	/* /dev/omwifi-tcm: mmap BAR2 (TCM) */
++	int			bar0_mapy;	/* ile zywych mmap-ow BAR0 (blokuje `irq on`) */
+ };
+ 
+ static struct om_bridge *om;			/* jeden egzemplarz karty */
+@@ -1538,6 +1542,14 @@
+ 			om_odp(b, "irq: juz wlaczone (irq=%u)\n", b->pdev->irq);
+ 			return;
+ 		}
++		/* Bramka symetryczna do mmap BAR0 (patrz sekcja mmap): ISR czyta
++		 * i W1C-pisze BAR0 jako okno, wiec przy zywym mapowaniu BAR0 w
++		 * userspace uzbrojenie przerwania zamkneloby sie na wyscig. */
++		if (b->bar0_mapy) {
++			om_blad(b, "irq: ODMOWA -- BAR0 jest zmapowany do userspace (%d mapowanie/a). ISR czyta i W1C-pisze BAR0 bez om_lock, a BAR0 jest oknem; zakoncz mmap BAR0 (minihost) i powtorz.\n",
++				b->bar0_mapy);
++			return;
++		}
+ 		if (!b->pdev->irq) {
+ 			om_blad(b, "irq: pdev->irq = 0 -- karta nie ma linii przerwania\n");
+ 			return;
+@@ -2029,6 +2041,7 @@
+ 	"irq on|off",
+ 	"read contract|console|rings|heartbeat|trap|tcm <adr_hex> <len_hex>",
+ 	"d2h",
++	"mmap: /dev/omwifi = BAR0 (0x8000; TYLKO po `irq off`), /dev/omwifi-tcm = BAR2/TCM (0x200000); offset 0",
+ 	NULL,
+ };
+ 
+@@ -2050,6 +2063,10 @@
+ 	om_odp(b, "  okno backplane z kontrola odczytu i powrotem na PCIE2; pola msgbufaddr tylko po bramce adresu\n");
+ 	om_odp(b, "  obce okno (D11 wrapper/rdzen, SOCRAM, ARM, CC): na czas dostepu linia przerwania MASKOWANA, bo ISR\n");
+ 	om_odp(b, "  czyta i W1C-pisze BAR0+0x48/+0x4C bez om_lock, a BAR0 jest oknem (audyt 11.09.2026)\n");
++	om_odp(b, "mmap dla userspace (minihost): %s + mmap(offset 0) = BAR0 (0x8000 B; TYLKO po `irq off`,\n", OM_DEV);
++	om_odp(b, "  bo ISR uzywa BAR0 jako okna), %s + mmap(offset 0) = BAR2/TCM (0x200000 B). Powod istnienia:\n", OM_DEV_TCM);
++	om_odp(b, "  jadro ma CONFIG_STRICT_DEVMEM=y i CONFIG_IO_STRICT_DEVMEM=y, wiec mmap na sysfs resourceN karty\n");
++	om_odp(b, "  BUSY (nasze pci_request_regions) daje -EINVAL -- zmierzone 12.09.2026 na `minihost d11`\n");
+ }
+ 
+ /* ================================================================== parser */
+@@ -2190,10 +2207,125 @@
+ 	return (ssize_t)count;
+ }
+ 
++/* =============================================== mmap BAR0/BAR2 dla userspace
++ *
++ * DLACZEGO PRZEZ MODUL, A NIE PRZEZ sysfs: jadro jest zbudowane z
++ * CONFIG_STRICT_DEVMEM=y ORAZ CONFIG_IO_STRICT_DEVMEM=y, a w cmdline nie ma
++ * `iomem=relaxed`. Skutek: mmap na /sys/bus/pci/devices/.../resourceN karty,
++ * ktora jest BUSY -- a jest, bo w probe robimy pci_request_regions() -- konczy
++ * sie -EINVAL (drivers/pci/pci-sysfs.c:1132-1134 -> iomem_is_exclusive ->
++ * kernel/resource.c:1918-1924; `strict_iomem_checks = 1` z CONFIG_STRICT_DEVMEM).
++ * Zmierzone 12.09.2026: `minihost d11 d11-ok --wykonaj` padl na
++ * "minihost: mmap resource2: Invalid argument" PRZED pierwszym MMIO (nic nie
++ * poszlo na karte). Most wystawia wiec TE SAME BAR-y przez mmap wlasnych wezlow:
++ * to droga sterownika, bez bramki strict-devm, i bez oslabiania jadra.
++ *
++ * Umowa (druga strona: minihost.c, otworz_karte()):
++ *   /dev/omwifi      + mmap(offset 0) = BAR0 (0x8000 B: PCIE2 + okno backplane)
++ *   /dev/omwifi-tcm  + mmap(offset 0) = BAR2 (0x200000 B: RAM fw / TCM)
++ *
++ * BRAMKA BAR0: tylko przy `irq off`. ISR (om_isr_*) czyta i W1C-pisze BAR0 BEZ
++ * om_lock, a BAR0 jest OKNEM na backplane -- gdyby uzbrojone przerwanie trafilo
++ * w chwile, gdy userspace ma okno przestawione na inny rdzen (np. strona D11),
++ * ISR czytalby i W1C-pisal rejestr TEGO rdzenia. Dlatego w obie strony:
++ * mmap BAR0 odmawia przy `irq on`, a `irq on` odmawia, gdy zyje jakikolwiek
++ * mmap BAR0. BAR2 (TCM) bramki nie ma -- to zwykla pamiec, bez okna i bez
++ * udzialu ISR.
++ */
++
++static void om_vma_zamknij(struct vm_area_struct *vma)
++{
++	mutex_lock(&om_lock);
++	if (om && om->bar0_mapy > 0)
++		om->bar0_mapy--;
++	mutex_unlock(&om_lock);
++}
++
++static const struct vm_operations_struct om_vm_ops = {
++	.close = om_vma_zamknij,
++};
++
++static int om_mmap_bar(struct file *f, struct vm_area_struct *vma, int bar)
++{
++	struct om_bridge *b;
++	unsigned long len = vma->vm_end - vma->vm_start;
++	resource_size_t rozmiar = 0;
++	int err = 0;
++
++	if (mutex_lock_interruptible(&om_lock))
++		return -ERESTARTSYS;
++	b = om;
++	if (!b || !b->bar0 || !b->bar2) {
++		mutex_unlock(&om_lock);
++		om_linia(NULL, 1, OM_NAZWA ": mmap BAR%d: most nie trzyma karty\n", bar);
++		return -ENODEV;
++	}
++	rozmiar = pci_resource_len(b->pdev, bar);
++	if (vma->vm_pgoff || !len || len > rozmiar) {
++		err = -EINVAL;
++		goto wyjdz;
++	}
++	if (bar == 0 && b->irq_on) {
++		err = -EBUSY;
++		goto wyjdz;
++	}
++	/* pgprot_device: ten sam typ pamieci co pci_iomap wyzej (x86: UC-), inaczej
++	 * x86/PAT odmowilby drugiego mapowania (-EBUSY "conflicting memory types"). */
++	if (remap_pfn_range(vma, vma->vm_start,
++			    (unsigned long)(pci_resource_start(b->pdev, bar) >> PAGE_SHIFT),
++			    len, pgprot_device(vma->vm_page_prot))) {
++		err = -EAGAIN;
++		goto wyjdz;
++	}
++	vma->vm_ops = &om_vm_ops;
++	if (bar == 0)
++		b->bar0_mapy++;
++	/* Log bez bufora odpowiedzi (b = NULL): mmap nie jest komenda i nie moze
++	 * zjadac odpowiedzi czekajacej na `cat /dev/omwifi`. */
++	om_linia(NULL, 2, OM_NAZWA ": mmap: BAR%d 0x%lx B -> userspace%s\n",
++		 bar, len,
++		 bar == 0 ? " (BAR0 = okno: dopoki to mapowanie zyje, `irq on` odmowi)"
++			  : " (TCM)");
++	mutex_unlock(&om_lock);
++	return 0;
++
++wyjdz:
++	if (err == -EBUSY)
++		om_linia(NULL, 1, OM_NAZWA ": mmap BAR0: ODMOWA -- IRQ jest uzbrojone (`irq on`), a BAR0 jest oknem, ktore ISR czyta i W1C-pisze bez om_lock. Zrob `irq off` i powtorz.\n");
++	else if (err == -EINVAL)
++		om_linia(NULL, 1, OM_NAZWA ": mmap BAR%d: zle parametry (pgoff=0x%lx, len=0x%lx, BAR ma 0x%llx B) -- umowa: offset 0, len <= rozmiar BAR-u\n",
++			 bar, vma->vm_pgoff, len, (unsigned long long)rozmiar);
++	else
++		om_linia(NULL, 1, OM_NAZWA ": mmap BAR%d: remap_pfn_range nieudane (0x%lx B @0x%llx)\n",
++			 bar, len, (unsigned long long)pci_resource_start(b->pdev, bar));
++	mutex_unlock(&om_lock);
++	return err;
++}
++
++static int om_mmap_bar0(struct file *f, struct vm_area_struct *vma)
++{
++	return om_mmap_bar(f, vma, 0);
++}
++
++static int om_mmap_bar2(struct file *f, struct vm_area_struct *vma)
++{
++	return om_mmap_bar(f, vma, 2);
++}
++
+ static const struct file_operations om_fops = {
+ 	.owner = THIS_MODULE,
+ 	.read = om_fop_read,
+ 	.write = om_fop_write,
++	.mmap = om_mmap_bar0,
++	.llseek = noop_llseek,
++};
++
++/* Osobny wezel dla BAR2 (TCM): mmap na /dev/omwifi ma z gory ustalone znaczenie
++ * (BAR0), a rozpoznawanie BAR-u po offsecie byloby zgadywanka. Ten wezel
++ * obsluguje WYLACZNIE mmap -- read/write na nim nie istnieja. */
++static const struct file_operations om_fops_tcm = {
++	.owner = THIS_MODULE,
++	.mmap = om_mmap_bar2,
+ 	.llseek = noop_llseek,
+ };
+ 
+@@ -2286,6 +2418,18 @@
+ 		goto blad_misc;
+ 	}
+ 
++	/* Drugi wezel: mmap BAR2/TCM dla minihosta (uzasadnienie i bramka BAR0 --
++	 * sekcja "mmap BAR0/BAR2 dla userspace" wyzej). */
++	b->misc_tcm.minor = MISC_DYNAMIC_MINOR;
++	b->misc_tcm.name = "omwifi-tcm";
++	b->misc_tcm.fops = &om_fops_tcm;
++	b->misc_tcm.mode = 0600;
++	err = misc_register(&b->misc_tcm);
++	if (err) {
++		dev_err(&pdev->dev, OM_NAZWA ": misc_register(%s) = %d\n", OM_DEV_TCM, err);
++		goto blad_misc_tcm;
++	}
++
+ 	mutex_lock(&om_lock);
+ 	om = b;
+ 	mutex_unlock(&om_lock);
+@@ -2298,6 +2442,8 @@
+ 		 (unsigned long long)b->dma_fiz, OM_DMA_ROZMIAR, win, cmd, (cmd >> 2) & 1u);
+ 	dev_info(&pdev->dev, OM_NAZWA ": bufor DMA przechodzi bramke fw 7.77 (<4 GiB i okno 64 MiB): %s\n",
+ 		 b->dma_ok ? "TAK" : "NIE");
++	dev_info(&pdev->dev, OM_NAZWA ": mmap dla userspace: %s = BAR0 (tylko po `irq off`), %s = BAR2/TCM; umowa: offset 0, len <= rozmiar BAR-u\n",
++		 OM_DEV, OM_DEV_TCM);
+ 	if (!b->dma_ok)
+ 		dev_emerg(&pdev->dev, OM_NAZWA ": UWAGA adres DMA 0x%llx NIE przechodzi bramki -- `contract` pominie pola msgbufaddr, a `ringinit`/`send`/`sendtrio` beda ODMAWIAC\n",
+ 			  (unsigned long long)b->dma_fiz);
+@@ -2305,6 +2451,8 @@
+ 		 OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV);
+ 	return 0;
+ 
++blad_misc_tcm:
++	misc_deregister(&b->misc);
+ blad_misc:
+ 	dma_free_coherent(&pdev->dev, OM_DMA_ROZMIAR, b->dma_va, b->dma_fiz);
+ blad_mapowanie:
+@@ -2337,6 +2485,7 @@
+ 	}
+ 	if (b->msi_on)
+ 		pci_disable_msi(pdev);
++	misc_deregister(&b->misc_tcm);
+ 	misc_deregister(&b->misc);
+ 	om_okno_restore(b);
+ 	if (b->dma_va)

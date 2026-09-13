@@ -1,0 +1,603 @@
+From ffc0b9e246f4f2d2b89957180efd1b94e02daa69 Mon Sep 17 00:00:00 2001
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Date: Wed, 9 Sep 2026 18:30:00 +0200
+Subject: [PATCH 20/20] test320 (M2): full NVRAM vars from the chip's own
+ SROM/CIS shadow (PCIe core +0x800) + wlunit=0
+
+---
+ brcmfmac/pcie.c | 592 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 556 insertions(+), 1 deletions(-)
+
+index e9fb78b..ac40aa7 100644
+--- a/brcmfmac/pcie.c
+@@ -322,6 +322,10 @@
+ module_param(bcm4360_test319_peek2, uint, 0644);
+ MODULE_PARM_DESC(bcm4360_test319_peek2, "BCM4360 test.319 fire #13 (phase R1): peek2 helper -- when nonzero, dump 16 dwords (64 B) at this TCM-absolute address via brcmf_pcie_read_ram32, one pr_emerg line per dword ('  +0xNN: 0x%08x'), bracketed; for the R1 breakcrumbs/SP/wl_struct/sched_ctx evidence (addresses resolved by fw-static analysis; 0 = skip). Runs where the POST-POLL dump runs (test277=1). (default 0, 0=skip)");
+ 
++static uint bcm4360_test320_sprom_nvram;
++module_param(bcm4360_test320_sprom_nvram, uint, 0644);
++MODULE_PARM_DESC(bcm4360_test320_sprom_nvram, "BCM4360 test.320 (M2, fire #15; notes/ sec.4 M2 -- full NVRAM from the chip's own SROM instead of the 13/15-var .txt kit): (a) PRE-release inside download_fw_nvram (ARM halted, BAR0 window) select PCIE2 core and read the WHOLE SROM/CIS shadow at PCIe core +0x800 (256 dwords = 1024 B -- kimptoc test.36-42: contains REAL Apple board data and is writable), log it as hex dumps (interleaved with printk -- the safe class, <=8 dwords per pr_emerg line; the 25-dword burst that killed printk in fire #10 is forbidden), then a raw CIS tuple walk (tag/len, kimptoc test.40 style) and a best-effort SROM rev 8/11 field extraction (SSB-style rev8 word offsets per include/linux/ssb/ssb_regs.h AND wl-style SROM11 dword offsets per kimptoc level-3 write test; fields: boardtype, boardrev, boardflags[0..1], sromrev, ccode, macaddr; the layout with a valid sromrev [4..12] wins, both interpretations are logged with the raw words; unparseable fields are logged raw, marked zero and warned -- nothing is invented). (b) Build the FULL vars text on the CFE pattern (boardtype/boardrev/boardflags/sromrev from the shadow, xtalfreq raw (0 when absent -- warned, NOT defaulted to 25000/40000), clkfreq=800,666 (CFE AC68U default), devpath=pci/<bus>/<dev> from pdev, wl0_macaddr + macaddr (from the shadow when valid -- nonzero, unicast -- else the .txt value with a warning), ccode (same rule), + wlunit=0 + the remaining keys kept byte-for-byte from the .txt kit (boardflags2/3, boardnum, regrev, vendid, devid, aa2g, aa5g)) -- then insert it at the EXACT same path the current vars use (download_fw_nvram: copy to rambase+ramsize-len, end token at TCM[ramsize-4], test276 varsz/vars16 snapshot follows the same buffer). Log: one 'test320: LEN=<n> vars=<full varbuf>' pr_emerg line (space-separated keys) + per-key lines with the layout and SROM source. test316 (R3b zero-NVRAM) takes precedence with a log line; test315 (R3a strip) is subsumed by the full replacement. Everything default (0) = byte-identical behavior. Fire discriminator: console wr_idx >0x27d (637) or new console output => the vars content (not the absence/wrongness of it) is the boot lever. (1=enable, 0=off)");
++
+ static int bcm4360_test308_olmsg_cdc;
+ module_param(bcm4360_test308_olmsg_cdc, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test308_olmsg_cdc, "BCM4360 test.308: PCI-CDC (olmsg) transport, phase 1+2. Phase 1: replace the msgbuf sharedram-ptr handshake poll (TCM[ramsize-4], guaranteed -ENODEV on this fw) with a best-effort si[+0x2028] poll (10 ms x 200, then CONTINUE), skip msgbuf shared-struct/ring setup, proto_type=BCDC. Phase 2: txctl/rxctl over the olmsg ring (T276 DMA buffer -- requires bcm4360_test276_shared_info=1), D2H drain in the threaded ISR on BAR0+0x48 bit 8, per-cycle mask BAR0+0x4C |= 0x100. txdata stays a stub until phase 3. Gated: only for chip 4360; all other chips keep the msgbuf path. (1=enable, 0=off)");
+@@ -1696,6 +1700,473 @@
+ }
+ 
+ 
++/* ==== BCM4360 test.320 (M2): SPROM-shadow NVRAM vars ====
++ * The .txt vars kit (brcmf_fw_nvram_strip output) is replaced by vars
++ * built from the chip's OWN SROM/CIS shadow at PCIe core +0x800
++ * (kimptoc test.36-42: REAL Apple board data, writable, first 28 dwords
++ * = CIS tuples). Format of the replacement = EXACTLY the strip output:
++ * NUL-separated "key=value" entries, zero padding to a 4 B boundary and
++ * the end token (~len/4 << 16 | len/4, LE) that lands at TCM[ramsize-4].
++ * If the shadow is unparseable (or fields read zero -- the shadow is
++ * mostly zero beyond the first 28 dwords on the 4360), the fields are
++ * logged raw, marked zero/warned -- never invented. */
++#define BCM4360_T320_SPROM_SHADOW_BYTES	1024	/* PCIe core +0x800, 256 dwords */
++#define BCM4360_T320_SPROM_DWORDS	(BCM4360_T320_SPROM_SHADOW_BYTES / 4)
++#define BCM4360_T320_VARBUF_MAX		2048	/* built text + padding + token */
++
++/* Word offsets (16-bit LE words of the shadow) -- SSB-style rev8 per
++ * include/linux/ssb/ssb_regs.h (SPOFF = byte/2). */
++#define BCM4360_T320_W_REV_SSB		0x003f	/* byte 0x7e: revision/CRC */
++#define BCM4360_T320_W_BOARDTYPE_SSB	0x0002	/* byte 0x04 (SPROM1_SPID) */
++#define BCM4360_T320_W_BOARDREV_SSB	0x0041	/* byte 0x82 */
++#define BCM4360_T320_W_BFLLO_SSB	0x0042	/* byte 0x84 */
++#define BCM4360_T320_W_BFLHI_SSB	0x0043	/* byte 0x86 */
++#define BCM4360_T320_W_BFL2LO_SSB	0x0044	/* byte 0x88 */
++#define BCM4360_T320_W_BFL2HI_SSB	0x0045	/* byte 0x8a */
++#define BCM4360_T320_W_MAC_SSB		0x0046	/* byte 0x8c: 6 B IL0MAC */
++#define BCM4360_T320_W_CCODE_SSB	0x0049	/* byte 0x92: 2 B alpha2 */
++/* Dword offsets -- wl-style SROM11 per kimptoc level-3 write test
++ * (bcm4360_test.c: sromrev at word 48, boardtype/boardrev at dword 33,
++ * boardflags at dword 35, ccode at dword 44, antenna at dword 49). */
++#define BCM4360_T320_D_REV		0x18	/* dword 24 = word 48 */
++#define BCM4360_T320_D_SVID_DEVID	0x20	/* dword 32 = subvid|devid */
++#define BCM4360_T320_D_BOARDTYPE	0x21	/* dword 33 = boardtype|boardrev */
++#define BCM4360_T320_D_BFL		0x23	/* dword 35 = boardflags */
++#define BCM4360_T320_D_BFL2		0x24	/* dword 36 */
++#define BCM4360_T320_D_CCODE		0x2c	/* dword 44 */
++
++struct bcm4360_t320_fields {
++	enum {
++		BCM4360_T320_LAYOUT_NONE = 0,
++		BCM4360_T320_LAYOUT_SSB8,
++		BCM4360_T320_LAYOUT_WL11
++	} layout;
++	u16 sromrev;
++	u16 boardtype;
++	u16 boardrev;
++	u32 boardflags;
++	u32 boardflags2;
++	u8 mac[6];
++	bool mac_valid;
++	char ccode[3];
++	bool ccode_valid;
++	u16 xtalfreq;
++	u32 subvid;
++	u32 devid;
++};
++
++static u16 bcm4360_t320_word(const u32 *shadow, u32 word)
++{
++	return (u16)(shadow[word >> 1] >> ((word & 1) << 4));
++}
++
++static bool bcm4360_t320_sromrev_ok(u16 rev)
++{
++	return rev >= 4 && rev <= 12;
++}
++
++/* Whole shadow read: select PCIE2 in the BAR0 window (the SROM/CIS
++ * shadow lives in the PCIe core at +0x800) and read 256 dwords; every
++ * 8-dword line is printed IMMEDIATELY after it is read (interleaved
++ * read/print -- the class that survived all fires; no buffered burst).
++ * ARM is halted here (host side) -- same access class as the proven
++ * T305/P1 PRE-release BAR0 reads. */
++static void bcm4360_t320_shadow_read(struct brcmf_pciedev_info *devinfo,
++				     u32 *shadow)
++{
++	u32 i;
++
++	pr_emerg("BCM4360 test.320: SROM/CIS shadow read START (PCIe core +0x800, %u dwords = %u B, BAR0 win select, ARM halted)\n",
++		 BCM4360_T320_SPROM_DWORDS, BCM4360_T320_SPROM_SHADOW_BYTES);
++	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
++	for (i = 0; i < BCM4360_T320_SPROM_DWORDS; i++)
++		shadow[i] = brcmf_pcie_read_reg32(devinfo, 0x800 + i * 4);
++	pr_emerg("BCM4360 test.320: SROM/CIS shadow read END (%u dwords)\n",
++		 BCM4360_T320_SPROM_DWORDS);
++	for (i = 0; i < BCM4360_T320_SPROM_DWORDS; i += 8) {
++		pr_emerg("BCM4360 test.320: srom[%03x..%03x]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			 i, i + 7, shadow[i], shadow[i + 1], shadow[i + 2],
++			 shadow[i + 3], shadow[i + 4], shadow[i + 5],
++			 shadow[i + 6], shadow[i + 7]);
++	}
++	/* raw byte view (dword LE), first 128 B */
++	pr_emerg("BCM4360 test.320: CIS bytes (dword LE), first 128 B:\n");
++	for (i = 0; i < 128; i += 16)
++		pr_emerg("BCM4360 test.320: CIS %03x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			 i,
++			 (unsigned int)((shadow[(i + 0) >> 2] >> (((i + 0) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 1) >> 2] >> (((i + 1) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 2) >> 2] >> (((i + 2) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 3) >> 2] >> (((i + 3) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 4) >> 2] >> (((i + 4) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 5) >> 2] >> (((i + 5) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 6) >> 2] >> (((i + 6) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 7) >> 2] >> (((i + 7) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 8) >> 2] >> (((i + 8) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 9) >> 2] >> (((i + 9) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 10) >> 2] >> (((i + 10) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 11) >> 2] >> (((i + 11) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 12) >> 2] >> (((i + 12) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 13) >> 2] >> (((i + 13) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 14) >> 2] >> (((i + 14) & 3) * 8)) & 0xff),
++			 (unsigned int)((shadow[(i + 15) >> 2] >> (((i + 15) & 3) * 8)) & 0xff));
++}
++
++/* Raw CIS tuple walk over the shadow bytes (kimptoc test.40 style:
++ * tag/len pairs, 0xff = END, len==0 or overrun = break; one pr_emerg
++ * line per tuple with the first <=16 data bytes in hex). */
++static void bcm4360_t320_cis_walk(const u32 *shadow)
++{
++	u32 i = 0;
++	u8 line[96];
++	u32 nl;
++
++	pr_emerg("BCM4360 test.320: CIS tuple walk START\n");
++	while (i + 1 < BCM4360_T320_SPROM_SHADOW_BYTES) {
++		u32 tag, tlen, d;
++
++		tag = (shadow[i >> 2] >> ((i & 3) * 8)) & 0xff;
++		if (tag == 0xff) {
++			pr_emerg("BCM4360 test.320: CIS @%03x: END\n", i);
++			break;
++		}
++		tlen = (shadow[(i + 1) >> 2] >> (((i + 1) & 3) * 8)) & 0xff;
++		if (tlen == 0 ||
++		    i + 2 + tlen > BCM4360_T320_SPROM_SHADOW_BYTES) {
++			pr_emerg("BCM4360 test.320: CIS @%03x: tag=0x%02x len=%u (break)\n",
++				 i, tag, tlen);
++			break;
++		}
++		nl = 0;
++		for (d = 0; d < tlen && d < 16; d++) {
++			u32 bj = i + 2 + d;
++
++			nl += snprintf(&line[nl], sizeof(line) - nl, "%02x ",
++				       (unsigned int)((shadow[bj >> 2] >>
++						      ((bj & 3) * 8)) & 0xff));
++		}
++		pr_emerg("BCM4360 test.320: CIS @%03x: tag=0x%02x len=%u data: %s\n",
++			 i, tag, tlen, line);
++		i += 2 + tlen;
++	}
++	pr_emerg("BCM4360 test.320: CIS tuple walk END\n");
++}
++
++static bool bcm4360_t320_mac_valid(const u8 *mac)
++{
++	u32 i;
++	bool nz = false;
++
++	for (i = 0; i < 6; i++) {
++		if (mac[i])
++			nz = true;
++		if (mac[i] == 0xff)
++			return false;	/* 0xff = unset byte */
++	}
++	return nz && !(mac[0] & 0x01);	/* not all-zero, unicast */
++}
++
++/* Field extraction -- both candidate layouts are decoded from the raw
++ * shadow words; the one whose sromrev validates [4..12] wins (SSB: word
++ * 63, wl-SROM11: word 48). Fields that the chosen layout does not
++ * define (mac: SSB only; xtalfreq: neither) are filled from the SSB
++ * offsets / zeroed and flagged in the per-field logs here (the builder
++ * re-warns). */
++static void bcm4360_t320_extract(const u32 *shadow,
++				 struct bcm4360_t320_fields *f)
++{
++	u16 rev_ssb, rev_wl, w;
++	u32 i;
++
++	memset(f, 0, sizeof(*f));
++	rev_ssb = bcm4360_t320_word(shadow, BCM4360_T320_W_REV_SSB) & 0xff;
++	rev_wl = bcm4360_t320_word(shadow, BCM4360_T320_D_REV * 2) & 0xff;
++	pr_emerg("BCM4360 test.320: sromrev candidates -- SSB word %u=0x%02x, wl word %u=0x%02x\n",
++		 BCM4360_T320_W_REV_SSB, rev_ssb,
++		 BCM4360_T320_D_REV * 2, rev_wl);
++	if (bcm4360_t320_sromrev_ok(rev_ssb))
++		f->layout = BCM4360_T320_LAYOUT_SSB8;
++	else if (bcm4360_t320_sromrev_ok(rev_wl))
++		f->layout = BCM4360_T320_LAYOUT_WL11;
++	else
++		f->layout = BCM4360_T320_LAYOUT_NONE;
++
++	if (f->layout == BCM4360_T320_LAYOUT_SSB8) {
++		f->sromrev = rev_ssb;
++		f->boardtype = bcm4360_t320_word(shadow,
++						 BCM4360_T320_W_BOARDTYPE_SSB);
++		f->boardrev = bcm4360_t320_word(shadow,
++						BCM4360_T320_W_BOARDREV_SSB);
++		w = bcm4360_t320_word(shadow, BCM4360_T320_W_BFLLO_SSB);
++		f->boardflags = w;
++		w = bcm4360_t320_word(shadow, BCM4360_T320_W_BFLHI_SSB);
++		f->boardflags |= (u32)w << 16;
++		w = bcm4360_t320_word(shadow, BCM4360_T320_W_BFL2LO_SSB);
++		f->boardflags2 = w;
++		w = bcm4360_t320_word(shadow, BCM4360_T320_W_BFL2HI_SSB);
++		f->boardflags2 |= (u32)w << 16;
++		for (i = 0; i < 3; i++) {
++			w = bcm4360_t320_word(shadow,
++					      BCM4360_T320_W_MAC_SSB + i * 2);
++			/* ssb sprom_get_mac: BE within each word */
++			f->mac[i * 2] = w >> 8;
++			f->mac[i * 2 + 1] = w & 0xff;
++		}
++		f->mac_valid = bcm4360_t320_mac_valid(f->mac);
++		w = bcm4360_t320_word(shadow, BCM4360_T320_W_CCODE_SSB);
++		f->ccode[0] = (w >> 8) & 0xff;
++		f->ccode[1] = w & 0xff;
++		f->ccode[2] = '\0';
++		f->ccode_valid = f->ccode[0] >= 0x21 && f->ccode[0] <= 0x7e &&
++				 f->ccode[1] >= 0x21 && f->ccode[1] <= 0x7e;
++	} else if (f->layout == BCM4360_T320_LAYOUT_WL11) {
++		f->sromrev = rev_wl;
++		f->boardtype = bcm4360_t320_word(shadow,
++						 BCM4360_T320_D_BOARDTYPE * 2);
++		f->boardrev = bcm4360_t320_word(shadow,
++						BCM4360_T320_D_BOARDTYPE * 2 + 1);
++		w = bcm4360_t320_word(shadow, BCM4360_T320_D_BFL * 2);
++		f->boardflags = w;
++		w = bcm4360_t320_word(shadow, BCM4360_T320_D_BFL * 2 + 1);
++		f->boardflags |= (u32)w << 16;
++		w = bcm4360_t320_word(shadow, BCM4360_T320_D_BFL2 * 2);
++		f->boardflags2 = w;
++		w = bcm4360_t320_word(shadow, BCM4360_T320_D_BFL2 * 2 + 1);
++		f->boardflags2 |= (u32)w << 16;
++		w = bcm4360_t320_word(shadow, BCM4360_T320_D_CCODE * 2);
++		f->ccode[0] = (w >> 8) & 0xff;
++		f->ccode[1] = w & 0xff;
++		f->ccode[2] = '\0';
++		f->ccode_valid = f->ccode[0] >= 0x21 && f->ccode[0] <= 0x7e &&
++				 f->ccode[1] >= 0x21 && f->ccode[1] <= 0x7e;
++		f->subvid = bcm4360_t320_word(shadow,
++					      BCM4360_T320_D_SVID_DEVID * 2);
++		f->devid = bcm4360_t320_word(shadow,
++					     BCM4360_T320_D_SVID_DEVID * 2 + 1);
++		/* mac: SSB-style offset only (layout-specific offset
++		 * unknown for wl11 -- fall back to the byte-0x8c guess). */
++		for (i = 0; i < 3; i++) {
++			w = bcm4360_t320_word(shadow,
++					      BCM4360_T320_W_MAC_SSB + i * 2);
++			/* ssb sprom_get_mac: BE within each word */
++			f->mac[i * 2] = w >> 8;
++			f->mac[i * 2 + 1] = w & 0xff;
++		}
++		f->mac_valid = bcm4360_t320_mac_valid(f->mac);
++	}
++	/* xtalfreq: no SROM field in either documented layout (it's an
++	 * nvram var on this silicon) -- 0 + warned, per the test spec. */
++	pr_emerg("BCM4360 test.320: extract layout=%s sromrev=%u boardtype=0x%04x boardrev=0x%04x boardflags=0x%08x boardflags2=0x%08x ccode='%s' mac=%pM%s subvid=0x%04x devid=0x%04x xtalfreq=0x0\n",
++		 f->layout == BCM4360_T320_LAYOUT_SSB8 ? "SSB8" :
++		 f->layout == BCM4360_T320_LAYOUT_WL11 ? "WL11" : "NONE",
++		 f->sromrev, f->boardtype, f->boardrev, f->boardflags,
++		 f->boardflags2, f->ccode_valid ? f->ccode : "??",
++		 f->mac, f->mac_valid ? "" : " (invalid -> txt fallback)",
++		 f->subvid, f->devid);
++}
++
++/* Look up a key in the original strip-output vars (text region only --
++ * the last 4 B are the end token). Returns the value (NUL-terminated
++ * copy). */
++static bool bcm4360_t320_txt_get(const u8 *txt, u32 txtlen, const char *key,
++				 char *out, u32 outsz)
++{
++	u32 content = txtlen > sizeof(u32) ? txtlen - sizeof(u32) : 0;
++	u32 i = 0;
++	u32 klen = strlen(key);
++
++	while (i < content) {
++		u32 start = i;
++		u32 elen;
++
++		while (i < content && txt[i])
++			i++;
++		elen = i - start;	/* bytes up to (not incl.) NUL */
++		if (elen > klen + 1 &&
++		    !strncmp((const char *)&txt[start], key, klen) &&
++		    txt[start + klen] == '=') {
++			u32 vlen = elen - klen - 1;
++
++			if (vlen + 1 > outsz)
++				vlen = outsz - 1;
++			memcpy(out, &txt[start + klen + 1], vlen);
++			out[vlen] = '\0';
++			return true;
++		}
++		if (i < content)
++			i++;		/* skip the NUL */
++	}
++	return false;
++}
++
++/* Build the replacement vars buffer (strip-exact format with the end
++ * token) and log it. txt = original .txt vars (fallback), txtlen = its
++ * len incl. token. */
++static u8 *bcm4360_t320_build_nvram(struct brcmf_pciedev_info *devinfo,
++				    const struct bcm4360_t320_fields *f,
++				    const u8 *txt, u32 txtlen, u32 *out_len)
++{
++	u8 *buf;
++	u32 pos = 0, padded, token;
++	__le32 token_le;
++	char val[64];
++	char mac[32];
++	char ccode[8];
++	char txtval[64];
++	u32 i;
++
++	buf = kzalloc(BCM4360_T320_VARBUF_MAX, GFP_KERNEL);
++	if (!buf)
++		return NULL;
++
++	if (f->ccode_valid)
++		snprintf(ccode, sizeof(ccode), "%c%c", f->ccode[0],
++			 f->ccode[1]);
++	else
++		snprintf(ccode, sizeof(ccode), "??");
++
++	#define T320_ADD(fmt, ...) do {						\
++		int t320_n = snprintf((char *)&buf[pos],			\
++				      BCM4360_T320_VARBUF_MAX - pos,		\
++				      fmt, ##__VA_ARGS__);			\
++		if (t320_n > 0 && (u32)t320_n < BCM4360_T320_VARBUF_MAX - pos)	\
++			pos += t320_n + 1;					\
++		else								\
++			pos = BCM4360_T320_VARBUF_MAX;				\
++	} while (0)
++
++	/* SROM primary fields (as-is, zero => warned), then the txt kit. */
++	T320_ADD("sromrev=%u", f->sromrev);
++	if (!f->sromrev)
++		pr_emerg("BCM4360 test.320: WARNING sromrev=0 (no valid SROM rev word -- raw shadow value, not defaulted)\n");
++	T320_ADD("boardtype=0x%04x", f->boardtype);
++	if (!f->boardtype || f->boardtype == 0xffff)
++		pr_emerg("BCM4360 test.320: WARNING boardtype=0x%04x (no valid SROM boardtype -- raw value kept)\n",
++			 f->boardtype);
++	T320_ADD("boardrev=0x%04x", f->boardrev);
++	if (!f->boardrev || f->boardrev == 0xffff)
++		pr_emerg("BCM4360 test.320: WARNING boardrev=0x%04x (raw value kept)\n",
++			 f->boardrev);
++	T320_ADD("boardflags=0x%08x", f->boardflags);
++	T320_ADD("xtalfreq=%u", f->xtalfreq);
++	pr_emerg("BCM4360 test.320: WARNING xtalfreq=%u (no SROM field defines it on this silicon; raw 0 kept -- NOT defaulted to 25000/40000)\n",
++		 f->xtalfreq);
++	T320_ADD("clkfreq=800,666");
++	T320_ADD("devpath=pci/%u/%u", devinfo->pdev->bus->number,
++		 PCI_SLOT(devinfo->pdev->devfn));
++	T320_ADD("wlunit=0");
++
++	/* MAC: SROM when valid, else the .txt value (warned). */
++	if (f->mac_valid) {
++		snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
++			 f->mac[0], f->mac[1], f->mac[2], f->mac[3],
++			 f->mac[4], f->mac[5]);
++		pr_emerg("BCM4360 test.320: macaddr from SROM shadow: %s\n", mac);
++	} else if (bcm4360_t320_txt_get(txt, txtlen, "macaddr", txtval,
++					sizeof(txtval))) {
++		snprintf(mac, sizeof(mac), "%s", txtval);
++		pr_emerg("BCM4360 test.320: macaddr: SROM invalid -> txt fallback '%s'\n",
++			 mac);
++	} else {
++		snprintf(mac, sizeof(mac), "00:00:00:00:00:00");
++		pr_emerg("BCM4360 test.320: macaddr: SROM invalid and no txt macaddr -> 00:00:00:00:00:00\n");
++	}
++	T320_ADD("macaddr=%s", mac);
++	T320_ADD("wl0_macaddr=%s", mac);
++
++	/* ccode: SROM when valid, else .txt (warned). */
++	if (f->ccode_valid) {
++		snprintf(val, sizeof(val), "%s", ccode);
++	} else if (bcm4360_t320_txt_get(txt, txtlen, "ccode", txtval,
++					sizeof(txtval))) {
++		snprintf(val, sizeof(val), "%s", txtval);
++		pr_emerg("BCM4360 test.320: ccode: SROM invalid -> txt fallback '%s'\n",
++			 val);
++	} else {
++		snprintf(val, sizeof(val), "XX");
++		pr_emerg("BCM4360 test.320: ccode: SROM invalid and no txt ccode -> XX\n");
++	}
++	T320_ADD("ccode=%s", val);
++
++	/* Remaining current keys kept from the .txt kit (identical). */
++	{
++		static const char *keep_keys[] = {
++			"boardflags2", "boardflags3", "boardnum", "regrev",
++			"vendid", "devid", "aa2g", "aa5g",
++		};
++		for (i = 0; i < ARRAY_SIZE(keep_keys); i++) {
++			if (bcm4360_t320_txt_get(txt, txtlen, keep_keys[i],
++						 txtval, sizeof(txtval))) {
++				T320_ADD("%s=%s", keep_keys[i], txtval);
++			} else {
++				pr_emerg("BCM4360 test.320: key '%s' missing from the txt kit -- not emitted\n",
++					 keep_keys[i]);
++			}
++		}
++	}
++
++	#undef T320_ADD
++
++	if (pos >= BCM4360_T320_VARBUF_MAX - 8) {
++		pr_emerg("BCM4360 test.320: vars text overflow (%u B) -- fallback to the original .txt vars\n",
++			 pos);
++		kfree(buf);
++		return NULL;
++	}
++
++	/* strip-exact tail: pad to roundup(pos + 1, 4), then the token. */
++	padded = roundup(pos + 1, 4);
++	while (pos < padded) {
++		buf[pos] = '\0';
++		pos++;
++	}
++	token = padded / 4;
++	token = (~token << 16) | (token & 0x0000ffff);
++	token_le = cpu_to_le32(token);
++	memcpy(&buf[padded], &token_le, sizeof(token_le));
++	*out_len = padded + sizeof(token_le);
++
++	/* The whole varbuf in the log: NULs -> spaces, chunked at 400 B
++	 * (printk records cap at ~1 KB); the first line carries the
++	 * "LEN=<n> vars=<...>" prefix the fire script greps for, the
++	 * rest are continuation chunks. */
++	if (pos == 0) {
++		pr_emerg("BCM4360 test.320: LEN=<%u> vars=<> (empty vars text -- %u B incl. token; fallback to the .txt kit)\n",
++			 (u32)(padded + sizeof(token_le)), *out_len);
++		kfree(buf);
++		return NULL;
++	}
++	{
++		char t320_line[424];
++		u32 t320_off = 0;
++		bool t320_first = true;
++
++		while (t320_off < pos) {
++			u32 t320_n = min_t(u32, pos - t320_off, 400);
++			u32 t320_k;
++
++			for (t320_k = 0; t320_k < t320_n; t320_k++)
++				t320_line[t320_k] = buf[t320_off + t320_k] ?
++					buf[t320_off + t320_k] : ' ';
++			t320_line[t320_n] = '\0';
++			if (t320_first) {
++				pr_emerg("BCM4360 test.320: LEN=<%u> vars=<%s",
++					 *out_len, t320_line);
++				t320_first = false;
++			} else {
++				pr_emerg("BCM4360 test.320: varscont=<%s", t320_line);
++			}
++			t320_off += t320_n;
++		}
++		if (t320_first)	/* pos == 0 guarded above */
++			pr_emerg("BCM4360 test.320: LEN=<%u> vars=<>\n", *out_len);
++		else
++			pr_emerg("BCM4360 test.320: end of vars (token 0x%08x at +0x%u, total %u B)\n",
++				 (u32)le32_to_cpu(token_le), padded, *out_len);
++	}
++	return buf;
++}
++
+ /* ==== BCM4360 test.315 R3a: strip the "boardtype=" var from NVRAM ====
+  * The buffer handed to brcmf_pcie_download_fw_nvram as (nvram, nvram_len)
+  * is the brcmf_fw_nvram_strip() output -- NUL-terminated "key=value"
+@@ -3133,6 +3604,11 @@
+ 	 * right after the TCM download below, so capture it beforehand. */
+ 	u32 t276_varsz = 0;
+ 	u8 t276_vars16[16] = { 0 };
++	/* BCM4360 test.320 (M2): replacement vars built from the SROM/CIS
++	 * shadow (strip-exact buffer, incl. the end token); freed right
++	 * after the TCM copy below. */
++	u8 *t320_buf = NULL;
++	u32 t320_len = 0;
+ 
+ 	/* BCM4360 test.315 R3a: strip the boardtype var from the NVRAM
+ 	 * vars BEFORE both consumers -- the TCM download below and the
+@@ -3161,6 +3637,44 @@
+ 	 */
+ 	brcmf_pcie_write_ram32(devinfo, devinfo->ci->ramsize - 4, 0);
+ 
++	/* BCM4360 test.320 (M2): read the chip's own SROM/CIS shadow and
++	 * build the replacement vars. Runs PRE-release (ARM halted) --
++	 * kimptoc test.36-42: the PCIe+0x800 shadow holds the REAL Apple
++	 * board data and is writable; the .txt kit (13/15 vars, mostly
++	 * invented by kimptoc: boardtype 0x0552, sromrev 11, xtalfreq
++	 * 40000) does NOT match the card. The replacement is inserted at
++	 * the exact same point as the original vars (TCM copy below,
++	 * token at TCM[ramsize-4], test276 varsz/vars16 snapshot). */
++	if (bcm4360_test320_sprom_nvram &&
++	    devinfo->ci->chip == BRCM_CC_4360_CHIP_ID &&
++	    bcm4360_test316 == 0) {
++		u32 *t320_shadow;
++		struct bcm4360_t320_fields t320_f;
++
++		t320_shadow = kzalloc(BCM4360_T320_SPROM_DWORDS *
++				      sizeof(u32), GFP_KERNEL);
++		if (!t320_shadow) {
++			pr_emerg("BCM4360 test.320: shadow buffer kmalloc FAILED -- keeping the original .txt vars\n");
++		} else {
++			bcm4360_t320_shadow_read(devinfo, t320_shadow);
++			bcm4360_t320_cis_walk(t320_shadow);
++			bcm4360_t320_extract(t320_shadow, &t320_f);
++			t320_buf = bcm4360_t320_build_nvram(devinfo, &t320_f,
++							    nvram, nvram_len,
++							    &t320_len);
++			kfree(t320_shadow);
++			if (t320_buf)
++				pr_emerg("BCM4360 test.320: vars REPLACED by the SPROM-shadow build (len %u B, %u dwords scanned; old .txt len was %u)\n",
++					 t320_len, BCM4360_T320_SPROM_DWORDS,
++					 nvram_len);
++			else
++				pr_emerg("BCM4360 test.320: vars build FAILED (see above) -- keeping the original .txt vars\n");
++		}
++	} else if (bcm4360_test320_sprom_nvram &&
++		   devinfo->ci->chip == BRCM_CC_4360_CHIP_ID) {
++		pr_emerg("BCM4360 test.320: scan SKIPPED -- test316 (R3b zero-NVRAM) takes precedence; with both set the fw sees no vars (kimptoc test.28 substrate)\n");
++	}
++
+ 	if (bcm4360_test316 && nvram &&
+ 	    devinfo->ci->chip == BRCM_CC_4360_CHIP_ID) {
+ 		/* BCM4360 test.316 R3b: skip the WHOLE NVRAM download -- no
+@@ -3179,6 +3693,47 @@
+ 		 * branch below is inactive anyway -- WCC sets fw_seed=0). */
+ 		pr_emerg("BCM4360 test.316: R3b NVRAM download SKIPPED (no vars, no token -- kimptoc test.28 replication; T276 varsz/vars16 snapshot will read zeros -- expected)\n");
+ 		brcmf_fw_nvram_free(nvram);
++	} else if (t320_buf) {
++		/* BCM4360 test.320 (M2): the SPROM-shadow vars -- the exact
++		 * original path (address, copy, token at ramsize-4, T276
++		 * varsz/vars16 snapshot, fwseed branch). */
++		pr_emerg("BCM4360 test.320: NVRAM vars download (SPROM-shadow build, len %u) at TCM 0x%08x\n",
++			 t320_len,
++			 devinfo->ci->rambase + devinfo->ci->ramsize -
++			 t320_len);
++		address = devinfo->ci->rambase + devinfo->ci->ramsize -
++			  t320_len;
++		brcmf_pcie_copy_mem_to_dev(devinfo, address, t320_buf,
++					   t320_len);
++		t276_varsz = t320_len;
++		if (t320_len < sizeof(t276_vars16))
++			memcpy(t276_vars16, t320_buf, t320_len);
++		else
++			memcpy(t276_vars16, t320_buf, sizeof(t276_vars16));
++		kfree(t320_buf);
++		t320_buf = NULL;
++		/* the original .txt buffer is not downloaded anymore --
++		 * release it here (kfree(NULL) is safe). */
++		brcmf_fw_nvram_free(nvram);
++		if (devinfo->fwseed) {
++			size_t rand_len = BRCMF_RANDOM_SEED_LENGTH;
++			struct brcmf_random_seed_footer footer = {
++				.length = cpu_to_le32(rand_len),
++				.magic = cpu_to_le32(BRCMF_RANDOM_SEED_MAGIC),
++			};
++
++			/* Some chips/firmwares expect a buffer of random
++			 * data to be present before NVRAM
++			 */
++			brcmf_dbg(PCIE, "Download random seed\n");
++
++			address -= sizeof(footer);
++			brcmf_pcie_copy_mem_to_dev(devinfo, address, &footer,
++						   sizeof(footer));
++
++			address -= rand_len;
++			brcmf_pcie_provide_random_bytes(devinfo, address);
++		}
+ 	} else if (nvram) {
+ 		brcmf_dbg(PCIE, "Download NVRAM %s\n", devinfo->nvram_name);
+ 		address = devinfo->ci->rambase + devinfo->ci->ramsize -
++++ b/brcmfmac/pcie.c

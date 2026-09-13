@@ -1,0 +1,198 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 12/12] brcmfmac: pcie: BCM4360 test.312 olmsg liveness gate
+
+Final spec from two research notes (workflow finished; file:line evidence
+there): notes/fw-watchdog-doorbell-static.md section d (PMU-watchdog DISARMED
+since c_init -- sole writer si_watchdog @0x9A46, zero pet-loops; fw arms its
+own SB intmask intrs_on @0x1C74 independently of the host and announces
+readiness via sbtopcimailbox(+0x28)=0x100, fw fn @0x1F94 -> host BAR0+0x48
+bit 8) and notes/config-space-research.md section 6 (config cycles after a
+fw freeze are the sharpest ammunition: kernel has no per-cycle timer, DEVCTL2
+COMP_TIMEOUT is the only one and no driver programs it, CTO is non-fatal and
+invisible; bcmdhd tmp/broadcom-bcmdhd-4359 carries doorbell-timeout machinery
++ the "trying to ring the doorbell after D3 inform" guard = the industry
+pattern for our liveness gate; select_core belongs on a LIVE device BEFORE
+release; kimptoc T301: the same config write passed at t+0 and wedged at
+t+60s -- MMIO wedge independent of config). Both hard wedges died at the
+phase-1 poll EXIT, immediately before: select_core (config 0x80 w+r),
+absolute MAILBOXMASK:=0, MSI/request_irq, preinit MBM|=0x100 and the first
+H2D doorbell (experiment #4 report sec.7; crash-root-cause-audit P5/P6).
+
+New module param bcm4360_test312_liveness_gate (default 0), gated
+bcm4360_olmsg_active() (test308=1 + chip 4360); three changes, all olmsg-only:
+
+1. Post-poll brcmf_pcie_select_core(PCIE2) SKIPPED instead of moved: PCIE2
+   regs sit at BAR0 offset 0 on this chip (wl.ko up-path does ZERO
+   config-space writes, BAR0 window set once at attach; experiment #1:
+   select_core is a no-op here) AND brcmf_pcie_attach() already ran
+   select_core(PCIE2) at the very start of brcmf_pcie_setup() -- PRE-RELEASE,
+   on the LIVE device. The post-poll config 0x80 write+read is redundant
+   ammunition. pr_emerg "select_core skipped (PCIE2 in BAR0@0)".
+
+2. brcmf_pcie_request_irq: in the olmsg path NO absolute MAILBOXMASK:=0
+   (wl.ko never writes 0 to 0x4C in the up-path) -- one RMW |=0x100 executed
+   HERE, before request_threaded_irq (spec section d item 2); the later
+   preinit RMW is idempotent. The absolute write stays for the msgbuf path.
+   pr_emerg at the skip.
+
+3. LIVENESS GATE before the first H2D doorbell (brcmf_pcie_tx_ctlpkt): the
+   fw announces readiness by sbtopcimailbox(+0x28)=0x100 -> host BAR0+0x48
+   bit 8 (PCIMailBoxInt). Poll every 50 ms, max 2 s (40 BAR0 reads,
+   T276-proven cadence class). Statistically 100% correlated with "fw alive
+   and armed": mbxint=0x03 on kimptoc test.28 (fully initialized fw),
+   mbxint=0x00000000 in ALL our fires (fw frozen before announcing). Bit
+   absent -> NO doorbell: pr_emerg "fw not ready (mbxint=0 after 2s) -- T309
+   hold instead of doorbell", bcm4360_t309_olmsg_zero_teardown_hold()
+   (zero-teardown, device stays bound) and return -ETIMEDOUT; the error
+   propagates (first preinit dcmd aborts -> brcmf_attach err) to the
+   0009-gated fail label. The T309 hold now dedups via devinfo->t309_hold_done
+   so the fail-path call logs "already ran" instead of holding twice. The
+   gate runs once (first dcmd); later dcmds pass straight through when the
+   fw is ready, and a latched NOT-READY state refuses every later doorbell.
+
+Bracketing pr_emerg after the poll (test.310, patch 0011) is unchanged.
+~90 lines, olmsg branch only -- zero behaviour change for every other chip
+and for the msgbuf path.
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 89 insertions(+), 2 deletions(-)
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -238,6 +238,10 @@
+ module_param(bcm4360_test311_skip_fwinit_poll, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test311_skip_fwinit_poll, "BCM4360 test.311: skip the test.308 phase-1 fw_init_done poll entirely (jump straight to poll-end return 0). The poll is best-effort CONTINUE and fw_init_done is NOT a protocol gate (report sec.9; the constant si[+0x2028] has no known writer in the fw image), so it delivers zero information -- and BOTH hard wedges (fire #4 and fire #5, experiment #4 report sec.7) died in its time window regardless of cadence (1 kHz in #4, 100 Hz in #5) and absolute t. With test311=1 the setup path runs with ZERO MMIO in the former poll window and goes straight to IRQ/attach/doorbell, with test.310 post-poll bracketing prints naming each step. Gated: chip 4360 + test308 (bcm4360_olmsg_active). (1=enable, 0=off)");
+ 
++static int bcm4360_test312_liveness_gate;
++module_param(bcm4360_test312_liveness_gate, int, 0644);
++MODULE_PARM_DESC(bcm4360_test312_liveness_gate, "BCM4360 test.312: olmsg liveness gate (spec: fw-watchdog-doorbell-static section d + config-space-research section 6; audit P5/P6). (a) post-poll select_core(PCIE2) skipped in the olmsg path -- PCIE2 regs sit at BAR0 offset 0 (wl.ko up-path does zero config-space writes; experiment #1: select_core is a no-op on this chip) and brcmf_pcie_attach() already selected PCIE2 pre-release on the LIVE device, so the post-poll config 0x80 cycle is redundant ammunition. (b) brcmf_pcie_request_irq: no absolute MAILBOXMASK:=0 in the olmsg path (wl.ko never writes 0 to 0x4C in the up-path) -- one RMW |=0x100 before request_threaded_irq instead. (c) LIVENESS GATE before the first H2D doorbell: poll BAR0+0x48 for bit 8 (fw sbtopcimailbox=0x100 announcement) every 50 ms, max 2 s; bit absent -> NO doorbell (bcmdhd dhd_doorbell_timeout / 'trying to ring the doorbell after D3 inform' pattern), T309 zero-teardown hold instead, error path to the 0009-gated fail label. Gated: chip 4360 + test308 (bcm4360_olmsg_active). (1=enable, 0=off)");
++
+ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4360_CHIP_ID, 0xFFFFFFFF, 4360),
+@@ -529,6 +533,13 @@
+ 	bool olmsg_resp_pending;	/* true while a ctl waits for a response */
+ 	u32 olmsg_resp_len;		/* bytes accumulated in olmsg_resp_data */
+ 	u8 olmsg_resp_data[BCM4360_OLMSG_CTL_RESP_SIZE];
++	/* BCM4360 test.312: olmsg liveness-gate state (config-space-research
++	 * section 6 / fw-watchdog-doorbell-static section d: no doorbell to
++	 * a fw that has not announced readiness; the T309 hold runs at most
++	 * once). */
++	bool t309_hold_done;		/* T309 hold already ran (dedup) */
++	bool olmsg_liveness_checked;	/* gate poll already ran (first dcmd) */
++	bool olmsg_fw_ready;		/* fw announced readiness (BAR0+0x48 bit 8) */
+ #ifdef DEBUG
+ 	u32 console_interval;
+ 	bool console_active;
+@@ -1046,6 +1057,15 @@
+ 	bool bit8_seen = false;
+ 	int i;
+ 
++	/* test.312: run at most once -- the liveness gate (tx_ctlpkt) may
++	 * hold BEFORE the fail path does; the 0009-gated fail-label call
++	 * then dedups here instead of holding twice. */
++	if (devinfo->t309_hold_done) {
++		pr_emerg("BCM4360 test.309: hold already ran (test.312 gate path) -- skipping second hold\n");
++		return;
++	}
++	devinfo->t309_hold_done = true;
++
+ 	pr_emerg("BCM4360 test.309: ENTER olmsg zero-teardown hold (setup fail ret=%d state=%d irq_allocated=%d olmsg_buf=%d; device stays bound, NO teardown: no device_release_driver, no chip_set_passive, no reset_device)\n",
+ 		 fail_ret, devinfo->state,
+ 		 devinfo->irq_allocated ? 1 : 0,
+@@ -1665,7 +1685,18 @@
+ 	struct pci_dev *pdev = devinfo->pdev;
+ 	struct brcmf_bus *bus = dev_get_drvdata(&pdev->dev);
+ 
+-	brcmf_pcie_intr_disable(devinfo);
++	if (bcm4360_test312_liveness_gate && bcm4360_olmsg_active(devinfo)) {
++		/* test.312(b): wl.ko up-path NEVER writes 0 to PCIMailBoxMask
++		 * -- the only operation is one RMW |=0x100 (wlc_ol_enable_
++		 * intrs @0x7F679). Do it HERE, before request_threaded_irq
++		 * (spec fw-watchdog-doorbell-static §d item 2); the later
++		 * brcmf_pcie_preinit() RMW is idempotent (second |=0x100 is a
++		 * no-op). The absolute 0x4C:=0 stays for the msgbuf path. */
++		pr_emerg("BCM4360 test.312: request_irq: absolute MAILBOXMASK:=0 skipped (olmsg) -- single RMW |=0x100 before request_threaded_irq\n");
++		brcmf_pcie_intr_enable(devinfo);
++	} else {
++		brcmf_pcie_intr_disable(devinfo);
++	}
+ 
+ 	brcmf_dbg(PCIE, "Enter\n");
+ 
+@@ -2183,6 +2214,51 @@
+ 	if (!bcm4360_olmsg_active(devinfo))
+ 		return 0;	/* msgbuf path does not use txctl */
+ 
++	/* test.312(c): LIVENESS GATE before the first H2D doorbell (spec
++	 * fw-watchdog-doorbell-static §d item 3 + config-space-research §6;
++	 * audit P5/P6). The fw announces readiness by writing sbtopcimailbox
++	 * (+0x28)=0x100 (fw fn @0x1F94) -> host sees BAR0+0x48 bit 8
++	 * (PCIMailBoxInt). Statistically: mbxint=0x03 on kimptoc test.28
++	 * (fw fully initialized) vs mbxint=0x00000000 in ALL our fires (fw
++	 * frozen before announcing) -- the gate is 100% correlated with
++	 * "fw alive and armed". Poll every 50 ms, max 2 s (T276-proven
++	 * cadence class, 40 BAR0 reads). Bit absent -> NO doorbell (bcmdhd
++	 * dhd_doorbell_timeout / "trying to ring the doorbell after D3
++	 * inform" guard -- the industry pattern brcmfmac lacks): T309
++	 * zero-teardown hold instead, then return -ETIMEDOUT; the error
++	 * propagates (preinit dcmds abort -> brcmf_attach err) to the
++	 * 0009-gated fail label, where the hold dedups. Runs ONCE (first
++	 * dcmd); later dcmds go straight through when fw is ready. */
++	if (bcm4360_test312_liveness_gate && !devinfo->olmsg_liveness_checked) {
++		u32 gate_i;
++		u32 gate_val = 0;
++
++		devinfo->olmsg_liveness_checked = true;
++		for (gate_i = 0; gate_i < 40; gate_i++) {
++			gate_val = brcmf_pcie_read_reg32(devinfo,
++					BRCMF_PCIE_PCIE2REG_MAILBOXINT);
++			if (gate_val & BCM4360_OLMSG_INT_D2H)
++				break;
++			msleep(50);
++		}
++		if (gate_val & BCM4360_OLMSG_INT_D2H) {
++			devinfo->olmsg_fw_ready = true;
++			pr_emerg("BCM4360 test.312: fw ALIVE (mbxint bit8 set, 0x%08x after %ums) -- ringing doorbell H2D\n",
++				 gate_val, gate_i * 50);
++		} else {
++			pr_emerg("BCM4360 test.312: fw not ready (mbxint=0x%08x after 2s) -- T309 hold instead of doorbell\n",
++				 gate_val);
++			bcm4360_t309_olmsg_zero_teardown_hold(devinfo,
++							      -ETIMEDOUT);
++			return -ETIMEDOUT;
++		}
++	}
++	if (bcm4360_test312_liveness_gate && !devinfo->olmsg_fw_ready) {
++		/* Gate latched NOT-READY earlier -- never doorbell this fw. */
++		brcmf_err(bus_if, "olmsg: fw not ready (test.312 gate latched) -- refusing doorbell\n");
++		return -ETIMEDOUT;
++	}
++
+ 	/* At most one outstanding ctl (bcdc serializes queries); arm the
+ 	 * pending state BEFORE the doorbell so an immediate D2H response
+ 	 * (ISR runs in a thread) still matches. */
+@@ -3356,7 +3432,22 @@
+ 	if (bcm4360_test310_olmsg_poll_heartbeat &&
+ 	    bcm4360_olmsg_active(devinfo))
+ 		pr_emerg("BCM4360 test.310: post-poll step: select_core(PCIE2) + request_irq enter\n");
+-	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
++	if (bcm4360_test312_liveness_gate && bcm4360_olmsg_active(devinfo)) {
++		/* test.312(a): SKIP the post-poll config-space cycle. PCIE2
++		 * regs sit at BAR0 offset 0 on this chip (wl.ko: BAR0 window
++		 * set once at attach, up-path has ZERO config-space writes;
++		 * experiment #1: select_core is a no-op here) AND
++		 * brcmf_pcie_attach() already ran select_core(PCIE2) at the
++		 * very start of setup -- PRE-RELEASE, on the LIVE device
++		 * (config cycles on a live device = the brcmfmac/bcmdhd/
++		 * OpenBSD pattern; config-space-research §6: config/MMIO
++		 * cycles after the fw freeze are the sharpest ammunition,
++		 * kimptoc T301). The BAR0 window is already PCIE2; the
++		 * post-poll write+read of config 0x80 is redundant. */
++		pr_emerg("BCM4360 test.312: select_core skipped (PCIE2 in BAR0@0) -- zero config cycles after ARM release\n");
++	} else {
++		brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
++	}
+ 	ret = brcmf_pcie_request_irq(devinfo);
+ 	if (ret)
+ 		goto fail;

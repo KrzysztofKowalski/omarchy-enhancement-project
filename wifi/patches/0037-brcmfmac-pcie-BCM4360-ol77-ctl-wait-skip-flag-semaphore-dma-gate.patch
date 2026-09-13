@@ -1,0 +1,430 @@
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -244,6 +244,80 @@
+ #define BCM4360_OL77_VARS_OFF		(BCM4360_T336_SI_VARS)		/* +0x24 */
+ #define BCM4360_OL77_ZERO_CHUNK		4096	/* B na jeden zapis zerowania */
+ 
++/* ==== BCM4360 patch 0037 (gaps 4b and 2a from the runbook + R1/R2/R3/R5 from the
++ * DMA-IRQ-addresses audit): closes the 7.77 substrate -- ENABLED PERMANENTLY for
++ * 7.77 images, no new module parameter. Four runtime changes (L4-b, L2-a, R2, R3)
++ * share one gate: bcm4360_ol77_path() (chip 4360 + image 2/3) -- outside it the
++ * code is bit-for-bit the old one. The fifth (R5) is ONLY the text of one autopsy
++ * T314 log line (the previous, fixed comment was untrue with intstatus != 0x200)
++ * and works on every path where the autopsy is called.
++ * Justification: notes/ (gaps 2 and 4),
++ * notes/ par. 4 (R1-R5), notes/.
++ *
++ *  (L4-b, gap 4) WE DO NOT WAIT FOR the ctl ANSWER on the 7.77 path. The 7.77 image
++ *      has NO dcmd/CDC type in its olmsg space (map of 72 BCM_OL_* types:
++ *      notes/), so a D2H answer to the dcmd
++ *      can never come, and our 5 s wait (BCM4360_OLMSG_CTL_
++ *      RESP_TIMEOUT_MS) ended with -ETIMEDOUT -> "Dongle setup failed"
++ *      (pcie.c:brcmf_pcie_setup, fail:) and a T309 hold -- i.e. bring-up failed
++ *      on something this fw would never do. The Apple host enforces NOTHING
++ *      here: _wlc_ol_msg_send ends after raising the doorbell,
++ *      and readiness comes from the +0x5028 gate, which after exceeding 2000x1 ms
++ *      only logs and carries on (no error branch -- notes/luka2-4-kontrakt-
++ *      i-bramka.md par. 2.1). Change: on the 7.77 path rx_ctlpkt returns 0 B
++ *      without an error (ONE pr_emerg per run), and the rest of the run
++ *      (readiness gate T337 + hold T309) stays unchanged. The msgbuf/non-7.77
++ *      path is UNTOUCHED.
++ *
++ *  (L2-a, R1) flag[0] (+0x14) and flag[1] (+0x18) := 0 in the 7.77 contract --
++ *      exactly what the Apple host writes (0x73a3d / 0x73a42: movl %r15d,
++ *      -0x10/-0xc(%r12), r12 = base+0x24). These are SEMAPHORE fields of the TCM
++ *      window (Peterson, notes/): the fw in tcm_sem_enter
++ *      (0x13022-0x13058) sets flag[1]=1, turn=0 and waits in a loop WITH NO EXIT
++ *      for flag[0] != 1; a leftover flag[0]=1 (TCM does not clear on reboot) is
++ *      a silent, eternal fw loop. The fw reads +0x14 EXACTLY ONCE in the whole
++ *      image (0x1304e; tmp/audyt-dma-fw-kontrakt-gtrack.txt:116) and never
++ *      writes it. turn (+0x1C) is left UNTOUCHED -- neither Apple
++ *      (0x73a3d/0x73a42 covers only the two fields), nor wl.ko writes it, and the
++ *      fw zeroes it itself in tcm_sem_enter; with flag[0]=0 the loop condition
++ *      does not hold anyway.
++ *
++ *  (R2) on the 7.77 path we SKIP write_ram32(ramsize-4, 0). This write comes from
++ *      the msgbuf path (there the fw publishes its sharedram pointer under it),
++ *      and for 7.77 it lands in contract+0x5F7C -- the last dword of the host
++ *      struct, which Apple does NOT write (list of 12 writes: notes/).
++ *      The value 0x5F7C does not occur in the 7.77 image EVEN ONCE: `grep 0x5f7c
++ *      tmp/fw7770.dis` = 0 hits (the only "5f7c" hits are instruction address
++ *      labels: 5f7c:, 15f7c:, 25f7c: ...), and the access scan over the contract
++ *      base (tmp/audyt-dma-fw-kontrakt-gtrack.txt) does not contain this
++ *      offset. The olmsg path does not poll TCM[ramsize-4] anyway (an earlier
++ *      return 0 in the bcm4360_olmsg_active() branch of
++ *      brcmf_pcie_download_fw_nvram -- not in brcmf_pcie_init_share_ram_info,
++ *      which is unreachable for olmsg).
++ *
++ *  (R3) GATE ON the published DMA address -- see bcm4360_ol77_dma_addr_ok().
++ *
++ * ZERO accesses to D11 (HARD RULE, CLAUDE.md p. 7). */
++#define BCM4360_OL77_SI_FLAG0		(BCM4360_T325_SI_LOCK_FLAG0)	/* +0x14 */
++#define BCM4360_OL77_SI_FLAG1		(BCM4360_T325_SI_LOCK_FLAG1)	/* +0x18 */
++#define BCM4360_OL77_SI_TURN		(BCM4360_T325_SI_LOCK_TURN)	/* +0x1C */
++/* fw 7.77: msgbuf = SI_PCI_MEM | (contract[+0x4] & ~SBTOPCIE0_MASK)
++ * (0x3a7c ldr r3,[r2,#4] -> 0x3a7e bic #0xFC000000 -> 0x3a82 orr #0x08000000;
++ * tmp/audyt-dma-fw-kontrakt-gtrack.txt lines 3a7c/3a8c). From the same word the
++ * fw takes the SB->PCIE window base (0x3a8c/0x3a90 and #0xFC000000): bits 31:26
++ * are masked, so the addressing window has 26 bits = 64 MiB -- HENCE the
++ * requirement that the WHOLE buffer fit in a single 64 MiB window (see
++ * bcm4360_ol77_dma_addr_ok).
++ * (Separately, at 0x3aa0-0x3aac the fw registers the region RANGE with mask
++ * 0x0FFFFFFF = 28 bits = 256 MB and granularity 0x800, index 7 -- that is a
++ * different number and mechanism than the addressing window; do not mix them.) */
++#define BCM4360_OL77_DMA_WIN_MASK	0x03FFFFFF	/* bity [25:0] w fw */
++#define BCM4360_OL77_DMA_WIN_SIZE	0x04000000	/* 64 MiB okna SB->PCIE */
++/* patch 0037 (L4-b): delay before the post-doorbell evidence. In test.344/345 the
++ * evidence (autopsy T314 + console dump T343) lived in the rxctl TIMEOUT branch
++ * -- after 5 s of waiting. The new path has no timeout, so the delay must be
++ * explicit: 20 x msleep(100 ms) = ~2 s (safe class: process msleep in a loop,
++ * like T276/T312; no hard blocking, no new address). */
++#define BCM4360_OL77_POST_DOORBELL_MS		2000
++#define BCM4360_OL77_POST_DOORBELL_STEP_MS	100
++
+ /* BCM4360 test.278: periodic console delta dump. */
+ #define BCM4360_T278_CHUNK_BYTES	128	/* per pr_emerg line */
+ #define BCM4360_T278_MAX_BYTES_PER_CALL	1024	/* printk safety cap */
+@@ -857,6 +931,10 @@
+ 	bool t309_hold_done;		/* T309 hold already ran (dedup) */
+ 	bool olmsg_liveness_checked;	/* gate poll already ran (first dcmd) */
+ 	bool olmsg_fw_ready;		/* fw announced readiness (BAR0+0x48 bit 8) */
++	/* patch 0037 (gap 4b): the 7.77 image has no dcmd/CDC type, so on this
++	 * path rx_ctlpkt does not wait for an answer and logs it ONCE per run
++	 * (without this latch the log would repeat on every dcmd). */
++	bool ol77_ctl_noresp_logged;	/* the "no dcmd type" log already went out */
+ #ifdef DEBUG
+ 	u32 console_interval;
+ 	bool console_active;
+@@ -1725,8 +1803,15 @@
+ 	pr_emerg("BCM4360 test.314: SB intstatus read (BAR0+0x20) now\n");
+ 	sb_intstatus = brcmf_pcie_read_reg32(devinfo,
+ 					     BCM4360_OLMSG_SB_INTSTATUS);
+-	pr_emerg("BCM4360 test.314: SB intstatus readback=0x%08x (bit8 0x100 set => doorbell latched at the fw intstatus)\n",
+-		 sb_intstatus);
++	/* patch 0037 (R5): verdict COMPUTED from the read value, not a fixed
++	 * text -- with intstatus=0x200 the previous version printed "bit8 0x100
++	 * set" although bit 8 was not set (interpretation trap described in
++	 * notes/ par. 2.1). */
++	pr_emerg("BCM4360 test.314: SB intstatus readback=0x%08x (bit8 0x100 %s)\n",
++		 sb_intstatus,
++		 (sb_intstatus & BCM4360_OLMSG_INT_D2H) ?
++			"SET => doorbell reached the fw intstatus" :
++			"= 0 => doorbell did NOT arrive (or the fw ISR already acked it W1C)");
+ 	pr_emerg("BCM4360 test.314: SB intmask read (BAR0+0x24) now\n");
+ 	sb_intmask = brcmf_pcie_read_reg32(devinfo, BCM4360_OLMSG_SB_INTMASK);
+ 	pr_emerg("BCM4360 test.314: SB intmask readback=0x%08x (0x300 pattern = fw-armed interrupts, kimptoc test.28; 0 = never armed)\n",
+@@ -5179,6 +5264,12 @@
+ }
+ 
+ 
++/* BCM4360 patch 0037 (gap 4b): the 7.77 path gate is needed ALSO
++ * in rx_ctlpkt below, and its definition lives further down (by the 0036/0037
++ * block) -- a forward declaration so the condition is ONE and cannot drift
++ * from the rest of the patch (no expression duplication). */
++static bool bcm4360_ol77_path(struct brcmf_pciedev_info *devinfo);
++
+ static int brcmf_pcie_rx_ctlpkt(struct device *dev, unsigned char *msg,
+ 				uint len)
+ {
+@@ -5189,6 +5280,87 @@
+ 	if (!bcm4360_olmsg_active(devinfo))
+ 		return 0;	/* msgbuf path does not use rxctl */
+ 
++	/* ==== BCM4360 patch 0037 (gap 4b): the 7.77 image has no dcmd/CDC type ====
++	 * Waiting 5 s (BCM4360_OLMSG_CTL_RESP_TIMEOUT_MS) assumes the fw will ANSWER
++	 * with a D2H message of the same seq. The 7.77 image will not: its
++	 * olmsg type space has NO dcmd/CDC type (map of 72 BCM_OL_* types --
++	 * notes/;
++	 * notes/), and the H2D dispatcher handles exclusively
++	 * those 72 types. Result: every dcmd ended with -ETIMEDOUT (-110) ->
++	 * "Dongle setup failed" and a T309 hold (test.345 log:308-441) -- bring-up
++	 * failed on something this fw has no way to do.
++	 * MINIMAL SOLUTION: on this path we do not wait at all and return 0 B
++	 * (no error), with ONE readable log line per run. The end state is
++	 * exactly what the previous timeout produced (pending=0, the response
++	 * buffer untouched), so the rest of the processing is identical; the
++	 * only difference is the missing -ETIMEDOUT.
++	 * Cost of this choice (accepted): the T314 autopsy block lives in the
++	 * timeout branch, so it will not run this pass -- calling it right after
++	 * the doorbell would measure an rd_ptr the fw has not had time to update,
++	 * i.e. give the false verdict "fw never touched the ring". The D2H/console
++	 * picture is covered anyway by T319/T277 (unchanged) and the T343 dump.
++	 * Apple pattern: the Apple host NEVER waits -- _wlc_ol_msg_send ends
++	 * after raising the doorbell, and the dongle state comes from the +0x5028
++	 * gate, which after 2000x1 ms only logs and carries on (no error branch:
++	 * notes/ par. 2.1, 2.2 item 2).
++	 * The msgbuf path (and images 0/1) is UNTOUCHED -- this block is gated by
++	 * bcm4360_ol77_path(). */
++	if (bcm4360_ol77_path(devinfo)) {
++		u32 t37_i;
++
++		devinfo->olmsg_resp_pending = false;
++		if (!devinfo->ol77_ctl_noresp_logged) {
++			devinfo->ol77_ctl_noresp_logged = true;
++			pr_emerg("BCM4360 patch 0037 (gap 4b): 7.77 image -- WAITING FOR THE ctl ANSWER SKIPPED (fw 7.77 has no dcmd/CDC type in its olmsg space: notes/; Apple pattern = the +0x5028 gate with no error branch, notes/ par. 2.1). Returning 0 B without an error -> bring-up proceeds (state as after a timeout, but without -ETIMEDOUT); later calls skip this log -- one log per run\n");
++
++			/* ==== patch 0037: POST-DOORBELL EVIDENCE on the new path ====
++			 * The T314 autopsy and the T343 console dump lived UNTIL NOW only in
++			 * the rxctl timeout branch (pcie.c:5324-5326 and 1917-1919) and in
++			 * the T309 hold -- without them this fire would have NOTHING to
++			 * confirm on the fw side that the H2D message arrived (these are
++			 * exactly the measurements: ring H2D rd_ptr vs w_ptr, D2H wr_ptr,
++			 * SB intstatus/intmask, fw console pointer and text -- they gave
++			 * test.344/345 the "fw consumed our message" proof).
++			 * So, after skipping the wait, we give THE SAME delay explicitly
++			 * (BCM4360_OL77_POST_DOORBELL_MS, msleep loop -- process, not
++			 * atomic) and call EXACTLY the same, fire-tested functions, under
++			 * THE SAME parameter gates:
++			 *   bcm4360_test314_olmsg_ring_autopsy -> autopsy (SB 0x20/0x24,
++			 *     ring headers from host RAM, D2H, console)
++			 *   bcm4360_test343_console_at_autopsy -> explicit console dump
++			 * The autopsy itself also fires a console dump (pcie.c:1917-1919),
++			 * so the log will show the console TWICE: once with the historical
++			 * "t+5s (autopsja T314, po timeoucie rxctl)" label from inside the
++			 * autopsy, once with the patch 0037 label below -- same content,
++			 * intentionally (the explicit dump must not depend on future
++			 * changes in the autopsy).
++			 * Zero new addresses, zero new MMIO classes (the same windowed
++			 * reads as in test.345), zero D11.
++			 * The delay runs ONLY when one of these two evidence functions
++			 * is enabled (both parameters 0 => the 7.77 path stays a clean,
++			 * fast skip of the wait). */
++			if (bcm4360_test314_olmsg_ring_autopsy ||
++			    bcm4360_test343_console_at_autopsy) {
++				pr_emerg("BCM4360 patch 0037 (L4-b): waiting %u ms (%u x %u ms, process msleep) so the fw can service the doorbell; then autopsy T314 + console dump T343 -- the same evidence pair as in test.344/345, just without the ctl timeout\n",
++					 BCM4360_OL77_POST_DOORBELL_MS,
++					 BCM4360_OL77_POST_DOORBELL_MS /
++						BCM4360_OL77_POST_DOORBELL_STEP_MS,
++					 BCM4360_OL77_POST_DOORBELL_STEP_MS);
++				for (t37_i = 0;
++				     t37_i < BCM4360_OL77_POST_DOORBELL_MS /
++					     BCM4360_OL77_POST_DOORBELL_STEP_MS;
++				     t37_i++)
++					msleep(BCM4360_OL77_POST_DOORBELL_STEP_MS);
++
++				if (bcm4360_test314_olmsg_ring_autopsy)
++					bcm4360_t314_olmsg_ring_autopsy(devinfo);
++				if (bcm4360_test343_console_at_autopsy)
++					bcm4360_t343_console_dump(devinfo,
++						"t+2s (patch 0037: after the doorbell, without a ctl timeout)");
++			}
++		}
++		return 0;
++	}
++
+ 	timeleft = wait_event_interruptible_timeout(
+ 		devinfo->olmsg_resp_wait, !devinfo->olmsg_resp_pending,
+ 		msecs_to_jiffies(BCM4360_OLMSG_CTL_RESP_TIMEOUT_MS));
+@@ -5429,10 +5601,52 @@
+  * w bit jak patch 0035). */
+ static bool bcm4360_ol77_path(struct brcmf_pciedev_info *devinfo)
+ {
+-	return devinfo->ci->chip == BRCM_CC_4360_CHIP_ID &&
++	/* patch 0037: guard na devinfo->ci (tak jak w bcm4360_olmsg_active,
++	 * pcie.c:1609) -- ta funkcja ma juz 7 miejsc wolania, m.in. cztery nowe
++	 * z 0037, a wolanie jej przed przypisaniem ci = oops. Zero zmian
++	 * zachowania: dzisiaj kazde miejsce wolania jest po ustawieniu ci. */
++	return devinfo->ci && devinfo->ci->chip == BRCM_CC_4360_CHIP_ID &&
+ 	       (bcm4360_test321_fw_apple == 2 || bcm4360_test321_fw_apple == 3);
+ }
+ 
++/* Gate for the published DMA address (patch 0037, R3 from notes/
++ * par. 4). The condition is 1:1 the same as in the userspace tool
++ * tmp/minihost/minihost.c (adres_ok_dla_fw, lines 517-521) -- one source
++ * of truth for both hosts.
++ *
++ * Where the condition comes from (evidence in the 7.77 binary, not out of
++ * thin air): the fw reads from the contract ONLY the LOW dword of the msgbuf
++ * address -- 0x3a7c `ldr r3,[r2,#4]` (second read of the same field: 0x3a8c).
++ * The +0x8 field has NOT A SINGLE access in the image: the offset listing in
++ * tmp/audyt-dma-fw-kontrakt-gtrack.txt does not contain +0x8, and
++ * notes/ par. 3.2 item 2 (exhaustive scan: 57 contract-pointer pulls,
++ * 68 `ldr rX,[pc,...]` gates, 15 accesses through the base) does not have it
++ * either. The fw builds the SB->PCIE window from this word:
++ *     msgbuf = SI_PCI_MEM | (low & ~SBTOPCIE0_MASK)
++ *  0x3a7e bic r3,r3,#0xFC000000  +  0x3a82 orr r3,r3,#0x08000000
++ * and takes the window base from the same word: 0x3a8c/0x3a90 `and #0xFC000000`
++ * -> sbtopcie0 (bits 31:26 masked, i.e. a 26-bit window = 64 MiB).
++ * Consequence: (1) the address must fit in 32 bits, (2) the WHOLE buffer
++ * (64 KiB) must lie in ONE 64 MiB window counted from bit 25 -- otherwise
++ * the fw programs a meaningless window and stays SILENT (the "fw alive and
++ * silent" class, the same one that cost us many fires), and diagnosing such
++ * a state is more expensive than refusing publication.
++ * WHAT THIS GATE DOES NOT DO (deliberately -- the condition is 1:1 as in
++ * minihost): the & 0x03FFFFFF mask TRUNCATES bits 31:26, so addresses
++ * >= 64 MiB (e.g. 0x25150000 from fire logs) PASS it. The audit
++ * (notes/ par. 1.3) considers them arithmetically consistent with the fw,
++ * but they were NEVER tested through an olmsg attach; only buffers
++ * CROSSING a 64 MiB boundary are rejected. When the gate rejects an address,
++ * the +0x4/+0x8 fields keep the PREVIOUS content (we do not zero them --
++ * this is a publication refusal, not state fabrication), and the pr_err
++ * says plainly which address failed and why.
++ * Measurement: 0x01280000 (18x across fires, incl. test.344/345 -- the fw
++ * consumed the message) passes the gate with headroom. */
++static bool bcm4360_ol77_dma_addr_ok(dma_addr_t dma)
++{
++	return (u64)dma < 0x100000000ULL &&
++	       (((u64)dma & BCM4360_OL77_DMA_WIN_MASK) +
++		BCM4360_T276_OLMSG_BUF_SIZE) <= BCM4360_OL77_DMA_WIN_SIZE;
++}
++
+ /* Zeroing the TCM range [from, to) (offsets RELATIVE to rambase, the same
+  * contract as brcmf_pcie_read_ram32/write_ram32; the image copy uses absolute
+  * offsets, because brcmf_pcie_copy_mem_to_dev does not add rambase -- for 4360
+@@ -5708,8 +5922,25 @@
+ 
+ 	/* reset last 4 bytes of RAM address. to be used for shared
+ 	 * area. This identifies when FW is running
+-	 */
+-	brcmf_pcie_write_ram32(devinfo, devinfo->ci->ramsize - 4, 0);
++	 *
++	 * BCM4360 patch 0037 (R2): on the 7.77 path we SKIP this write.
++	 * Rationale: it comes from the msgbuf path, where the fw publishes the
++	 * pointer to its shared struct under TCM[ramsize-4] -- for the 7.77 image
++	 * this address is contract+0x5F7C, i.e. the last dword of the host struct,
++	 * which the Apple host does NOT write (full list of 12 writes in
++	 * notes/kontrakt-audyt-pokrycia.md par. 1). Nobody reads this field: the
++	 * olmsg path does not poll TCM[ramsize-4] -- in THE SAME function
++	 * (brcmf_pcie_download_fw_nvram) the bcm4360_olmsg_active() branch ends
++	 * with an earlier `return 0`, before the sharedram_addr poll and before
++	 * calling brcmf_pcie_init_share_ram_info (both unreachable for olmsg), and
++	 * the read into the sharedram_addr_written variable below is dead on this
++	 * path. Negative evidence from the image: offset 0x5F7C does not occur in
++	 * tmp/fw7770.dis EVEN ONCE (0 hits), nor in the access scan over the
++	 * contract base (tmp/audyt-dma-fw-kontrakt-gtrack.txt). Additionally: if
++	 * the fw required a zero there, the Apple host (which also does not clear
++	 * TCM at startup) would not work.
++	 * The msgbuf path (images 0/1) is unchanged. */
++	if (!bcm4360_ol77_path(devinfo))
++		brcmf_pcie_write_ram32(devinfo, devinfo->ci->ramsize - 4, 0);
+ 
+ 	/* BCM4360 test.320 (M2): read the chip's own SROM/CIS shadow and
+ 	 * build the replacement vars. Runs PRE-release (ARM halted) --
+@@ -6462,6 +6693,26 @@
+ 			if (t336_ok) {
+ 				u32 t336_rb[8];
+ 				u32 t336_t276_magic;
++				bool t336_msgbuf_ok;
++
++				/* BCM4360 patch 0037 (R3): bramka adresu DMA przed
++				 * publikacja pol msgbuf (+0x4/+0x8). Uzasadnienie
++				 * i dowody: bcm4360_ol77_dma_addr_ok() powyzej.
++				 * Bramka dziala TYLKO na sciezce 7.77 -- poza nia
++				 * (obrazy 0/1) zapis jest bezwarunkowy, jak przed
++				 * patchem 0037. Gdy adres odpada, NIE publikujemy
++				 * tych dwoch pol (reszta kontraktu idzie jak dotad:
++				 * markery, heartbeat i flaga TRAP sa potrzebne
++				 * bramce T337 i nie zaleza od adresu), a odczyt
++				 * zwrotny nizej pokaze, co zostalo w TCM. */
++				t336_msgbuf_ok = !bcm4360_ol77_path(devinfo) ||
++						 bcm4360_ol77_dma_addr_ok(t336_dma);
++				if (!t336_msgbuf_ok)
++					pr_err("BCM4360 patch 0037 (R3): adres DMA msgbuf 0x%llx ODPADA na bramce (fw czyta tylko dolny dword i buduje z niego okno SB->PCIE: wymagane <4GiB ORAZ (adres & 0x%08x) + 0x%x <= 0x%x) -- pol +0x4/+0x8 NIE publikuje; reszta kontraktu bez zmian\n",
++					       (unsigned long long)t336_dma,
++					       BCM4360_OL77_DMA_WIN_MASK,
++					       BCM4360_T276_OLMSG_BUF_SIZE,
++					       BCM4360_OL77_DMA_WIN_SIZE);
+ 
+ 				pr_emerg("BCM4360 test.336: apple host shared base=0x%08x (ramsize-0x5F80) msgbuf=0x%llx sz=0x10000 markers A5A5A5A5@+0 / 5A5A5A5A@+0x5F5C\n",
+ 					 t336_base,
+@@ -6477,12 +6728,16 @@
+ 				brcmf_pcie_write_ram32(devinfo,
+ 					t336_base + BCM4360_T336_SI_MARKER_BEGIN,
+ 					BCM4360_T336_MARKER_BEGIN_VAL);
+-				brcmf_pcie_write_ram32(devinfo,
+-					t336_base + BCM4360_T336_SI_MSGBUFADDR_LO,
+-					lower_32_bits(t336_dma));
+-				brcmf_pcie_write_ram32(devinfo,
+-					t336_base + BCM4360_T336_SI_MSGBUFADDR_HI,
+-					upper_32_bits(t336_dma));
++				/* patch 0037 (R3): pola msgbuf publikujemy tylko
++				 * gdy adres przechodzi bramke (patrz wyzej). */
++				if (t336_msgbuf_ok) {
++					brcmf_pcie_write_ram32(devinfo,
++						t336_base + BCM4360_T336_SI_MSGBUFADDR_LO,
++						lower_32_bits(t336_dma));
++					brcmf_pcie_write_ram32(devinfo,
++						t336_base + BCM4360_T336_SI_MSGBUFADDR_HI,
++						upper_32_bits(t336_dma));
++				}
+ 				brcmf_pcie_write_ram32(devinfo,
+ 					t336_base + BCM4360_T336_SI_MSGBUF_SZ,
+ 					BCM4360_T276_OLMSG_BUF_SIZE);
+@@ -6704,6 +6959,77 @@
+ 							BCM4360_OL77_CONTRACT_SIZE);
+ 			}
+ 		}
++
++		/* ==== BCM4360 patch 0037 (L2-a, R1 z audytu): POLA SEMAFORA okna
++		 * TCM -- flag[0] (+0x14) i flag[1] (+0x18) := 0, DOKLADNIE jak host
++		 * Apple (0x73a3d: movl %r15d,-0x10(%r12) i 0x73a42: movl %r15d,
++		 * -0xc(%r12), gdzie r12 = baza+0x24, czyli baza+0x14 / baza+0x18;
++		 * tmp/re-kext-verify/full.dis:125773-125790).
++		 *
++		 * Dlaczego to nie kosmetyka: to semafor Petersona na okno TCM
++		 * (notes/). Fw w tcm_sem_enter (0x13022-0x13058)
++		 * ustawia flag[1]=1 i turn=0, po czym czeka w petli BEZ WYJSCIA na
++		 * flag[0] != 1 (po 3000 obrotach jeden printf i dalszy spin).
++		 * Zastane flag[0]=1 -- a TCM NIE czysci sie rebootem (CLAUDE.md p. 5),
++		 * wiec pole przenosi wartosc miedzy biegami -- to cicha, wieczna
++		 * petla fw. Fw czyta +0x14 w calym obrazie 7.77 DOKLADNIE RAZ
++		 * (0x1304e; tmp/audyt-dma-fw-kontrakt-gtrack.txt:116) i NIGDY go nie
++		 * zapisuje, wiec nie ma komu tego sprzatnac poza hostem.
++		 *
++		 * turn (+0x1C) zostawiamy NIETKNIETY: nie pisze go ani Apple (jego
++		 * dwa movl dotycza tylko +0x14/+0x18), ani wl.ko, a fw sam zeruje go
++		 * w tcm_sem_enter; przy flag[0]=0 warunek petli i tak nie zachodzi.
++		 * Odczyt turn w logu ponizej jest tylko kontrola, ze nasz patch go
++		 * nie rusza.
++		 *
++		 * Bramki: tylko sciezka 7.77 + ramsize > 0x5F80 (bez tego drugiego
++		 * baza kontraktu liczylaby sie ujemnie). Zapis idzie na SAMYM KONCU
++		 * okna pre-release (po bloku T276, po T325 i po vars z 0036 --
++		 * zaden z nich nie dotyka +0x14/+0x18 przy tej bazie), tuz przed
++		 * brcmf_chip_set_active. ZERO dostepow do D11. */
++		if (bcm4360_ol77_path(devinfo) &&
++		    devinfo->ci->ramsize > BCM4360_OL77_CONTRACT_SIZE) {
++			u32 t336o_base = devinfo->ci->ramsize -
++					BCM4360_OL77_CONTRACT_SIZE;
++			u32 t336o_f0_pre;
++			u32 t336o_f1_pre;
++			u32 t336o_turn;
++
++			/* Kontrola H-T1 (notes/ par. 1.3
++			 * poz. L2-e): co bylo w tych polach PRZED naszym zapisem.
++			 * Zmierzone wczesniej smieci (np. 0x5dc8ca30) to cudza
++			 * tresc w oknie, ktorego nikt nie zeruje -- ten odczyt
++			 * pokazuje to wprost w logu fire'a. */
++			t336o_f0_pre = brcmf_pcie_read_ram32(devinfo,
++					t336o_base + BCM4360_OL77_SI_FLAG0);
++			t336o_f1_pre = brcmf_pcie_read_ram32(devinfo,
++					t336o_base + BCM4360_OL77_SI_FLAG1);
++			t336o_turn = brcmf_pcie_read_ram32(devinfo,
++					t336o_base + BCM4360_OL77_SI_TURN);
++			pr_emerg("BCM4360 patch 0037 (L2-a): semafor TCM przed zapisem: flag0@+0x%x=0x%08x flag1@+0x%x=0x%08x turn@+0x%x=0x%08x (turn NIETKNIETY -- nie pisze go ani Apple, ani wl.ko)\n",
++				 BCM4360_OL77_SI_FLAG0, t336o_f0_pre,
++				 BCM4360_OL77_SI_FLAG1, t336o_f1_pre,
++				 BCM4360_OL77_SI_TURN, t336o_turn);
++
++			/* Wlasciwy zapis: 1:1 jak Apple (0x73a3d / 0x73a42).
++			 * Wylacznie ZERA -- w te pola nigdy nie wolno wpisac 1
++			 * (flag0=1 przy turn=0 zakleszcza fw, notes/flag-turn-
++			 * semafor.md). */
++			brcmf_pcie_write_ram32(devinfo,
++					t336o_base + BCM4360_OL77_SI_FLAG0, 0);
++			brcmf_pcie_write_ram32(devinfo,
++					t336o_base + BCM4360_OL77_SI_FLAG1, 0);
++
++			/* Odczyt zwrotny: dowod, ze zapis DOTARL (a nie tylko
++			 * zostal wydany) + turn bez zmian. */
++			pr_emerg("BCM4360 patch 0037 (L2-a): semafor TCM po zapisie: flag0=0x%08x flag1=0x%08x turn=0x%08x (exp 0x0 0x0 i turn bez zmian; zapis jak Apple 0x73a3d/0x73a42 -- fw czyta +0x14 raz, w tcm_sem_enter 0x1304e)\n",
++				 brcmf_pcie_read_ram32(devinfo,
++						t336o_base + BCM4360_OL77_SI_FLAG0),
++				 brcmf_pcie_read_ram32(devinfo,
++						t336o_base + BCM4360_OL77_SI_FLAG1),
++				 brcmf_pcie_read_ram32(devinfo,
++						t336o_base + BCM4360_OL77_SI_TURN));
++		}
+ 	}
+ 
+ 	sharedram_addr_written = brcmf_pcie_read_ram32(devinfo,

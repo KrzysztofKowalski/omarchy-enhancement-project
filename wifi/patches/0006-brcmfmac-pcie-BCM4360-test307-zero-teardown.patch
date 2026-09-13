@@ -1,0 +1,146 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 6/6] brcmfmac: pcie: BCM4360 test.307 zero-teardown hold (T307)
+
+BCM4360 experiment #2 variant A (zero-teardown). Experiment #1 (fire #2)
+showed that after the fw-init timeout the fail path goes through
+device_release_driver() and the teardown MMIO against a live MBM=0x300
+mask wedges the host (silent, in the window (t+90s, ~t+96s], no fail-path
+line ever printed). Variant A eliminates the teardown wedge entirely:
+instead of -ENODEV -> fw_crashed -> device_release_driver, the probe holds
+the device (probe already returned 0 from brcmf_pcie_probe, so the device
+stays bound), masks all D2H (PCIMailBoxMask BAR0+0x4C := 0, the same
+mechanism as brcmf_pcie_intr_disable and test.305), and polls PCIMailBoxInt
+(BAR0+0x48) every 1 s for 60 s. The int register latches status
+independently of the mask (the mask only gates the IRQ line), so this is a
+passive, wedge-free observation of whether the fw signals D2H (bit 8,
+FN0_0) at all. No wiphy, no IRQ armed, no timers after the hold -- nothing
+touches the device; reboot clears the state (rmmod would teardown).
+
+New module param bcm4360_test307_zero_teardown (default 0), gated on chip
+== BRCM_CC_4360_CHIP_ID at the call site, so every other chip's behaviour
+is unchanged. Hook placement: the brcmf_pcie_download_fw_nvram() call site
+in brcmf_pcie_setup() -- the ONLY fail point corresponding to the fw-init
+timeout (the 5 s wait loop inside download_fw_nvram returns -ENODEV); at
+this point no IRQ is requested yet (brcmf_pcie_request_irq is later in
+setup), no wiphy (brcmf_attach later), no fwcon timer. All other fail
+points keep the normal goto fail.
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 87 insertions(+), 1 deletion(-)
+diff --git a/brcmfmac/pcie.c b/brcmfmac/pcie.c
+index c4a4faf..ce6e1e9 100644
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -142,6 +142,10 @@ static int bcm4360_test306_cfg_dump;
+ module_param(bcm4360_test306_cfg_dump, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test306_cfg_dump, "BCM4360 test.306: read-only PCI config dump 0x40..0xFF at 3 stages (pre-set_active/post-set_active/post-T276-poll), highlighting 0x94/0xB4/0xB8 vendor area. (1=enable, 0=off)");
+ 
++static int bcm4360_test307_zero_teardown;
++module_param(bcm4360_test307_zero_teardown, int, 0644);
++MODULE_PARM_DESC(bcm4360_test307_zero_teardown, "BCM4360 test.307: zero-teardown fail path. On fw-init timeout (download_fw_nvram returns -ENODEV): MAILBOXMASK (BAR0+0x4C):=0 so no IRQ can ever fire, then poll BAR0+0x48 (PCIMailBoxInt) every 1 s for 60 s to observe whether fw signals D2H (bit 8) at all. Probe returns success, device stays bound, NO teardown (no device_release_driver -> no wedge window, experiment #1). Reboot clears state -- do NOT rmmod. (1=enable, 0=off)");
++
+ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4360_CHIP_ID, 0xFFFFFFFF, 4360),
+@@ -848,6 +852,71 @@ static void bcm4360_t306_cfg_dump(struct brcmf_pciedev_info *devinfo,
+ 			 s_cfgB8[0], s_cfgB8[1], s_cfgB8[2]);
+ }
+ 
++/* BCM4360 test.307: zero-teardown hold -- replacement for the fail-path
++ * teardown. Experiment #1 (fire #2) showed that after the fw-init timeout
++ * (test.276 wrote the test magic 0xA5A5A5A5 into the REAL shared_info, so
++ * the fw never writes the sharedram pointer and the 5 s wait loop returns
++ * -ENODEV) the code goes through device_release_driver(), and the teardown
++ * MMIO against a live MBM=0x300 mask wedges the host. Instead: write
++ * PCIMailBoxMask (BAR0+0x4C) := 0 so no IRQ can ever fire, then poll
++ * PCIMailBoxInt (BAR0+0x48) every 1 s for 60 s -- the int register latches
++ * status independently of the mask (the mask only gates the IRQ line), so
++ * this is a passive, wedge-free observation of whether the fw signals D2H
++ * (bit 8, FN0_0) at all. The device stays bound to the driver (probe
++ * already returned 0), no wiphy, no IRQ armed, no timers -- nothing touches
++ * the device afterwards; reboot clears the state (rmmod would teardown). */
++#define BCM4360_T307_POLL_SECONDS	60
++static void bcm4360_t307_zero_teardown_hold(struct brcmf_pciedev_info *devinfo,
++					    int fail_ret)
++{
++	u32 prev = 0, val = 0;
++	u32 max_val = 0, last = 0;
++	u32 mbm;
++	bool bit8_seen = false, nonzero_seen = false;
++	int first_bit8_t = -1;
++	int changed_reads = 0;
++	int i;
++
++	pr_emerg("BCM4360 test.307: ENTER zero-teardown hold (download_fw_nvram ret=%d; device stays bound, no teardown, no wiphy)\n",
++		 fail_ret);
++	/* Same MBM mechanism as test.305/intr_disable (BAR0+0x4C). select_core
++	 * is a no-op on this chip (PCIE2 regs sit at BAR0 offset 0, window
++	 * unchanged -- experiment #1), so a plain masked write suffices. */
++	brcmf_pcie_write_reg32(devinfo, devinfo->reginfo->mailboxmask, 0);
++	mbm = brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->mailboxmask);
++	pr_emerg("BCM4360 test.307: MAILBOXMASK:=0 readback=0x%08x (expect 0x0 -- bit8 FN0_0 masked, no IRQ can fire)\n",
++		 mbm);
++
++	for (i = 1; i <= BCM4360_T307_POLL_SECONDS; i++) {
++		u32 changed;
++		u32 bit8;
++
++		val = brcmf_pcie_read_reg32(devinfo,
++					    BRCMF_PCIE_PCIE2REG_MAILBOXINT);
++		changed = (i == 1) || (val != prev);
++		if (changed)
++			changed_reads++;
++		if (val > max_val)
++			max_val = val;
++		last = val;
++		bit8 = !!(val & BRCMF_PCIE_MB_INT_FN0_0);
++		if (bit8 && !bit8_seen) {
++			bit8_seen = true;
++			first_bit8_t = i;
++		}
++		if (val && !nonzero_seen)
++			nonzero_seen = true;
++		pr_emerg("BCM4360 test.307: t=%ds mbxint=0x%08x bit8=%d changed=%d sec=%u\n",
++			 i, val, bit8, changed, (u32)jiffies / HZ);
++		prev = val;
++		msleep(1000);
++	}
++	pr_emerg("BCM4360 test.307: SUMMARY reads=%d changed_reads=%d bit8_seen=%d first_bit8_t=%ds nonzero_seen=%d max=0x%08x last=0x%08x\n",
++		 BCM4360_T307_POLL_SECONDS, changed_reads,
++		 bit8_seen ? 1 : 0, first_bit8_t, nonzero_seen ? 1 : 0,
++		 max_val, last);
++}
++
+ 
+ static void
+ brcmf_pcie_copy_dev_tomem(struct brcmf_pciedev_info *devinfo, u32 mem_offset,
+@@ -2758,8 +2827,25 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
+ 	brcmf_pcie_adjust_ramsize(devinfo, (u8 *)fw->data, fw->size);
+ 
+ 	ret = brcmf_pcie_download_fw_nvram(devinfo, fw, nvram, nvram_len);
+-	if (ret)
++	if (ret) {
++		if (bcm4360_test307_zero_teardown &&
++		    devinfo->ci->chip == BRCM_CC_4360_CHIP_ID) {
++			/* T307: zero-teardown. The fw-init timeout (test.276
++			 * poison magic in the real shared_info -> sharedram
++			 * pointer never written -> -ENODEV after 5 s) is
++			 * exactly the fail path whose teardown
++			 * (device_release_driver) wedged the host in
++			 * experiment #1. Hold the device instead: mask all
++			 * D2H, poll BAR0+0x48 for 60 s, then return WITHOUT
++			 * teardown -- the probe already returned 0, so the
++			 * device stays bound to the driver; no wiphy, no IRQ
++			 * armed, no timers -- nothing touches it afterwards.
++			 * Reboot clears the state (rmmod would teardown). */
++			bcm4360_t307_zero_teardown_hold(devinfo, ret);
++			return;
++		}
+ 		goto fail;
++	}
+ 
+ 	devinfo->state = BRCMFMAC_PCIE_STATE_UP;
+ 
+--
+2.39.2

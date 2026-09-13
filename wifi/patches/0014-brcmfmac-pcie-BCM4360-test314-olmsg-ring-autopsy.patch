@@ -1,0 +1,376 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 14/14] brcmfmac: pcie: BCM4360 test.314 olmsg ring autopsy
+
+Fire #7 (0013 doorbell-anyway) went CLEAN -- the first H2D doorbell
+(RMW BAR0+0x48 |= 0x1) did not kill the machine (RMW in 7 us, zero AER) -- but
+the fw did not answer (bit 8 D2H never came up, rxctl timeout 5000 ms, T309
+hold). The format audit (notes/olmsg-h2d-format-audit.md) showed that the
+format, pointers and doorbell match the wl.ko reference byte for byte, and the
+faulty part is the FIRST MESSAGE TYPE: 0x4 = BCM_OL_LOW_RSSI_NOTIFICATION
+(a D2H-direction type!), while the olmsg channel carries only BCM_OL_* types
+(64-type table @0x58d28 in the fw) -- zero dcmd/CDC.
+
+Patch 0014 (parameter bcm4360_test314_olmsg_ring_autopsy, default 0)
+closes the three evidence gaps of fire #7 (experiment-6-fire7-doorbell-anyway.md
+sec.3.2/sec.5 + olmsg-h2d-format-audit.md A1/A2/B5) in a single fire:
+
+a) MAILBOXINT (BAR0+0x48) READBACK IMMEDIATELY AFTER the doorbell RMW |=0x1
+   (in bcm4360_olmsg_write, before the wait) -- settles hypotheses sec.3.1
+   (a)/(b)/(c): bit 0x1 set => the write latched (a later 0 = someone
+   consumed it); 0 => the posted write was lost (RC1 variant) or HW clears
+   it itself (one-shot doorbell). One windowed read of the same class as
+   the T276 poll / T312 gate (proven safe on the live device in #6/#7).
+
+b) SB-side PCIe2 intstatus/intmask: BAR0+0x20 and BAR0+0x24 (struct
+   sbpcieregs in pcie_core.h; PCIE2 sits at BAR0@0 on this chip).
+   Read BEFORE the doorbell (baseline in brcmf_pcie_tx_ctlpkt) and AFTER the
+   rxctl timeout (in the autopsy) -- whether bit 8 (PCIE_INT_MB_FN0_0,
+   pcie_core.h:180) reached the fw-side interrupt status. Stalling reads:
+   fire ONLY at CTO 10-100 ms (config-space-research sec.6 / RC1 audit).
+
+c) olmsg ring headers from HOST RAM (pure CPU, zero MMIO -- the DMA buffer
+   is ours, coherent): H2D rd_ptr (+0x08, written by the fw after consuming
+   -- fw.dis:2df6-2e0a) vs our w_ptr; rd_ptr==w_ptr => the fw consumed the
+   message via DMA (the doorbell->fw-ISR->dispatch chain is dead);
+   rd_ptr==0 => the fw never touched the ring. Plus the D2H wr_ptr (+0x1C,
+   fw.dis:2f08), the raw dump of the ring headers 0x00..0x1C, the first H2D
+   message header and the first 64 B of the D2H area (audit A2).
+
+d) Windowed TCM reads: the fw console after the doorbell (test.277 mechanism
+   -- struct pointer from si[+0x010], wr_idx at struct+0x08; the TCM/BAR1
+   class survived fires #6/#7). wr_idx==0x27d (637) => the fw is stuck at the
+   same WFI spot; >0x27d => the console moved (audit A3: look for
+   "pciedngl_isr called" / "Offload Message:" in the delta -- the delta is
+   T278's job, here only two windowed reads, no loop).
+
+e) SEMANTIC CHANGE of the H2D message (olmsg-h2d-format-audit.md H2 + B5):
+   with test314=1 the first (and only) message sent is BCM_OL_ARP_DISABLE
+   {type=0x00000007, seq=0, len=0} -- 12 B total, the wl.ko staging pattern
+   wl.dis:7ff90-7ff9e -- instead of type 0x4 with the BCDC cmd 262. We do not
+   expect a D2H answer (these types generate none in wl.ko): the pending
+   state is armed as in 0008 and the 5 s rxctl timeout runs unchanged -- the
+   observation targets are the autopsy + the fw console, not a protocol
+   answer. Later dcmds (seq>0) keep the 0008 semantics.
+
+Safety (mandated by wedges #4/#5): all new MMIO reads are single windowed
+reads (zero loops), each bracketed by pr_emerg before/after (test.310/311
+pattern); item (c) reads from host RAM -- zero MMIO; the T309 zero-teardown
+is untouched (the autopsy runs BEFORE the fail path, nothing is added to the
+teardown). test314=0 (default) => zero code and behavior difference (the
+test310 print shows the same type/len values as in 0008).
+
+Requires: test308=1 + test276=1 (ring) + test313=1 (doorbell after the
+timeout gate); fire only after setpci ASPM-off + CTO 10-100 ms on the live
+device.
+
+~230 lines, olmsg branch only -- zero behaviour change for every other
+chip and for the msgbuf path.
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 224 insertions(+), 3 deletions(-)
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -221,6 +221,37 @@
+ /* internal ctl response buffer: max BCDC dcmd payload + 16 B dcmd header;
+  * multi-fragment D2H responses (same seq) are appended up to this size. */
+ #define BCM4360_OLMSG_CTL_RESP_SIZE	(BRCMF_DCMD_MAXLEN + 16)
++/* test.314: SB-side PCIe2 core registers, seen from the host at BAR0+offset
++ * (PCIE2 core regs sit at BAR0@0 on this chip -- no select_core needed).
++ * Offsets from bcmdhd include/pcie_core.h, struct sbpcieregs (pcie_core.h:
++ * 92-93): intstatus @0x20, intmask @0x24. The host H2D doorbell
++ * (BAR0+0x48 |= 0x1 == bit PCIE_MB_TOSB_FN0_0, pcie_core.h:191) latches
++ * bit 8 (PCIE_INT_MB_FN0_0, pcie_core.h:180) in the fw-side intstatus --
++ * the bit pciedngl_isr tests (fw.dis:1cae). Reading these is a stalling
++ * read: fire ONLY with CTO 10-100 ms (config-space-research sec.6 /
++ * RC1 audit). */
++#define BCM4360_OLMSG_SB_INTSTATUS	0x20	/* sbpcieregs.intstatus */
++#define BCM4360_OLMSG_SB_INTMASK	0x24	/* sbpcieregs.intmask */
++/* test.314: olmsg ring header fields inside the 64 KB coherent DMA buffer
++ * (wl.ko bcm_olmsg_create wl.dis:2e70-2e8f; writer per audit table
++ * notes/olmsg-h2d-format-audit.md sec.1.3): H2D rd_ptr (+0x08) is written
++ * by the FW after DMA-consuming a message (fw fn @0x2df2), H2D wr_ptr
++ * (+0x0C) by the host, D2H wr_ptr (+0x1C) by the fw (fw.dis:2f08). All
++ * reads of these come from HOST RAM (CPU-only, zero MMIO). */
++#define BCM4360_OLMSG_H2D_RD_PTR	0x08
++#define BCM4360_OLMSG_H2D_WR_PTR	0x0C
++#define BCM4360_OLMSG_D2H_WR_PTR	0x1C
++/* test.314: harmless first H2D message -- BCM_OL_ARP_DISABLE, entry 0x07 of
++ * the fw type table @0x58d28 (64 BCM_OL_* entries, olmsg-h2d-format-audit
++ * sec.1.6); wl.ko staging pattern wl.dis:7ff90-7ff9e = {type=0x7, seq=0,
++ * len=0}, total 0xC. The 0008 type 0x4 is BCM_OL_LOW_RSSI_NOTIFICATION --
++ * a D2H-direction event type -- and the olmsg channel carries only BCM_OL_*
++ * types, never dcmd/CDC (audit H2). */
++#define BCM4360_OLMSG_TYPE_ARP_DISABLE	0x00000007
++/* test.314: wr_idx offset inside the fw console struct (test.277 decode:
++ * buf_addr, size, wr_idx, rd_addr at the si[+0x010]-published pointer;
++ * fires #6/#7 saw wr_idx=0x27d=637 = the frozen WFI state). */
++#define BCM4360_T277_CONSOLE_WR_IDX	0x08
+ 
+ static int bcm4360_test308_olmsg_cdc;
+ module_param(bcm4360_test308_olmsg_cdc, int, 0644);
+@@ -246,6 +277,10 @@
+ module_param(bcm4360_test313_doorbell_anyway, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test313_doorbell_anyway, "BCM4360 test.313: doorbell ANYWAY on liveness-gate timeout (fire #6 showed the DEADLOCK: the fw publishes its console (si[+0x010]) after wake but NEVER sets BAR0+0x48 bit 8 because it waits for OUR first H2D doorbell -- the gate waits for fw, fw waits for host; statyka wl.ko says the host moves FIRST: the fw_init poll is best-effort ~2 s and the doorbell follows regardless). With test313=1, a test.312 gate TIMEOUT no longer takes the T309-hold/-ETIMEDOUT path: it prints 'gate timeout but doorbell ANYWAY (wl.ko pattern; protected by ASPM-off + CTO 10-100ms)' and CONTINUES the normal doorbell path (RMW BAR0+0x48 |= 0x1); olmsg_fw_ready stays 0 but test313 overrides the gate latch for every later dcmd too. Bracketing: pr_emerg immediately before the doorbell RMW (last line if the doorbell kills the machine) + pr_emerg right after it (waiting D2H bit8) + pr_emerg on the rxctl wait timeout. Risk accepted ONLY with ASPM off + CTO 10-100 ms programmed by setpci on root port 00:1c.2 and endpoint 03:00.0 BEFORE the fire (a stalling transaction then recovers via CTO in <=100 ms). (1=enable, 0=off)");
+ 
++static int bcm4360_test314_olmsg_ring_autopsy;
++module_param(bcm4360_test314_olmsg_ring_autopsy, int, 0644);
++MODULE_PARM_DESC(bcm4360_test314_olmsg_ring_autopsy, "BCM4360 test.314: olmsg ring autopsy after the rxctl timeout (experiment-6-fire7-doorbell-anyway.md sec.5 + olmsg-h2d-format-audit.md A1/A2/B5). (a) MAILBOXINT (BAR0+0x48) READBACK immediately after the doorbell RMW |=0x1 (resolves fire #7 sec.3.1 (a)/(b)/(c): posted write lost vs fw-consumed vs HW one-shot). (b) SB-side PCIe2 intstatus/intmask (BAR0+0x20/0x24, pcie_core.h sbpcieregs) read BEFORE the doorbell and again after the rxctl timeout -- did the H2D bit 8 reach the fw-side interrupt status at all. (c) olmsg ring headers from HOST RAM (CPU-only, zero MMIO): H2D rd_ptr vs our w_ptr (rd_ptr==w_ptr => fw DMA-consumed, chain doorbell->ISR->dispatch dead; rd_ptr==0 => fw never touched the ring) + D2H wr_ptr. (d) one windowed TCM read of the fw console wr_idx (test.277 mechanism) -- >0x27d means the console advanced past the doorbell. (e) semantic message change: the first H2D message is BCM_OL_ARP_DISABLE {type=7,seq=0,len=0,total 12 B} (wl.ko staging wl.dis:7ff90-7ff9e) instead of the 0008 type 0x4 -- 0x4 is BCM_OL_LOW_RSSI_NOTIFICATION (D2H-direction) and the channel carries only BCM_OL_* types (audit H2). All new MMIO reads are windowed singles with pr_emerg bracketing before/after; the T309 zero-teardown hold is untouched. Requires test308=1 + test276=1; fire only with ASPM off + CTO 10-100 ms. (1=enable, 0=off)");
++
+ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4360_CHIP_ID, 0xFFFFFFFF, 4360),
+@@ -1163,6 +1198,25 @@
+ 			       brcmf_pcie_read_reg32(devinfo,
+ 					BRCMF_PCIE_PCIE2REG_MAILBOXINT) |
+ 			       BCM4360_OLMSG_DB_H2D);
++	/* test.314(a): readback of the doorbell RMW itself, the MMIO op
++	 * IMMEDIATELY after the posted write (fire #7 logged nothing
++	 * between the RMW and the rxctl wait). One windowed read: bit 0x1
++	 * still set => the write latched (and a later readback of 0 means
++	 * someone consumed it -- the fw stirred); 0 => the posted write
++	 * never latched (RC1-posted-write variant) or HW cleared it
++	 * (one-shot doorbell). Resolves fire #7 sec.3.1 hypotheses (a)/(b)/
++	 * (c); same MMIO read class as the T276 poll and the T312 gate
++	 * (proven safe on the live device in fires #6/#7). */
++	if (bcm4360_test314_olmsg_ring_autopsy) {
++		u32 t314_db_readback;
++
++		pr_emerg("BCM4360 test.314: MAILBOXINT readback (BAR0+0x48) right after doorbell RMW\n");
++		t314_db_readback =
++			brcmf_pcie_read_reg32(devinfo,
++					      BRCMF_PCIE_PCIE2REG_MAILBOXINT);
++		pr_emerg("BCM4360 test.314: doorbell readback=0x%08x (bit0 0x1 set => RMW latched; 0 => posted write lost or consumed/HW-cleared)\n",
++			 t314_db_readback);
++	}
+ 	brcmf_dbg(PCIE, "olmsg: H2D type=0x%x seq=%u len=%u w_ptr=%u\n",
+ 		  type, devinfo->olmsg_seq, len, w);
+ 	return 0;
+@@ -1246,6 +1300,142 @@
+ 	*(__le32 *)(buf + 0x18) = cpu_to_le32(r);
+ }
+ 
++/* ==== BCM4360 test.314: olmsg ring autopsy (after the rxctl timeout) ====
++ * One-shot diagnostic run after the 5 s D2H wait times out and BEFORE the
++ * fail path (T309 hold -- untouched) proceeds; closes the three evidence
++ * gaps of fire #7 (experiment-6-fire7-doorbell-anyway.md sec.3.2):
++ *   (b) SB-side PCIe2 intstatus/intmask (BAR0+0x20/0x24) -- did the H2D
++ *       bit 8 reach the fw-side interrupt status (pre-doorbell baseline is
++ *       taken in brcmf_pcie_tx_ctlpkt);
++ *   (c) ring headers from HOST RAM (coherent DMA buffer -- CPU-only, zero
++ *       MMIO): H2D rd_ptr vs our w_ptr, D2H wr_ptr;
++ *   (d) one windowed TCM read of the fw console wr_idx (test.277 class).
++ * Every new MMIO read is a single windowed access bracketed by pr_emerg
++ * before/after (test.310/311 pattern); host-RAM reads need no bracketing.
++ */
++static void bcm4360_t314_olmsg_ring_autopsy(struct brcmf_pciedev_info *devinfo)
++{
++	struct brcmf_bus *bus = dev_get_drvdata(&devinfo->pdev->dev);
++	u8 *buf = devinfo->t276_olmsg_buf;
++	u32 sb_intstatus, sb_intmask;
++
++	pr_emerg("BCM4360 test.314: olmsg ring autopsy enter (H2D w_ptr=%u, seq=%u, last msg type=0x%x)\n",
++		 devinfo->olmsg_h2d_wr, devinfo->olmsg_seq,
++		 BCM4360_OLMSG_TYPE_ARP_DISABLE);
++
++	/* (b) SB-side interrupt status/mask -- stalling reads, fire ONLY
++	 * with CTO 10-100 ms (config-space-research sec.6 / RC1 audit).
++	 * intstatus bit 8 (PCIE_INT_MB_FN0_0, pcie_core.h:180) set => the
++	 * H2D doorbell DID latch at the fw (fw alive enough to latch, but
++	 * not dispatching -- boot problem, audit H5); clear => the write
++	 * never reached the SB interrupt status (write-path problem).
++	 * intmask shows whether the fw armed its interrupts at all
++	 * (intrs_on: kimptoc test.28 saw 0x300 on a fully initialized fw). */
++	pr_emerg("BCM4360 test.314: SB intstatus read (BAR0+0x20) now\n");
++	sb_intstatus = brcmf_pcie_read_reg32(devinfo,
++					     BCM4360_OLMSG_SB_INTSTATUS);
++	pr_emerg("BCM4360 test.314: SB intstatus readback=0x%08x (bit8 0x100 set => doorbell latched at the fw intstatus)\n",
++		 sb_intstatus);
++	pr_emerg("BCM4360 test.314: SB intmask read (BAR0+0x24) now\n");
++	sb_intmask = brcmf_pcie_read_reg32(devinfo, BCM4360_OLMSG_SB_INTMASK);
++	pr_emerg("BCM4360 test.314: SB intmask readback=0x%08x (0x300 pattern = fw-armed interrupts, kimptoc test.28; 0 = never armed)\n",
++		 sb_intmask);
++
++	if (!buf) {
++		brcmf_err(bus, "test.314: ring buffer missing -- header autopsy skipped\n");
++		return;
++	}
++
++	/* (c) ring headers from HOST RAM -- CPU-only, zero MMIO. The DMA
++	 * buffer is ours (coherent), so no MMIO bracketing is needed here. */
++	{
++		u32 h2d_rd = le32_to_cpu(*(__le32 *)(buf +
++						     BCM4360_OLMSG_H2D_RD_PTR));
++		u32 h2d_wr = le32_to_cpu(*(__le32 *)(buf +
++						     BCM4360_OLMSG_H2D_WR_PTR));
++		u32 d2h_wr = le32_to_cpu(*(__le32 *)(buf +
++						     BCM4360_OLMSG_D2H_WR_PTR));
++		u32 i;
++		__le32 raw[16];
++
++		pr_emerg("BCM4360 test.314: ring H2D rd_ptr=%u wr_ptr=%u (host w_ptr=%u) D2H wr_ptr=%u\n",
++			 h2d_rd, h2d_wr, devinfo->olmsg_h2d_wr, d2h_wr);
++		if (h2d_rd == devinfo->olmsg_h2d_wr)
++			pr_emerg("BCM4360 test.314: VERDICT rd_ptr==w_ptr => fw DMA-CONSUMED the message (DMA works; chain doorbell->fw-ISR->dispatch dead)\n");
++		else if (h2d_rd == 0)
++			pr_emerg("BCM4360 test.314: VERDICT rd_ptr==0 => fw never touched the ring (DMA inactive in the frozen state)\n");
++		else
++			pr_emerg("BCM4360 test.314: VERDICT rd_ptr=%u is partial/unexpected (fw read %u of %u bytes)\n",
++				 h2d_rd, h2d_rd, devinfo->olmsg_h2d_wr);
++		/* raw header dump + the first H2D message header + the first
++		 * 64 B of the D2H data area (audit A2: has the fw overwritten
++		 * +0x08 with its rd_ptr? did it write anything back?). */
++		for (i = 0; i < 8; i++)
++			raw[i] = *(__le32 *)(buf + i * 4);
++		pr_emerg("BCM4360 test.314: ring hdr[0x00..0x1c] %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			 le32_to_cpu(raw[0]), le32_to_cpu(raw[1]),
++			 le32_to_cpu(raw[2]), le32_to_cpu(raw[3]),
++			 le32_to_cpu(raw[4]), le32_to_cpu(raw[5]),
++			 le32_to_cpu(raw[6]), le32_to_cpu(raw[7]));
++		pr_emerg("BCM4360 test.314: first H2D msg {type=0x%08x seq=0x%08x len=0x%08x} (host-written)\n",
++			 le32_to_cpu(*(__le32 *)(buf +
++					BCM4360_OLMSG_H2D_DATA_OFF)),
++			 le32_to_cpu(*(__le32 *)(buf +
++					BCM4360_OLMSG_H2D_DATA_OFF + 4)),
++			 le32_to_cpu(*(__le32 *)(buf +
++					BCM4360_OLMSG_H2D_DATA_OFF + 8)));
++		for (i = 0; i < 16; i++)
++			raw[i] = *(__le32 *)(buf + BCM4360_OLMSG_D2H_DATA_OFF +
++					     i * 4);
++		pr_emerg("BCM4360 test.314: D2H data[0x00..0x3f] %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			 le32_to_cpu(raw[0]), le32_to_cpu(raw[1]),
++			 le32_to_cpu(raw[2]), le32_to_cpu(raw[3]),
++			 le32_to_cpu(raw[4]), le32_to_cpu(raw[5]),
++			 le32_to_cpu(raw[6]), le32_to_cpu(raw[7]));
++		pr_emerg("BCM4360 test.314: D2H data[0x40..0x7f] %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			 le32_to_cpu(raw[8]), le32_to_cpu(raw[9]),
++			 le32_to_cpu(raw[10]), le32_to_cpu(raw[11]),
++			 le32_to_cpu(raw[12]), le32_to_cpu(raw[13]),
++			 le32_to_cpu(raw[14]), le32_to_cpu(raw[15]));
++	}
++
++	/* (d) windowed TCM reads of the fw console wr_idx (the test.277
++	 * mechanism: struct pointer from si[+0x010], wr_idx at struct+0x08;
++	 * TCM/BAR1 read class proven on the live device in fires #6/#7 --
++	 * T277 POST-POLL). 0x27d=637 is the frozen WFI state; a larger
++	 * value means the console advanced after the doorbell (fw stirred
++	 * and logged -- audit A3: look for "pciedngl_isr called" /
++	 * "Offload Message:" in the delta; the delta itself is T278's job,
++	 * kept off here to keep this two windowed reads, no loop). */
++	{
++		u32 t276_base = devinfo->ci->ramsize -
++				BCM4360_T276_SHARED_INFO_OFFSET;
++		u32 t314_ptr;
++
++		pr_emerg("BCM4360 test.314: console struct ptr read (TCM si[+0x010]) now\n");
++		t314_ptr = brcmf_pcie_read_ram32(devinfo,
++					t276_base + BCM4360_T276_SI_FW_STATUS);
++		pr_emerg("BCM4360 test.314: console struct ptr=0x%08x (si[+0x010]; fires #6/#7 saw 0x9af88)\n",
++			 t314_ptr);
++		if (!t314_ptr || t314_ptr >= devinfo->ci->ramsize) {
++			pr_emerg("BCM4360 test.314: struct ptr invalid (ramsize=0x%x) -- wr_idx read skipped\n",
++				 devinfo->ci->ramsize);
++		} else {
++			u32 t314_wr_idx;
++
++			pr_emerg("BCM4360 test.314: console wr_idx read (TCM struct+0x08) now\n");
++			t314_wr_idx =
++				brcmf_pcie_read_ram32(devinfo,
++					t314_ptr + BCM4360_T277_CONSOLE_WR_IDX);
++			pr_emerg("BCM4360 test.314: console wr_idx=0x%08x (%u) -- ==0x27d (637) => frozen WFI unchanged after the doorbell; >0x27d => console advanced (fw stirred)\n",
++				 t314_wr_idx, t314_wr_idx);
++		}
++	}
++
++	pr_emerg("BCM4360 test.314: autopsy done (SB intstatus=0x%08x SB intmask=0x%08x) -- fail path continues\n",
++		 sb_intstatus, sb_intmask);
++}
++
+ 
+ static void
+ brcmf_pcie_copy_dev_tomem(struct brcmf_pciedev_info *devinfo, u32 mem_offset,
+@@ -2213,6 +2403,9 @@
+ {
+ 	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
+ 	struct brcmf_pciedev_info *devinfo = bus_if->bus_priv.pcie->devinfo;
++	u32 t314_type = BCM4360_OLMSG_TYPE_CDC_DCMD;
++	const u8 *t314_payload = msg;
++	u32 t314_len = len;
+ 	int ret;
+ 
+ 	if (!bcm4360_olmsg_active(devinfo))
+@@ -2279,6 +2472,45 @@
+ 		return -ETIMEDOUT;
+ 	}
+ 
++	/* test.314(e): with the autopsy param set, the FIRST (and only)
++	 * message pushed over the olmsg channel is the harmless
++	 * BCM_OL_ARP_DISABLE {type=0x7, seq=0, len=0}, total 12 B (wl.ko
++	 * staging pattern wl.dis:7ff90-7ff9e), instead of the 0008 type
++	 * 0x4 dcmd: type 0x4 is BCM_OL_LOW_RSSI_NOTIFICATION -- a D2H-
++	 * direction event type -- and the olmsg channel carries only
++	 * BCM_OL_* types, never dcmd/CDC (audit H2, olmsg-h2d-format-
++	 * audit.md). No D2H answer is expected for these types (wl.ko
++	 * generates none), so the pending state is armed and the 5 s rxctl
++	 * timeout runs unchanged -- the observation targets are the autopsy
++	 * and the fw console, not a protocol answer. Later dcmds (seq>0)
++	 * keep the 0008 semantics. */
++	if (bcm4360_test314_olmsg_ring_autopsy && !devinfo->olmsg_seq) {
++		t314_type = BCM4360_OLMSG_TYPE_ARP_DISABLE;
++		t314_payload = NULL;
++		t314_len = 0;
++	}
++
++	/* test.314(b): SB-side PCIe2 intstatus/intmask (BAR0+0x20/0x24)
++	 * BEFORE the doorbell -- the baseline for the post-timeout read in
++	 * the autopsy (did bit 8 appear there only after OUR write?). Two
++	 * windowed single reads, each bracketed pr_emerg. Stalling reads:
++	 * fire ONLY with CTO 10-100 ms (config-space-research sec.6). */
++	if (bcm4360_test314_olmsg_ring_autopsy) {
++		u32 t314_sb_is;
++		u32 t314_sb_im;
++
++		pr_emerg("BCM4360 test.314: SB intstatus read (BAR0+0x20) pre-doorbell now\n");
++		t314_sb_is = brcmf_pcie_read_reg32(devinfo,
++						   BCM4360_OLMSG_SB_INTSTATUS);
++		pr_emerg("BCM4360 test.314: pre-doorbell SB intstatus=0x%08x\n",
++			 t314_sb_is);
++		pr_emerg("BCM4360 test.314: SB intmask read (BAR0+0x24) pre-doorbell now\n");
++		t314_sb_im = brcmf_pcie_read_reg32(devinfo,
++						   BCM4360_OLMSG_SB_INTMASK);
++		pr_emerg("BCM4360 test.314: pre-doorbell SB intmask=0x%08x\n",
++			 t314_sb_im);
++	}
++
+ 	/* At most one outstanding ctl (bcdc serializes queries); arm the
+ 	 * pending state BEFORE the doorbell so an immediate D2H response
+ 	 * (ISR runs in a thread) still matches. */
+@@ -2291,14 +2523,13 @@
+ 	 * fires #4/#5 (experiment #4 report sec.7). */
+ 	if (bcm4360_test310_olmsg_poll_heartbeat)
+ 		pr_emerg("BCM4360 test.310: before first doorbell H2D (olmsg_write type=0x%x len=%u)\n",
+-			 BCM4360_OLMSG_TYPE_CDC_DCMD, len);
++			 t314_type, t314_len);
+ 	/* test.313: bracket the doorbell RMW itself. THIS is the last line
+ 	 * if the doorbell kills the machine (fire #6: gate timeout, fw
+ 	 * frozen -- first MMIO mailbox RMW since ARM release). */
+ 	if (bcm4360_test313_doorbell_anyway)
+ 		pr_emerg("BCM4360 test.313: doorbell H2D RMW |=0x1 now\n");
+-	ret = bcm4360_olmsg_write(devinfo, BCM4360_OLMSG_TYPE_CDC_DCMD,
+-				  msg, len);
++	ret = bcm4360_olmsg_write(devinfo, t314_type, t314_payload, t314_len);
+ 	if (ret) {
+ 		devinfo->olmsg_resp_pending = false;
+ 		return ret;
+@@ -2336,6 +2567,11 @@
+ 		if (bcm4360_test313_doorbell_anyway)
+ 			pr_emerg("BCM4360 test.313: rxctl wait timeout after %d ms (waiting D2H bit8 -- fw never answered)\n",
+ 				 BCM4360_OLMSG_CTL_RESP_TIMEOUT_MS);
++		/* test.314: ring autopsy AFTER the rxctl timeout, BEFORE the
++		 * fail path reaches the T309 hold (the hold and its SUMMARY
++		 * are untouched -- nothing new in the teardown path). */
++		if (bcm4360_test314_olmsg_ring_autopsy)
++			bcm4360_t314_olmsg_ring_autopsy(devinfo);
+ 		brcmf_err(bus_if, "olmsg: ctl response timeout\n");
+ 		return -ETIMEDOUT;
+ 	}

@@ -1,0 +1,33 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 4/5] brcmfmac: pcie: BCM4360 INTERNAL_MEM reset NULL guard
+
+The BCM4360 has no BCMA_CORE_INTERNAL_MEM core, so
+brcmf_chip_get_core() returns NULL and upstream's unconditional
+brcmf_chip_resetcore() dereferences it on the 4360 exit_download_state
+path. Extend the existing BCM43602-only reset to also cover the
+BCM4360 and guard the call with a NULL check (kimptoc
+reference/brcmfmac-reference/pcie.c).
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 4 insertions(+), 2 deletions(-)
+diff --git a/brcmfmac/pcie.c b/brcmfmac/pcie.c
+index 9a0bdc8..c4a4faf 100644
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -748,9 +1044,11 @@ static int brcmf_pcie_exit_download_state(struct brcmf_pciedev_info *devinfo,
+ {
+ 	struct brcmf_core *core;
+ 
+-	if (devinfo->ci->chip == BRCM_CC_43602_CHIP_ID) {
++	if (devinfo->ci->chip == BRCM_CC_4360_CHIP_ID ||
++	    devinfo->ci->chip == BRCM_CC_43602_CHIP_ID) {
+ 		core = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_INTERNAL_MEM);
+-		brcmf_chip_resetcore(core, 0, 0, 0);
++		if (core)
++			brcmf_chip_resetcore(core, 0, 0, 0);
+ 	}
+ 
+ 	if (!brcmf_chip_set_active(devinfo->ci, resetintr))
+--
+2.39.2

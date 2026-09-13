@@ -1,0 +1,57 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 2/5] brcmfmac: chip: BCM4360 TCM rambase=0 and fixed RAM info
+
+The BCM4360 ARM CR4 core maps TCM directly through BAR2 with no
+offset: rambase must be 0 (BCM43602 uses 0x180000). Without this,
+brcmf_chip_tcm_rambase() returns INVALID_RAMBASE and the probe fails
+with "RAM base not provided with ARM CR4 core" before firmware
+download. The chip's TCM is 640 KiB (0xa0000) with no separate SRAM.
+
+Ported from kimptoc/bcm4360-re (reference/brcmfmac-reference/chip.c):
+- brcmf_chip_tcm_rambase(): case BRCM_CC_4360_CHIP_ID -> 0
+- brcmf_chip_get_raminfo(): early fixed-RAM branch for BCM4360
+  (rambase=0, ramsize=0xa0000, srsize=0); kimptoc hardcodes these
+  values because the CR4 bxinfo-derived ramsize is not reliable on
+  this chip (D11 core rev 42, unusual memory layout).
+
+Adaptation for 7.1.8: 7.1.8's get_raminfo() tail differs from
+kimptoc's v6.12 base (7.1.8 uses brcmf_chip_socram_ramsize() and has
+no SDRAM srsize subtraction), so the early-return branch is inserted
+at the top of the function, before the memory-core lookup, keeping
+the rest of the function byte-identical to upstream.
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 12 insertions(+), 0 deletions(-)
+diff --git a/brcmfmac/chip.c b/brcmfmac/chip.c
+index 4adc0d0..8351f7b 100644
+--- a/brcmfmac/chip.c
++++ b/brcmfmac/chip.c
+@@ -723,6 +723,7 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
+ 	case BRCM_CC_43570_CHIP_ID:
+ 	case BRCM_CC_4358_CHIP_ID:
+ 	case BRCM_CC_43602_CHIP_ID:
++	case BRCM_CC_4360_CHIP_ID:
+ 	case BRCM_CC_4371_CHIP_ID:
+ 		return 0x180000;
+ 	case BRCM_CC_43465_CHIP_ID:
+@@ -760,6 +761,17 @@ int brcmf_chip_get_raminfo(struct brcmf_chip *pub)
+ 	struct brcmf_core_priv *mem_core;
+ 	struct brcmf_core *mem;
+ 
++	if (ci->pub.chip == BRCM_CC_4360_CHIP_ID) {
++		/* BCM4360: TCM is 640 KiB mapped directly at BAR2, no
++		 * separate SRAM. The ARM CR4 bxinfo-derived size is not
++		 * reliable on this chip (D11 core rev 42), so use fixed
++		 * values (kimptoc phase5 test.121). */
++		ci->pub.rambase = 0;
++		ci->pub.ramsize = 0xa0000;
++		ci->pub.srsize = 0;
++		return 0;
++	}
++
+ 	mem = brcmf_chip_get_core(&ci->pub, BCMA_CORE_ARM_CR4);
+ 	if (mem) {
+ 		mem_core = container_of(mem, struct brcmf_core_priv, pub);
+--
+2.39.2

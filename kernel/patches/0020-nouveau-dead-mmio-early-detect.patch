@@ -1,0 +1,182 @@
+From 0020-nouveau-dead-mmio-early-detect Mon Sep 17 00:00:00 2001
+From: Krzysztof Kowalski <krzysztof7kowalski@gmail.com>
+Date: Tue, 1 Sep 2026 21:00:00 +0200
+Subject: [PATCH 0020/0020] nouveau: refuse init on a dGPU with dead MMIO
+ (switcheroo power-on after S3)
+
+MacBookPro11,3, raport 116: the first power-ON of the dGPU after an S3 resume
+hits a card whose config space answers (the patch 0011 link poll passes,
+"enabling device"), while MMIO reads only 0xffffffff ("timer: stalled at
+ffffffffffffffff", WARNING g84_bar_flush xN).  Init proceeds into
+nvkm_device_init on the dead device; patch 0019 turned the oops into a
+gracefully refused re-init of the tree, but:
+
+1. nouveau_switcheroo_set_state(ON) sets DRM_SWITCH_POWER_ON
+   unconditionally, ignoring the result of nouveau_pmops_resume() — after a
+   failed resume the device is left switch_power_state == ON without
+   initialization.  The first suspend after that enters nouveau_do_suspend()
+   + D3hot on dead MMIO (nouveau_pmops_suspend() skips only the OFF /
+   DYNAMIC_OFF states) — suspected machine freeze on the second S3
+   (raport 116, 18:37:15).
+2. Every subsequent init attempt on the same card spews WARNINGs, grinds in
+   nvkm (a dozen or so seconds of timeouts) and ends with the userspace
+   process exiting mid-write to debugfs ("reclocked exited with irqs
+   disabled", vgasr_mutex poisoned forever, raport 116 17:49:42).
+
+The patch adds an early dead-MMIO probe: a read of NV_PMC_BOOT_0 (BAR0+0x0) —
+the chipset identification register, the same one nvkm_device_ctor() reads at
+cold-boot probe; on a live GPU it always returns the fused value, on a card
+that never completes a memory TLP — 0xffffffff.  The probe is a single
+ioread32 on the probe-time BAR0 mapping (suspend never unmaps it), it never
+sleeps and cannot hang the caller: on a dead card the master abort completes
+on the link.  The probe sits in nouveau_pmops_resume() after
+pci_restore_state()/pci_enable_device()/pci_set_master() — i.e. at the
+safest point: link trained (poll 0011), MEM decoding enabled, before any nvkm
+init.
+
+With dead MMIO:
+
+* nouveau_pmops_resume() logs "dGPU MMIO dead ... refusing init", returns
+  -ENODEV and **sets switch_power_state = DRM_SWITCH_POWER_OFF** — restoring
+  the pre-attempt state, so every later nouveau_pmops_suspend() (system PM,
+  shutdown) is a no-op and suspend never touches the dead card.  The client
+  tree was not disturbed (the guard stands before nvif_client_resume), so the
+  next attempt starts from a consistent state.
+* nouveau_switcheroo_set_state() **stops ignoring** the resume result: on
+  error it logs and leaves DRM_SWITCH_POWER_OFF instead of the unconditional
+  ON.  Writing "ON" to vgaswitcheroo ends quickly, without WARNINGs; the
+  daemon gets an unambiguous "dGPU MMIO dead" in dmesg.
+* nouveau_pmops_runtime_resume() gets the same guard (switch_power_state
+  stays DYNAMIC_OFF there — suspend-safe by construction).
+
+Retry semantics in vga_switcheroo: vga_switchon() sets client->pwr_state
+= ON after set_gpu_state() returns, so a repeated "ON" write is a no-op
+(fast, without init) — the destructive re-probe loop from raport 116 dies.
+A real new cycle requires the "OFF" sequence (set_gpu_state(OFF) is no-op at
+switch_power_state == OFF, the gmux handler cuts the rails — a full
+power-cycle) and only then "ON".  So: if the card was only briefly frozen and
+the sequence was the dead one, OFF->ON gives it a fresh power cycle; if the
+card is truly dead, every attempt ends with a single "MMIO dead" message and
+an immediate return.
+
+The root reason why the gmux ON sequence after S3 leaves the GPU in a "rails
+latched, core never started" state (config alive, MMIO dead for >= 10 min,
+while power pulsations without S3 work) is not statically decidable —
+candidates (GPE powerchange timeout after S3, no full OFF->ON cycle before
+ON, parent PEG state) need live confirmation, raport 117.
+
+Signed-off-by: Krzysztof Kowalski <krzysztof7kowalski@gmail.com>
+---
+ drivers/gpu/drm/nouveau/nouveau_drm.c | 50 ++++++++++++++++++++++++++
+ drivers/gpu/drm/nouveau/nouveau_vga.c | 22 ++++++++++++++++++--
+ 2 files changed, 71 insertions(+), 1 deletion(-)
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.c b/drivers/gpu/drm/nouveau/nouveau_drm.c
+index 3f8c53b..98143a5 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.c
+@@ -1089,6 +1089,35 @@ static int nouveau_pci_resume(struct pci_dev *pdev)
+ 	return ret == -EIO ? -EIO : 0;
+ }
+ 
++/*
++ * Detect a dGPU whose MMIO is dead: the PCIe link is trained and config
++ * space answers (nouveau_pci_resume() just polled it), but the device
++ * never completes a memory TLP - every BAR0 read returns 0xffffffff.
++ *
++ * On the MacBookPro11,3 this is what a power-on after an S3 resume looks
++ * like (raport 116): the gmux rail sequence latches ON (read-back 0x03,
++ * patch 0003), the link retrains, pci_enable_device()/pci_set_master()
++ * succeed, and yet every MMIO read is all-1s ("timer: stalled at
++ * ffffffffffffffff", WARNING g84_bar_flush) and nvkm then walks its
++ * object tree over dead hardware.  The state persists for minutes, so
++ * it is not a matter of waiting longer.
++ *
++ * The probe is NV_PMC_BOOT_0 (BAR0+0x0), the chipset identification
++ * register: on a live GPU it always reads back its fused value - it is
++ * the same read nvkm_device_ctor() uses at cold-boot probe, so it is
++ * readable before any nvkm init.  It is a single ioread32 on the BAR0
++ * mapping created at probe time (suspend never unmaps it), it sleeps
++ * nowhere and cannot hang the caller: on a dead card the master abort
++ * completes on the link.
++ */
++static bool nouveau_mmio_dead(struct nouveau_drm *drm)
++{
++	if (!drm->client.device.object.map.ptr)
++		return false;
++	return PCI_POSSIBLE_ERROR(nvif_rd32(&drm->client.device.object,
++					    0x00000000));
++}
++
+ int
+ nouveau_pmops_resume(struct device *dev)
+ {
+@@ -1109,6 +1138,17 @@ nouveau_pmops_resume(struct device *dev)
+ 		return ret;
+ 	pci_set_master(pdev);
+ 
++	/* Refuse to run nouveau_do_resume() (nvkm device init, object tree
++	 * walk, VBIOS reinit) against a card that never came out of the
++	 * power-cycle.  Drop the switch_power_state back to OFF: ON would
++	 * make the next nouveau_pmops_suspend() touch the dead card.
++	 */
++	if (nouveau_mmio_dead(drm)) {
++		NV_ERROR(drm, "dGPU MMIO dead after resume (BOOT0 = 0xffffffff), refusing init\n");
++		drm->dev->switch_power_state = DRM_SWITCH_POWER_OFF;
++		return -ENODEV;
++	}
++
+ 	ret = nouveau_do_resume(drm, false);
+ 
+ 	/* Monitors may have been connected / disconnected during suspend */
+@@ -1292,6 +1332,16 @@ nouveau_pmops_runtime_resume(struct device *dev)
+ 		return ret;
+ 	pci_set_master(pdev);
+ 
++	/* Same dead-MMIO guard as nouveau_pmops_resume(): on failure the
++	 * switch_power_state is still DRM_SWITCH_POWER_DYNAMIC_OFF here
++	 * (set by runtime suspend), so a later suspend is a no-op by
++	 * construction and only the error needs to be returned.
++	 */
++	if (nouveau_mmio_dead(drm)) {
++		NV_ERROR(drm, "dGPU MMIO dead after resume (BOOT0 = 0xffffffff), refusing init\n");
++		return -ENODEV;
++	}
++
+ 	ret = nouveau_do_resume(drm, true);
+ 	if (ret) {
+ 		NV_ERROR(drm, "resume failed with: %d\n", ret);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_vga.c b/drivers/gpu/drm/nouveau/nouveau_vga.c
+index a6c375a..3fedb48 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_vga.c
++++ b/drivers/gpu/drm/nouveau/nouveau_vga.c
+@@ -41,9 +41,29 @@ nouveau_switcheroo_set_state(struct pci_dev *pdev,
+ 		return;
+ 
+ 	if (state == VGA_SWITCHEROO_ON) {
++		int ret;
++
+ 		pr_err("VGA switcheroo: switched nouveau on\n");
+ 		dev->switch_power_state = DRM_SWITCH_POWER_CHANGING;
+-		nouveau_pmops_resume(&pdev->dev);
++		ret = nouveau_pmops_resume(&pdev->dev);
++		if (ret) {
++			/*
++			 * Resume failed - e.g. dead MMIO after an S3 power
++			 * cycle (raport 116).  Do NOT leave ON here: ON on an
++			 * uninitialized device makes the next system suspend
++			 * run nouveau_do_suspend() against dead MMIO, and
++			 * every retry of the init would re-enter nvkm on the
++			 * same dead card.  Restore OFF so both nouveau's
++			 * pmops and the vga_switcheroo core treat the device
++			 * as powered down; a real retry is an explicit
++			 * OFF->ON sequence, which gives the gmux a fresh
++			 * power cycle (a plain ON after this is a no-op in
++			 * vga_switchon(), because pwr_state is already ON).
++			 */
++			pr_err("VGA switcheroo: nouveau resume failed (%d), leaving dGPU off\n", ret);
++			dev->switch_power_state = DRM_SWITCH_POWER_OFF;
++			return;
++		}
+ 		dev->switch_power_state = DRM_SWITCH_POWER_ON;
+ 	} else {
+ 		pr_err("VGA switcheroo: switched nouveau off\n");

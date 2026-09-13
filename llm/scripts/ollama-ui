@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# "Ollama UI" entry in the Omarchy app list (XDG .desktop).
+# Subcommands: install | uninstall
+set -euo pipefail
+
+URL="http://127.0.0.1:11434"
+APPS_DIR="$HOME/.local/share/applications"
+DESKTOP_PATH="$APPS_DIR/ollama-ui.desktop"
+
+info() { printf 'info: %s\n' "$*"; }
+err()  { printf 'err: %s\n' "$*" >&2; }
+
+cmd_install() {
+  mkdir -p "$APPS_DIR"
+
+  # Omarchy opens web apps via omarchy-launch-webapp (a --app window in Chromium);
+  # that is its own convention (YouTube.desktop, Gemini.desktop, etc.).
+  # Fallback: plain xdg-open in the default browser.
+  if command -v omarchy-launch-webapp >/dev/null 2>&1; then
+    EXEC_LINE="omarchy-launch-webapp $URL"
+  else
+    EXEC_LINE="sh -c \"xdg-open $URL\""
+  fi
+
+  # Idempotent: overwrite. The network-server icon ships with Adwaita (no downloads).
+  cat >"$DESKTOP_PATH" <<EOF
+[Desktop Entry]
+Version=1.0
+Name=Ollama UI
+Comment=Built-in web UI of Ollama (gateway 11434)
+Exec=$EXEC_LINE
+Terminal=false
+Type=Application
+Icon=network-server
+Categories=Network;Development;
+StartupNotify=true
+EOF
+  chmod +x "$DESKTOP_PATH"
+
+  # Refresh the .desktop database (the same as omarchy-refresh-applications).
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$APPS_DIR" 2>/dev/null || true
+  fi
+
+  info "entry ready: $DESKTOP_PATH"
+  info "launch via the app launcher (SUPER + SPACE) → \"Ollama UI\""
+}
+
+cmd_uninstall() {
+  # Remove only our own file, nothing else.
+  rm -f "$DESKTOP_PATH"
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$APPS_DIR" 2>/dev/null || true
+  fi
+  info "removed: $DESKTOP_PATH"
+}
+
+case "${1:-}" in
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  *)
+    err "usage: $0 {install|uninstall}"
+    exit 2
+    ;;
+esac

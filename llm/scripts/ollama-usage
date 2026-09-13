@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ollama-usage — shows ollama.com limit usage (hourly + weekly)
+for sessions saved in Firefox, Chromium and Firefox Developer Edition.
+
+How it works:
+  1. copies the profile cookie DB into tmp/cookies/ (the original is READ-ONLY),
+  2. Firefox and Firefox Developer Edition: the cookie is plaintext in sqlite
+     (moz_cookies table; firefox = regular profiles, firefox-developer = the
+     *.dev-edition-default profiles — each account has its own browser);
+     Chromium: __Secure-session is encrypted — the key comes from the "Chromium
+     Safe Storage" entry in Secret Service (secret-tool, fallback: dbus, "peanuts")
+     and is decrypted by a temporary node decryptor created in tmp/cookies/
+     (the decryptor and the DB copy are removed afterwards),
+  3. fetches https://ollama.com/settings with the given browser's UA,
+  4. prints hourly/weekly %, time until reset (data-time) and per-model
+     segments (data-usage-segment: data-model + data-requests).
+
+Security: cookie values and keyring secrets are never printed or written to
+disk — the secret passes only through the decryptor process's environment;
+working files are 0600 and removed at the end.
+
+Usage: ollama-usage [--browser firefox|chromium|firefox-developer|all] [--json]
+"""
+
+import argparse
+import calendar
+import glob
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+COOKIE_DIR = os.path.join(BASE_DIR, "tmp", "cookies")
+
+SESSION_COOKIE = "__Secure-session"
+SETTINGS_URL = "https://ollama.com/settings"
+
+UA = {
+    "firefox": "Mozilla/5.0 (X11; Linux x86_64; rv:154.0) Gecko/20100101 Firefox/154.0",
+    "firefox-developer": "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0",
+    "chromium": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+}
+
+CHROMIUM_COOKIES = os.path.expanduser("~/.config/chromium/Default/Cookies")
+FIREFOX_PROFILES_DIR = os.path.expanduser("~/.config/mozilla/firefox")
+
+# Firefox Developer Edition keeps its profiles in the *.dev-edition-default
+# directory (shared root ~/.config/mozilla/firefox, but separate profiles and
+# installs — see installs.ini). These constants split the session sources:
+# "firefox" takes the regular profiles, "firefox-developer" only dev-edition ones.
+FIREFOX_DEV_SUFFIX = ".dev-edition-default"
+
+
+def is_dev_edition_profile(profile_dir):
+    return profile_dir.rstrip("/").endswith(FIREFOX_DEV_SUFFIX)
+
+# ollama.com nav links — not an account name
+NON_ACCOUNT = {
+    "blog", "docs", "download", "pricing", "privacy", "search", "settings",
+    "signin", "signout", "signup", "logout", "login", "register", "new",
+    "models", "library", "explore", "faq", "api", "contact", "about", "jobs",
+    "careers", "discord", "github", "terms", "dashboard", "profile", "billing",
+    "limits", "usage", "me", "&", "search?", "blog?tag",
+}
+
+
+# ------------------------------------------------------------------ helpers
+
+def human_left(seconds_left):
+    """seconds -> 'in 53 min' / 'in 4h' / 'in 6d 2h'"""
+    if seconds_left is None:
+        return "?"
+    if seconds_left < 0:
+        return "reset done"
+    minutes = int(seconds_left // 60)
+    if minutes < 60:
+        return "in %d min" % minutes
+    hours = int(minutes // 60)
+    if hours < 48:
+        return "in %dh" % hours
+    days = int(hours // 24)
+    rem = hours % 24
+    return ("in %dd %dh" % (days, rem)) if rem else ("in %dd" % days)
+
+
+def reset_left(iso_utc):
+    """'2026-08-31T21:00:00Z' -> text 'in X' or '?'."""
+    try:
+        t = calendar.timegm(time.strptime(iso_utc, "%Y-%m-%dT%H:%M:%SZ"))
+        return human_left(t - int(time.time()))
+    except Exception:
+        return "?"
+
+
+def pct_str(v):
+    return "?" if v is None else ("%g" % v)
+
+
+# ------------------------------------------------------------------ parsing
+
+def detect_account(html):
+    for m in re.finditer(r'href="/([A-Za-z0-9_.-]{1,40})"', html):
+        n = m.group(1)
+        if n not in NON_ACCOUNT and not n.startswith("__"):
+            return n
+    return None
+
+
+def parse_usage(html):
+    out = {"hourly_pct": None, "weekly_pct": None,
+           "reset_hourly_iso": None, "reset_weekly_iso": None,
+           "models_h": [], "models_w": []}
+
+    # % taken from the aria-label on the tracks; fallback to the bar width
+    def pct(label):
+        m = re.search(r'aria-label="%s\s+([\d.]+)%%\s+used"' % label, html)
+        if not m:
+            m = re.search(r'%s.{0,500}?width:\s*([\d.]+)%%' % label, html, re.S)
+        return float(m.group(1)) if m else None
+
+    out["hourly_pct"] = pct("Session usage")
+    out["weekly_pct"] = pct("Weekly usage")
+
+    times = re.findall(r'data-time="([^"]+)"', html)
+
+    # Account on a pro plan: /settings has NO "Session usage/Weekly usage
+    # N% used" tracks — instead a single dollar track "Monthly usage $X of $Y used"
+    # (monthly limit) + "Resets in N weeks". Then hourly/weekly stay None,
+    # and we report the monthly block.
+    if out["hourly_pct"] is None and out["weekly_pct"] is None:
+        m = re.search(r'aria-label="Monthly usage \$([\d.]+) of \$([\d.]+) used"', html)
+        if m:
+            used, cap = float(m.group(1)), float(m.group(2))
+            out["monthly_used"] = used
+            out["monthly_cap"] = cap
+            out["monthly_pct"] = round(used / cap * 100.0, 2) if cap > 0 else None
+            out["models_m"] = _segs_in(html)
+            if times:
+                out["reset_monthly_iso"] = times[0]
+            return out  # pro plan: reset_h/reset_w do not exist
+
+    # data-time: first occurrence = hourly reset, second = weekly
+    if times:
+        out["reset_hourly_iso"] = times[0]
+    if len(times) > 1:
+        out["reset_weekly_iso"] = times[1]
+
+    # per-model segments in the tracks — split at the "Weekly usage" aria-label boundary
+    return parse_segments(html, out)
+
+
+def _segs_in(chunk):
+    res = []
+    for m in re.finditer(r'data-usage-segment[^>]*?data-model="([^"]*)"[^>]*?'
+                         r'data-requests="(\d+)"', chunk):
+        res.append((m.group(1), int(m.group(2))))
+    if not res:
+        for m in re.finditer(r'data-requests="(\d+)"[^>]*?data-model="([^"]*)"',
+                             chunk):
+            res.append((m.group(2), int(m.group(1))))
+    return res
+
+
+def parse_segments(html, out):
+    i_h = html.find('aria-label="Session usage')
+    i_w = html.find('aria-label="Weekly usage')
+    hour_part = (html[i_h:i_w] if (i_h >= 0 and i_w > i_h)
+                 else (html if i_h >= 0 else ""))
+    week_part = html[i_w:] if i_w >= 0 else ""
+    out["models_h"] = _segs_in(hour_part)
+    out["models_w"] = _segs_in(week_part)
+    return out
+
+
+# ------------------------------------------------------------------- źródła
+
+CHROMIUM_DECRYPTOR_JS = r"""
+// Temporary cookie decryptor — the secret is read from the SECRET env var (never argv).
+// Chromium Linux, "v11" prefix (from os_crypt/async, Chromium ~133+):
+//   key = PBKDF2-HMAC-SHA1(password, salt "saltysalt", 1 iteration, 16 B),
+//   AES-128-CBC, fixed IV = 16 spaces,
+//   plaintext = 32 random prefix bytes + the actual cookie value.
+// (NOTE: v11 is NOT AES-256-GCM — GCM applies only to other platforms/previews.)
+// "v10" prefix / no prefix: the older AES-128-CBC format with "peanuts".
+const crypto = require('crypto'), { execFileSync } = require('child_process');
+const [db, hostLike, name] = process.argv.slice(2);
+const secret = process.env.SECRET;
+const rows = execFileSync('sqlite3', ['-readonly', db,
+  `SELECT quote(encrypted_value) FROM cookies WHERE host_key LIKE '${hostLike}' AND name='${name}' LIMIT 1;`],
+  { encoding: 'utf8' }).trim();
+const m = rows.match(/^X'([0-9a-fA-F]*)'$/);
+if (!m) process.exit(3); // no cookie
+const blob = Buffer.from(m[1], 'hex');
+const prefix = blob.subarray(0, 3).toString('latin1');
+const cbc = (key, body) => {
+  const d = crypto.createDecipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20));
+  return Buffer.concat([d.update(body), d.final()]);
+};
+let plain = null;
+try {
+  if (prefix === 'v11' || prefix === 'v10') {
+    const key = crypto.pbkdf2Sync(secret, 'saltysalt', 1, 16, 'sha1');
+    const full = cbc(key, blob.subarray(3));
+    plain = prefix === 'v11' ? full.subarray(32) : full;
+  } else {
+    const key = crypto.pbkdf2Sync('peanuts', 'saltysalt', 1, 16, 'sha1');
+    plain = cbc(key, blob); // no-prefix format
+  }
+} catch (e) { process.exit(4); } // bad key / undecryptable
+if (!plain || plain.length < 16) process.exit(4);
+process.stdout.write(plain.toString('latin1'));
+"""
+
+
+def chromium_candidates():
+    """Successive candidates for 'Chromium Safe Storage' (never prints secrets)."""
+    secret_tool_done = False
+    try:
+        r = subprocess.run(["secret-tool", "lookup", "application", "chromium"],
+                           capture_output=True, timeout=20)
+        if r.returncode == 0 and r.stdout:
+            secret_tool_done = True
+            yield r.stdout.decode("utf-8", "replace").rstrip("\n")
+    except Exception:
+        pass
+    # fallback: dbus Secret Service — when secret-tool is missing/refused
+    if not secret_tool_done:
+        try:
+            import dbus
+            bus = dbus.SessionBus()
+            obj = bus.get_object("org.freedesktop.secrets",
+                                 "/org/freedesktop/secrets", False)
+            svc = dbus.Interface(obj, "org.freedesktop.Secret.Service")
+            props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
+            # OpenSession: result is (output, session_path) — session at index 1
+            _, sess = svc.OpenSession("plain", dbus.String("", variant_level=1))
+            for coll_path in props.Get("org.freedesktop.Secret.Service",
+                                       "Collections"):
+                coll = bus.get_object("org.freedesktop.secrets", coll_path, False)
+                cp = dbus.Interface(coll, "org.freedesktop.DBus.Properties")
+                try:
+                    items = cp.Get("org.freedesktop.Secret.Collection", "Items")
+                except Exception:
+                    continue
+                for ipath in items:
+                    item = bus.get_object("org.freedesktop.secrets", ipath, False)
+                    ip = dbus.Interface(item, "org.freedesktop.DBus.Properties")
+                    try:
+                        attrs = ip.Get("org.freedesktop.Secret.Item", "Attributes")
+                    except Exception:
+                        continue
+                    if str(attrs.get("application", "")) != "chromium":
+                        continue
+                    try:
+                        _s, _p, content, _ct = svc.GetSecrets(
+                            [dbus.ObjectPath(str(ipath))],
+                            dbus.ObjectPath(sess))[dbus.ObjectPath(str(ipath))]
+                        yield bytes(content).decode("utf-8", "replace")
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    # last fallback: the "peanuts" password (older format without keyring)
+    yield "peanuts"
+
+
+def get_chromium_session(work_dir):
+    """Copy of the cookie DB into tmp + decryption of __Secure-session (node)."""
+    if not os.path.exists(CHROMIUM_COOKIES):
+        return None, "no chromium cookies DB"
+    if shutil.which("node") is None:
+        return None, "node not in PATH"
+    work = os.path.join(work_dir, "chromium-Cookies.work")
+    dec = os.path.join(work_dir, "chromium-decrypt.js")
+    shutil.copyfile(CHROMIUM_COOKIES, work)
+    os.chmod(work, 0o600)
+    try:
+        with open(dec, "w") as f:
+            f.write(CHROMIUM_DECRYPTOR_JS)
+        os.chmod(dec, 0o700)
+        last = "could not decrypt (no key matched)"
+        for cand in chromium_candidates():
+            env = dict(os.environ, SECRET=cand)
+            try:
+                r = subprocess.run(["node", dec, work, "%ollama%", SESSION_COOKIE],
+                                   capture_output=True, env=env, timeout=30)
+            except subprocess.TimeoutExpired:
+                continue
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.decode("latin1", "replace"), None
+            if r.returncode == 3:
+                return None, "no ollama session in chromium"
+        return None, last
+    finally:
+        for p in (work, dec):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def get_firefox_session(work_dir, profile_filter=None):
+    """Copy of the profile's cookies.sqlite and read of the plaintext __Secure-session.
+
+    profile_filter: predicate on the profile directory (None = all) — lets us
+    separate regular Firefox from Firefox Developer Edition (separate accounts)."""
+    dbs = sorted(glob.glob(os.path.join(FIREFOX_PROFILES_DIR, "*", "cookies.sqlite")))
+    if profile_filter is not None:
+        dbs = [db for db in dbs if profile_filter(os.path.dirname(db))]
+    if not dbs:
+        return None, "no firefox profile"
+    cookies = []
+    for idx, db in enumerate(dbs):
+        work = os.path.join(work_dir, "firefox-Cookies.%d.%d" % (os.getpid(), idx))
+        shutil.copyfile(db, work)
+        os.chmod(work, 0o600)
+        try:
+            conn = sqlite3.connect("file:%s?immutable=1" % work, uri=True)
+            try:
+                for (v,) in conn.execute(
+                        "SELECT value FROM moz_cookies "
+                        "WHERE host LIKE ? AND name = ? LIMIT 1",
+                        ("%ollama%", SESSION_COOKIE)):
+                    cookies.append(v)
+            finally:
+                conn.close()
+        finally:
+            try:
+                os.remove(work)
+            except OSError:
+                pass
+    if not cookies:
+        return None, "no ollama session in firefox"
+    return cookies[0], None
+
+
+# ------------------------------------------------------------------ probe
+
+def examine(browser):
+    res = {"browser": browser, "account": None, "hourly_pct": None,
+           "weekly_pct": None, "reset_h": None, "reset_w": None,
+           "models_h": [], "models_w": [], "error": None}
+    try:
+        os.makedirs(COOKIE_DIR, exist_ok=True)
+        if browser == "chromium":
+            cookie, err = get_chromium_session(COOKIE_DIR)
+        elif browser == "firefox-developer":
+            cookie, err = get_firefox_session(COOKIE_DIR, is_dev_edition_profile)
+        else:  # firefox — regular profiles (outside *.dev-edition-default)
+            cookie, err = get_firefox_session(
+                COOKIE_DIR, lambda p: not is_dev_edition_profile(p))
+        if not cookie:
+            res["error"] = err or "no session"
+            return res
+        req = urllib.request.Request(SETTINGS_URL, headers={
+            "Cookie": "%s=%s" % (SESSION_COOKIE, cookie),
+            "User-Agent": UA[browser],
+            "Accept": "text/html",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                code, html = resp.getcode(), resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            code, html = e.code, ""
+        if code != 200 or not html:
+            res["error"] = "no session (HTTP %s from %s)" % (code, SETTINGS_URL)
+            return res
+        res["account"] = detect_account(html)
+        u = parse_usage(html)
+        res.update(hourly_pct=u["hourly_pct"], weekly_pct=u["weekly_pct"],
+                   models_h=u["models_h"], models_w=u["models_w"])
+        if u.get("monthly_used") is not None:
+            res["monthly"] = {"used": u["monthly_used"], "cap": u["monthly_cap"],
+                              "pct": u.get("monthly_pct")}
+            res["models_m"] = u.get("models_m", [])
+        if u.get("reset_monthly_iso"):
+            res["reset_m"] = {"iso": u["reset_monthly_iso"],
+                              "left": reset_left(u["reset_monthly_iso"])}
+        if u["reset_hourly_iso"]:
+            res["reset_h"] = {"iso": u["reset_hourly_iso"],
+                              "left": reset_left(u["reset_hourly_iso"])}
+        if u["reset_weekly_iso"]:
+            res["reset_w"] = {"iso": u["reset_weekly_iso"],
+                              "left": reset_left(u["reset_weekly_iso"])}
+        if res["account"] is None:
+            res["error"] = "could not recognize the account name"
+        return res
+    except Exception as e:
+        res["error"] = str(e)
+        return res
+
+
+# ------------------------------------------------------------------ output
+
+def slim(r):
+    d = {"browser": r["browser"]}
+    if r.get("error"):
+        d["error"] = r["error"]
+    d.update(account=r.get("account"), hourly_pct=r.get("hourly_pct"),
+             weekly_pct=r.get("weekly_pct"),
+             reset_h=(r.get("reset_h") or {}).get("iso"),
+             reset_w=(r.get("reset_w") or {}).get("iso"),
+             models_h=r.get("models_h"), models_w=r.get("models_w"))
+    # Pro-plan account: an extra monthly block (dollar limit); hourly/weekly = None.
+    if r.get("monthly"):
+        d.update(monthly_pct=r["monthly"].get("pct"),
+                 monthly_used=r["monthly"].get("used"),
+                 monthly_cap=r["monthly"].get("cap"),
+                 reset_m=(r.get("reset_m") or {}).get("iso"),
+                 models_m=r.get("models_m", []))
+    return d
+
+
+def render(out):
+    for r in out:
+        if r.get("error") and r.get("hourly_pct") is None:
+            print("%s: %s" % (r["browser"], r["error"]))
+            continue
+        print("%s (%s):" % (r["browser"], r.get("account") or "?"))
+        if r.get("hourly_pct") is not None and r.get("reset_h"):
+            print("  hourly:    %5s  (%s)"
+                  % (pct_str(r["hourly_pct"]), r["reset_h"]["left"]))
+        if r.get("weekly_pct") is not None and r.get("reset_w"):
+            print("  weekly:    %5s  (%s)" % (pct_str(r["weekly_pct"]),
+                                              r["reset_w"]["left"]))
+        for m, n in r.get("models_h", []):
+            print("    model %s: %s req (hourly)" % (m, n))
+        for m, n in r.get("models_w", []):
+            print("    model %s: %s req" % (m, n))
+        # Pro-plan account: a monthly dollar track instead of hourly/weekly.
+        if r.get("hourly_pct") is None and r.get("monthly"):
+            mm = r["monthly"]
+            left = (r.get("reset_m") or {}).get("left", "?")
+            print("  monthly: $%g of $%g  (%s)" % (mm["used"], mm["cap"], left))
+            for m, n in r.get("models_m", []):
+                print("    model %s: %s req (monthly)" % (m, n))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="ollama-usage",
+        description="ollama.com limit usage from browser sessions.")
+    ap.add_argument("--browser", choices=["firefox", "chromium", "firefox-developer", "all"],
+                    default="all", help="which session source (default: all)")
+    ap.add_argument("--json", action="store_true",
+                    help="the same result as JSON")
+    args = ap.parse_args()
+
+    browsers = (["firefox", "chromium", "firefox-developer"]
+                if args.browser == "all" else [args.browser])
+    out = [examine(b) for b in browsers]
+    if args.json:
+        print(json.dumps([slim(r) for r in out], indent=2, ensure_ascii=False))
+    else:
+        render(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

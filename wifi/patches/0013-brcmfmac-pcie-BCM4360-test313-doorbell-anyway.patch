@@ -1,0 +1,138 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 13/13] brcmfmac: pcie: BCM4360 test.313 olmsg doorbell-anyway
+
+Fire #6 (test.276+277+308+309+310+311+312, test278=0) exposed a DEADLOCK in
+the 0012 liveness gate, not a fix: after the wake the fw publishes its
+console (si[+0x010] -- the fw console was readable) but NEVER sets bit 8 on
+the mailbox (BAR0+0x48 / PCIMailBoxInt), because it waits for OUR first H2D
+doorbell. The gate waited for the fw to announce readiness, the fw waited
+for the host to ring the doorbell first -- both sides wait forever, the
+fire ends in a T309 hold with a frozen-but-console-alive fw (fire #6
+journal: gate timeout -> "fw not ready" -> T309 hold, mbxint=0 to the end).
+
+Statyka wl.ko resolves the stalemate: the HOST moves first. The fw_init
+poll is best-effort (~2 s) and the doorbell follows regardless of the poll
+outcome (notes/fw-watchdog-doorbell-static: wl.ko wlc_ol up-path does
+BAR0+0x48 |= 0x1 without waiting for bit 8). The 0012 gate treated a
+missing bit 8 as "fw frozen"; the truth is "fw has not been doorbelled
+yet" -- bit 8 (fw sbtopcimailbox=0x100 announcement) may only appear AFTER
+the first H2D doorbell.
+
+New module param bcm4360_test313_doorbell_anyway (default 0). When set, a
+test.312 gate TIMEOUT no longer takes the T309-hold / return -ETIMEDOUT
+path: it prints pr_emerg "test.313: gate timeout but doorbell ANYWAY (wl.ko
+pattern: fw_init poll is best-effort; protected by ASPM-off + CTO
+10-100ms)" and CONTINUES the normal doorbell path (RMW BAR0+0x48 |= 0x1 in
+bcm4360_olmsg_write). olmsg_fw_ready stays 0, but the gate-latch check
+(test.312: refuse every later doorbell when not ready) is overridden by
+test313 for every later dcmd too -- consistent with "doorbell ANYWAY".
+
+Risk accounting: with ASPM off + CTO 10-100 ms programmed by setpci on the
+root port 00:1c.2 and the endpoint 03:00.0 BEFORE the fire (config-space-
+research section 6: a stalling transaction recovers via CTO in <= 100 ms,
+non-fatal and invisible), ringing the doorbell of a frozen fw is accepted
+risk -- that is exactly the experiment: does the doorbell wake the fw
+(fire #6 showed a console-alive fw) or wedge the machine (fires #2/#4/#5
+died near the first mailbox RMW)?
+
+Bracketing (all test313-gated, pr_emerg): (1) immediately before the
+doorbell RMW -- "test.313: doorbell H2D RMW |=0x1 now", the last line if
+the doorbell kills the machine; (2) immediately after it -- "test.313:
+doorbell H2D done (seq=N) -- waiting D2H bit8 (rxctl, 5000 ms)"; (3) on the
+rxctl wait timeout -- "test.313: rxctl wait timeout after 5000 ms". The D2H
+wait is a waitqueue sleep (wait_event_interruptible_timeout, 5 s), so per
+the 0013 bracketing policy there are no iter prints -- the two endpoint
+prints (post-doorbell, post-timeout) are the bracket.
+
+~40 lines, olmsg branch only -- zero behaviour change for every other chip
+and for the msgbuf path, and zero change with test313=0 (default): the 0012
+gate keeps its T309-hold-on-timeout semantics.
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 39 insertions(+), 2 deletions(-)
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -242,6 +242,10 @@
+ module_param(bcm4360_test312_liveness_gate, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test312_liveness_gate, "BCM4360 test.312: olmsg liveness gate (spec: fw-watchdog-doorbell-static section d + config-space-research section 6; audit P5/P6). (a) post-poll select_core(PCIE2) skipped in the olmsg path -- PCIE2 regs sit at BAR0 offset 0 (wl.ko up-path does zero config-space writes; experiment #1: select_core is a no-op on this chip) and brcmf_pcie_attach() already selected PCIE2 pre-release on the LIVE device, so the post-poll config 0x80 cycle is redundant ammunition. (b) brcmf_pcie_request_irq: no absolute MAILBOXMASK:=0 in the olmsg path (wl.ko never writes 0 to 0x4C in the up-path) -- one RMW |=0x100 before request_threaded_irq instead. (c) LIVENESS GATE before the first H2D doorbell: poll BAR0+0x48 for bit 8 (fw sbtopcimailbox=0x100 announcement) every 50 ms, max 2 s; bit absent -> NO doorbell (bcmdhd dhd_doorbell_timeout / 'trying to ring the doorbell after D3 inform' pattern), T309 zero-teardown hold instead, error path to the 0009-gated fail label. Gated: chip 4360 + test308 (bcm4360_olmsg_active). (1=enable, 0=off)");
+ 
++static int bcm4360_test313_doorbell_anyway;
++module_param(bcm4360_test313_doorbell_anyway, int, 0644);
++MODULE_PARM_DESC(bcm4360_test313_doorbell_anyway, "BCM4360 test.313: doorbell ANYWAY on liveness-gate timeout (fire #6 showed the DEADLOCK: the fw publishes its console (si[+0x010]) after wake but NEVER sets BAR0+0x48 bit 8 because it waits for OUR first H2D doorbell -- the gate waits for fw, fw waits for host; statyka wl.ko says the host moves FIRST: the fw_init poll is best-effort ~2 s and the doorbell follows regardless). With test313=1, a test.312 gate TIMEOUT no longer takes the T309-hold/-ETIMEDOUT path: it prints 'gate timeout but doorbell ANYWAY (wl.ko pattern; protected by ASPM-off + CTO 10-100ms)' and CONTINUES the normal doorbell path (RMW BAR0+0x48 |= 0x1); olmsg_fw_ready stays 0 but test313 overrides the gate latch for every later dcmd too. Bracketing: pr_emerg immediately before the doorbell RMW (last line if the doorbell kills the machine) + pr_emerg right after it (waiting D2H bit8) + pr_emerg on the rxctl wait timeout. Risk accepted ONLY with ASPM off + CTO 10-100 ms programmed by setpci on root port 00:1c.2 and endpoint 03:00.0 BEFORE the fire (a stalling transaction then recovers via CTO in <=100 ms). (1=enable, 0=off)");
++
+ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4360_CHIP_ID, 0xFFFFFFFF, 4360),
+@@ -2245,6 +2249,20 @@
+ 			devinfo->olmsg_fw_ready = true;
+ 			pr_emerg("BCM4360 test.312: fw ALIVE (mbxint bit8 set, 0x%08x after %ums) -- ringing doorbell H2D\n",
+ 				 gate_val, gate_i * 50);
++		} else if (bcm4360_test313_doorbell_anyway) {
++			/* test.313: fire #6 DEADLOCK -- the fw publishes its
++			 * console (si[+0x010]) after wake but NEVER sets bit 8
++			 * on the mailbox, because it waits for OUR first H2D
++			 * doorbell; the gate waited for the fw, the fw waited
++			 * for the host. Statyka wl.ko: the host moves FIRST --
++			 * the fw_init poll is best-effort ~2 s and the
++			 * doorbell follows regardless. Ring it anyway; the
++			 * stalling read recovers via CTO (ASPM off + CTO
++			 * 10-100 ms set by setpci before the fire).
++			 * olmsg_fw_ready stays 0 -- the latch below lets the
++			 * doorbell through only because test313 overrides it
++			 * (also for every later dcmd). */
++			pr_emerg("BCM4360 test.313: gate timeout but doorbell ANYWAY (wl.ko pattern: fw_init poll is best-effort; protected by ASPM-off + CTO 10-100ms)\n");
+ 		} else {
+ 			pr_emerg("BCM4360 test.312: fw not ready (mbxint=0x%08x after 2s) -- T309 hold instead of doorbell\n",
+ 				 gate_val);
+@@ -2253,8 +2271,10 @@
+ 			return -ETIMEDOUT;
+ 		}
+ 	}
+-	if (bcm4360_test312_liveness_gate && !devinfo->olmsg_fw_ready) {
+-		/* Gate latched NOT-READY earlier -- never doorbell this fw. */
++	if (bcm4360_test312_liveness_gate && !devinfo->olmsg_fw_ready &&
++	    !bcm4360_test313_doorbell_anyway) {
++		/* Gate latched NOT-READY earlier -- never doorbell this fw
++		 * (test.313 overrides: doorbell ANYWAY is the whole point). */
+ 		brcmf_err(bus_if, "olmsg: fw not ready (test.312 gate latched) -- refusing doorbell\n");
+ 		return -ETIMEDOUT;
+ 	}
+@@ -2272,12 +2292,24 @@
+ 	if (bcm4360_test310_olmsg_poll_heartbeat)
+ 		pr_emerg("BCM4360 test.310: before first doorbell H2D (olmsg_write type=0x%x len=%u)\n",
+ 			 BCM4360_OLMSG_TYPE_CDC_DCMD, len);
++	/* test.313: bracket the doorbell RMW itself. THIS is the last line
++	 * if the doorbell kills the machine (fire #6: gate timeout, fw
++	 * frozen -- first MMIO mailbox RMW since ARM release). */
++	if (bcm4360_test313_doorbell_anyway)
++		pr_emerg("BCM4360 test.313: doorbell H2D RMW |=0x1 now\n");
+ 	ret = bcm4360_olmsg_write(devinfo, BCM4360_OLMSG_TYPE_CDC_DCMD,
+ 				  msg, len);
+ 	if (ret) {
+ 		devinfo->olmsg_resp_pending = false;
+ 		return ret;
+ 	}
++	/* test.313: doorbell landed -- the D2H answer is waited for in
++	 * rxctl's waitqueue (sleep), so per the 0013 bracketing policy the
++	 * only further print is the rxctl wait timeout (5 s). */
++	if (bcm4360_test313_doorbell_anyway)
++		pr_emerg("BCM4360 test.313: doorbell H2D done (seq=%u) -- waiting D2H bit8 (rxctl, %d ms)\n",
++			 devinfo->olmsg_seq,
++			 BCM4360_OLMSG_CTL_RESP_TIMEOUT_MS);
+ 	devinfo->olmsg_seq++;
+ 	return 0;
+ }
+@@ -2298,6 +2330,12 @@
+ 		msecs_to_jiffies(BCM4360_OLMSG_CTL_RESP_TIMEOUT_MS));
+ 	if (timeleft == 0) {
+ 		devinfo->olmsg_resp_pending = false;
++		/* test.313: the waitqueue slept the whole 5 s -- no iter
++		 * prints possible; this is the second bracketing print
++		 * after the post-doorbell one. */
++		if (bcm4360_test313_doorbell_anyway)
++			pr_emerg("BCM4360 test.313: rxctl wait timeout after %d ms (waiting D2H bit8 -- fw never answered)\n",
++				 BCM4360_OLMSG_CTL_RESP_TIMEOUT_MS);
+ 		brcmf_err(bus_if, "olmsg: ctl response timeout\n");
+ 		return -ETIMEDOUT;
+ 	}

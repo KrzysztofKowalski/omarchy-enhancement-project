@@ -1,0 +1,96 @@
+From 0019-nouveau-nvkm-object-init-guard Mon Sep 17 00:00:00 2001
+From: Krzysztof Kowalski <krzysztof7kowalski@gmail.com>
+Date: Tue, 1 Sep 2026 14:00:00 +0200
+Subject: [PATCH 0019/0019] nouveau: refuse object tree walk on objects without
+ a client (NULL deref in nvkm_object_init)
+
+MacBookPro11,3: writing "ON" to /sys/kernel/debug/vgaswitcheroo/switch
+after an S3 resume Oopsed the kernel in nvkm_object_init+0x23
+(NULL pointer deref at 0x88, rax=0):
+
+  vga_switchon -> nouveau_switcheroo_set_state(ON) -> nouveau_pmops_resume
+  -> nouveau_do_resume -> nvif_client_resume -> nvkm_object_init x4
+  -> nvkm_object_init+0x23: cmpl $0x3,0x88(%rax) with object->client == NULL
+
++0x23 is the inlined nvif_debug(object, "init running...") at the top of
+nvkm_object_init(): nvif_printk reads _object->client (nvkm_object+0x8) and
+then _client->debug (nvkm_client+0x88, after object(0x60) + name[32](0x20) +
+device(0x8)) unconditionally, before object->func->init is even looked at.
+The faulting object sat at depth 4 of the kernel client tree (client ->
+udevice -> uchan -> child); its ->client read 0.
+
+Every object that is legitimately reachable from a client tree is created by
+nvkm_ioctl_new() with oclass.client = client set, and the internal engine
+context objects (ectx) that are also walked by nvkm_object_init/fini borrow
+the creating client (nvkm_cgrp_ectx_get(): .client = client).  No nvkm code
+ever clears object->client after construction, so a NULL client here means
+the object is a stale/corrupted tree entry, not a live object.  On this
+machine the tree had survived months of switcheroo power ON/OFF pulses
+(raport 110: 242 power-ons/day) and a resume re-init was run with the GPU
+MMIO-unreachable ("timer: stalled at ffffffffffffffff"), at which point the
+walk hit memory that no longer held a live object.
+
+The oops itself is fatal in a particularly nasty way: it happens while the
+writer holds vgasr_mutex, the mutex is never released, and every later
+open/read of the vgaswitcheroo debugfs file wedges in D state forever -
+which is how a desktop daemon turned a GPU hiccup into frozen fans (raport
+114).
+
+Guard both entry points of the tree walk.  An object without a client can
+never be legally initialized or finalized, so return -ENODEV before the
+nvif_debug() deref instead of faulting.  The caller unwinds normally:
+nvkm_object_init() runs its fail_child/fini cleanup on the *parent* frame
+(list_for_each_entry_continue_reverse never re-touches the failed child),
+nouveau_do_resume() logs "Client resume failed with error: -19" and
+nouveau_pmops_resume() returns the error, so vgasr_mutex is released and
+user space gets a live kernel instead of a poisoned switcheroo.
+
+The guard is deliberately at the nvkm object-walk level (variant (b)) rather
+than in nouveau_do_resume()/nouveau_switcheroo_set_state() (variant (a)):
+there is no reliable "device is really there" oracle on this hardware
+(power_state, runtime_status and the PCI config space all lie on the
+half-on gmux state, raporty 63 and 114), so a caller-side state gate would
+be either too porous (oops still possible) or too strict (blocks legitimate
+resumes).  The walk-level guard covers every path that can reach a dead
+object: switcheroo ON after S3, power pulses, and any future resume path.
+
+Signed-off-by: Krzysztof Kowalski <krzysztof7kowalski@gmail.com>
+---
+ drivers/gpu/drm/nouveau/nvkm/core/object.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+--- a/drivers/gpu/drm/nouveau/nvkm/core/object.c
++++ b/drivers/gpu/drm/nouveau/nvkm/core/object.c
+@@ -149,6 +149,15 @@
+ 	s64 time;
+ 	int ret;
+ 
++	/*
++	 * Objects without a client are internal-only and must never reach the
++	 * client tree walk (see nvkm_object_init below); hitting one here
++	 * means the tree entry is stale, so bail out instead of dereferencing
++	 * object->client in the nvif_debug() macros.
++	 */
++	if (!object->client)
++		return -ENODEV;
++
+ 	switch (suspend) {
+ 	case NVKM_POWEROFF:
+ 	default:
+@@ -203,6 +212,16 @@
+ 	s64 time;
+ 	int ret;
+ 
++	/*
++	 * nvif_debug() dereferences object->client->debug unconditionally.
++	 * A live client-tree object always has ->client set (nvkm_ioctl_new
++	 * passes it through oclass), so a NULL here means a corrupted/stale
++	 * tree entry: refuse the walk with -ENODEV instead of Oopsing
++	 * (MacBookPro11,3 vgaswitcheroo power-on after S3, raport 114).
++	 */
++	if (!object->client)
++		return -ENODEV;
++
+ 	nvif_debug(object, "init running...\n");
+ 	time = ktime_to_us(ktime_get());
+ 	if (object->func->init) {

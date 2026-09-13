@@ -1,0 +1,143 @@
+From: OpenWiFi BCM4360 Project <bcm4360@localhost>
+Subject: [PATCH 9/9] brcmfmac: pcie: BCM4360 test.309 olmsg zero-teardown fail path
+
+BCM4360 experiment #4 (fire T308, olmsg transport) hard-wedged the host and
+forced a reboot: the journal ends on the phase-1 "Wait for FW init" line,
+the fw_init_done poll never emitted its terminal pr_emerg, and no fail-path
+line ever appeared -- the same silent, total wedge signature as experiment
+#1 (fire #2), which wedged on exactly the fail-path teardown
+(brcmf_fw_crashed + device_release_driver -> brcmf_pcie_remove ->
+intr_disable/synchronize_irq/release_irq/MAILBOXINT read+write/
+release_ringbuffers/reset_device(chip_set_passive + config-space rewrite)/
+release_resource). The teardown must never run on the test.308 fail path.
+
+Patch 0006 (test.307) already guards the ONE fail point that the msgbuf
+variant hits (the fw-init timeout of brcmf_pcie_download_fw_nvram). The
+olmsg variant never returns -ENODEV from download_fw_nvram (phase 1
+CONTINUEs), so its failures surface at the other goto-fail points of
+brcmf_pcie_setup(): brcmf_pcie_request_irq(), brcmf_attach(), and the early
+firmware/raminfo failures. Guard the shared "fail:" label instead: with the
+new module param bcm4360_test309_olmsg_zero_teardown (default 0), gated on
+bcm4360_olmsg_active() (test308=1 AND chip == BRCM_CC_4360_CHIP_ID), the
+fail path holds the device instead of tearing it down: MAILBOXMASK
+(BAR0+0x4C) := 0 so no IRQ can fire whether or not request_irq already ran
+(we deliberately do NOT free_irq -- that is teardown territory), then a 10 s
+passive 1 Hz poll of PCIMailBoxInt (BAR0+0x48) -- the identical wedge-free
+mechanism proven by test.307 on fire #3 (readback clean for 60 s) -- and a
+SUMMARY line, then return WITHOUT device_release_driver. The device stays
+bound (brcmf_pcie_probe already returned 0 via brcmf_fw_get_firmwares), no
+wiphy, no timers; nothing touches the device afterwards. Reboot clears the
+state -- do NOT rmmod (rmmod is teardown).
+
+NOTE: this does NOT make the phase-1 fw_init_done poll itself wedge-proof
+(fire T308 wedged inside that poll, before any fail path ran) -- it only
+guarantees that a later failure inside brcmf_pcie_setup() can never trigger
+the teardown wedge. See notes/experiment-4-fire-t308-crash.md for the
+wedge analysis and the next-fire plan.
+
+Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
+---
+ 1 files changed, 76 insertions(+), 0 deletions(-)
+--- a/brcmfmac/pcie.c
++++ b/brcmfmac/pcie.c
+@@ -211,6 +211,10 @@
+ module_param(bcm4360_test308_olmsg_cdc, int, 0644);
+ MODULE_PARM_DESC(bcm4360_test308_olmsg_cdc, "BCM4360 test.308: PCI-CDC (olmsg) transport, phase 1+2. Phase 1: replace the msgbuf sharedram-ptr handshake poll (TCM[ramsize-4], guaranteed -ENODEV on this fw) with a best-effort si[+0x2028] poll (1 ms x 2000, then CONTINUE), skip msgbuf shared-struct/ring setup, proto_type=BCDC. Phase 2: txctl/rxctl over the olmsg ring (T276 DMA buffer -- requires bcm4360_test276_shared_info=1), D2H drain in the threaded ISR on BAR0+0x48 bit 8, per-cycle mask BAR0+0x4C |= 0x100. txdata stays a stub until phase 3. Gated: only for chip 4360; all other chips keep the msgbuf path. (1=enable, 0=off)");
+ 
++static int bcm4360_test309_olmsg_zero_teardown;
++module_param(bcm4360_test309_olmsg_zero_teardown, int, 0644);
++MODULE_PARM_DESC(bcm4360_test309_olmsg_zero_teardown, "BCM4360 test.309: olmsg zero-teardown fail path. When the test.308 (olmsg) variant fails anywhere in brcmf_pcie_setup() (fw-init, IRQ, attach), the fail path must NOT run the teardown (brcmf_fw_crashed + device_release_driver -> brcmf_pcie_remove -> chip_set_passive/reset_device/release_*): fire T308 wedged the host hard, and experiment #1 wedged exactly on this teardown. Instead: MAILBOXMASK (BAR0+0x4C):=0 (no IRQ can fire), a 10 s passive 1 Hz poll of PCIMailBoxInt (BAR0+0x48), log SUMMARY, and return -- the device stays bound (brcmf_pcie_probe already returned 0), no wiphy. Reboot clears state -- do NOT rmmod. Gated: chip 4360 + test308 (bcm4360_olmsg_active). (1=enable, 0=off)");
++
+ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4360_CHIP_ID, 0xFFFFFFFF, 4360),
+@@ -991,6 +995,67 @@
+ 		 max_val, last);
+ }
+ 
++/* BCM4360 test.309: olmsg zero-teardown hold -- replacement for the
++ * fail-path teardown of brcmf_pcie_setup() when the test.308 (olmsg)
++ * variant is active. The upstream fail path (brcmf_pcie_bus_console_read
++ * + brcmf_fw_crashed + device_release_driver -> brcmf_pcie_remove ->
++ * intr_disable/synchronize_irq/release_irq/read+write MAILBOXINT/
++ * release_scratchbuffers/release_ringbuffers/reset_device(chip_set_passive
++ * + full config-space rewrite)/release_resource) wedged the host in
++ * experiment #1, and fire T308 (experiment #4) hard-wedged the host in the
++ * phase-1 fw_init_done poll window itself. The discipline is the proven
++ * test.307 one: NO teardown -- the device stays bound (brcmf_pcie_probe
++ * already returned 0 via brcmf_fw_get_firmwares, so unbinding is the only
++ * thing that would tear it down), MBM:=0 so no IRQ can fire regardless of
++ * whether request_irq already ran, and a short passive 1 Hz poll of
++ * PCIMailBoxInt (BAR0+0x48) -- the same wedge-free mechanism as test.307
++ * (readback on fire #3 was clean for 60 s). No wiphy, no timers after the
++ * hold; nothing touches the device afterwards. Reboot clears the state
++ * (rmmod would teardown -- do NOT rmmod). */
++#define BCM4360_T309_POLL_SECONDS	10
++static void bcm4360_t309_olmsg_zero_teardown_hold(struct brcmf_pciedev_info *devinfo,
++						  int fail_ret)
++{
++	u32 prev = 0, val = 0;
++	u32 max_val = 0, last = 0;
++	u32 mbm;
++	int changed_reads = 0;
++	bool bit8_seen = false;
++	int i;
++
++	pr_emerg("BCM4360 test.309: ENTER olmsg zero-teardown hold (setup fail ret=%d state=%d irq_allocated=%d olmsg_buf=%d; device stays bound, NO teardown: no device_release_driver, no chip_set_passive, no reset_device)\n",
++		 fail_ret, devinfo->state,
++		 devinfo->irq_allocated ? 1 : 0,
++		 devinfo->t276_olmsg_buf ? 1 : 0);
++	/* Same MBM mechanism as test.307/intr_disable (BAR0+0x4C) -- the only
++	 * MMIO in this hold, proven safe on fire #3 (write+readback landed).
++	 * If request_irq already ran, the handler stays registered but the
++	 * mask keeps the line quiet; we deliberately do NOT free_irq (that
++	 * is teardown territory). */
++	brcmf_pcie_write_reg32(devinfo, devinfo->reginfo->mailboxmask, 0);
++	mbm = brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->mailboxmask);
++	pr_emerg("BCM4360 test.309: MAILBOXMASK:=0 readback=0x%08x (expect 0x0 -- bit8 FN0_0 masked, no IRQ can fire)\n",
++		 mbm);
++
++	for (i = 1; i <= BCM4360_T309_POLL_SECONDS; i++) {
++		val = brcmf_pcie_read_reg32(devinfo,
++					    BRCMF_PCIE_PCIE2REG_MAILBOXINT);
++		if ((i == 1) || (val != prev))
++			changed_reads++;
++		if (val > max_val)
++			max_val = val;
++		last = val;
++		if (val & BRCMF_PCIE_MB_INT_FN0_0)
++			bit8_seen = true;
++		prev = val;
++		msleep(1000);
++	}
++	pr_emerg("BCM4360 test.309: SUMMARY fail_ret=%d reads=%d changed_reads=%d bit8_seen=%d max=0x%08x last=0x%08x state=%d irq_allocated=%d -- device held (bound, MBM=0, no wiphy); reboot clears state, do NOT rmmod\n",
++		 fail_ret, BCM4360_T309_POLL_SECONDS, changed_reads,
++		 bit8_seen ? 1 : 0, max_val, last, devinfo->state,
++		 devinfo->irq_allocated ? 1 : 0);
++}
++
+ /* ==== BCM4360 test.308: olmsg transport (phase 2) ====
+  * H2D ring: host appends {type, seq, len} + payload at H2D_DATA_OFF + w,
+  * publishes the new wr_ptr into the ring header (+0x0C), then doorbells
+@@ -3265,6 +3330,21 @@
+ 
+ fail:
+ 	brcmf_err(bus, "Dongle setup failed\n");
++	if (bcm4360_test309_olmsg_zero_teardown &&
++	    bcm4360_olmsg_active(devinfo)) {
++		/* T309: olmsg zero-teardown. Any failure of the test.308
++		 * variant inside brcmf_pcie_setup() (fw init, IRQ, attach)
++		 * must NOT run the teardown -- device_release_driver ->
++		 * brcmf_pcie_remove does chip_set_passive/reset_device/
++		 * release_* MMIO against a live-or-dying fw, which wedged
++		 * the host in experiment #1. Hold the device instead: mask
++		 * all IRQ, passive 10 s poll of BAR0+0x48, then return
++		 * WITHOUT teardown -- the probe already returned 0, so the
++		 * device stays bound; reboot clears the state (rmmod would
++		 * teardown). */
++		bcm4360_t309_olmsg_zero_teardown_hold(devinfo, ret);
++		return;
++	}
+ 	brcmf_pcie_bus_console_read(devinfo, true);
+ 	brcmf_fw_crashed(dev);
+ 	device_release_driver(dev);

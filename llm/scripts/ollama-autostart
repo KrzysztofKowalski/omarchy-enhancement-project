@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Autostart `ollama serve` (the ol-has build) as a systemd --user unit.
+# Subcommands: install | uninstall | start | stop | restart | status
+set -euo pipefail
+
+UNIT_NAME="ollama-olhas.service"
+UNIT_DIR="$HOME/.config/systemd/user"
+UNIT_PATH="$UNIT_DIR/$UNIT_NAME"
+OLLAMA_BIN="${OLLAMA_BIN:-$HOME/Projects/ol-has/ollama/ollama}"
+HOST="127.0.0.1:11434"
+PORT="11434"
+SCREEN_NAME="ollama-serve"
+
+info() { printf 'info: %s\n' "$*"; }
+err()  { printf 'err: %s\n' "$*" >&2; }
+
+# Is port 11434 busy? (read-only, we never kill anything)
+port_busy() {
+  ss -ltn "sport = :$PORT" 2>/dev/null | grep -q ":$PORT"
+}
+
+# Is a screen session named ollama-serve already running? (read-only)
+screen_session_exists() {
+  screen -ls 2>/dev/null | grep -q "[.]$SCREEN_NAME([[:space:]]"
+}
+
+cmd_install() {
+  if [[ ! -x "$OLLAMA_BIN" ]]; then
+    err "binary missing: $OLLAMA_BIN (build the project first)"
+    exit 1
+  fi
+
+  mkdir -p "$UNIT_DIR"
+  # Unit written idempotently (always overwrite).
+  # Type=forking: `screen -dm` detaches and exits; ollama serve runs inside the
+  # $SCREEN_NAME session (the user can `screen -r $SCREEN_NAME` and see logs).
+  cat >"$UNIT_PATH" <<EOF
+[Unit]
+Description=Ollama (ol-has build, gateway $PORT, in screen $SCREEN_NAME)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/screen -dmS $SCREEN_NAME env OLLAMA_HOST=$HOST $OLLAMA_BIN serve
+RemainAfterExit=yes
+Environment=HOME=%h
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable "$UNIT_NAME"
+  info "unit installed and enabled: $UNIT_PATH"
+
+  # Start only when the port is free AND there is no $SCREEN_NAME session;
+  # a running process/screen is our build — leave it alone.
+  if port_busy; then
+    info "port $PORT busy — not starting; enable will take effect at next login"
+  elif screen_session_exists; then
+    info "screen session '$SCREEN_NAME' already exists — not starting (no server duplication)"
+  else
+    systemctl --user start "$UNIT_NAME"
+    info "port $PORT free, no '$SCREEN_NAME' session — unit started (server in screen)"
+  fi
+}
+
+cmd_uninstall() {
+  # disable --now kills the unit's cgroup: screen $SCREEN_NAME + its child (ollama serve).
+  # PIDs are not touched manually.
+  systemctl --user disable --now "$UNIT_NAME" 2>/dev/null || true
+  rm -f "$UNIT_PATH"
+  systemctl --user daemon-reload
+  info "unit removed: $UNIT_PATH"
+}
+
+# Port held by a foreign process? (unit inactive, so not our screen)
+port_foreign() {
+  port_busy && ! systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null
+}
+
+cmd_start() {
+  if port_foreign; then
+    err "port $PORT used by another process and unit '$UNIT_NAME' is inactive — I kill nothing"
+    err "close/kill that process manually and retry: $0 start"
+    exit 1
+  fi
+  systemctl --user start "$UNIT_NAME"
+  info "unit started — ollama serve runs in screen '$SCREEN_NAME' (enter: screen -r $SCREEN_NAME)"
+}
+
+cmd_stop() {
+  # stop kills the unit's cgroup: screen $SCREEN_NAME + its child (ollama serve)
+  systemctl --user stop "$UNIT_NAME"
+  info "unit stopped (screen '$SCREEN_NAME' + ollama serve killed via cgroup)"
+}
+
+cmd_restart() {
+  if port_foreign; then
+    err "port $PORT used by another process and unit '$UNIT_NAME' is inactive — I kill nothing"
+    err "close/kill that process manually and retry: $0 restart"
+    exit 1
+  fi
+  systemctl --user restart "$UNIT_NAME"
+  info "unit restarted — ollama serve runs in screen '$SCREEN_NAME'"
+}
+
+cmd_status() {
+  if [[ -f "$UNIT_PATH" ]]; then
+    info "unit file exists: $UNIT_PATH"
+  else
+    info "no unit file: $UNIT_PATH"
+  fi
+  printf 'enabled: %s\n' "$(systemctl --user is-enabled "$UNIT_NAME" 2>/dev/null || echo no)"
+  printf 'active:  %s\n' "$(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || echo no)"
+  if port_busy; then
+    info "port $PORT: busy"
+  else
+    info "port $PORT: free"
+  fi
+
+  # The $SCREEN_NAME screen session and whether ollama serve runs inside it.
+  local sess_line
+  sess_line="$(screen -ls 2>/dev/null | grep "[.]$SCREEN_NAME([[:space:]]" || true)"
+  if [[ -n "$sess_line" ]]; then
+    info "screen session '$SCREEN_NAME': present ($sess_line)"
+    local pid
+    pid="$(pgrep -f "screen.*[S] $SCREEN_NAME" | head -1 || true)"
+    local ollama_in
+    ollama_in="$(pgrep -af "ollama serve" | grep -v pgrep || true)"
+    if [[ -n "$ollama_in" && -n "$pid" ]] && ps -o ppid= -p "${ollama_in%% *}" 2>/dev/null | grep -q "$(ps -o pid= --ppid "$pid" 2>/dev/null | head -1 | tr -d ' ')"; then
+      info "running in '$SCREEN_NAME' session: ${ollama_in}"
+    elif [[ -n "$ollama_in" ]]; then
+      info "ollama serve is running (PID check via cgroup/screen ambiguous): ${ollama_in}"
+    else
+      info "session '$SCREEN_NAME' exists, but no 'ollama serve' detected"
+    fi
+  else
+    info "screen session '$SCREEN_NAME': absent"
+    local any_serve
+    any_serve="$(pgrep -af "ollama serve" | grep -v pgrep || true)"
+    if [[ -n "$any_serve" ]]; then
+      info "note: 'ollama serve' runs outside the '$SCREEN_NAME' session: $any_serve"
+    fi
+  fi
+
+  systemctl --user status "$UNIT_NAME" --no-pager -n 3 2>/dev/null || true
+}
+
+case "${1:-}" in
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  restart)   cmd_restart ;;
+  status)    cmd_status ;;
+  *)
+    err "usage: $0 {install|uninstall|start|stop|restart|status}"
+    exit 2
+    ;;
+esac

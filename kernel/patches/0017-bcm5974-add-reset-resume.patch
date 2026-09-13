@@ -1,0 +1,44 @@
+From 9f1c3a2b4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a Mon Sep 17 00:00:00 2001
+From: Omarchy Workshop <workshop@omarchy.local>
+Date: Sun Aug 31 11:57:00 2026 +0200
+Subject: [PATCH] Input: bcm5974 - handle reset_resume for Wellspring trackpad
+
+---
+
+--- a/drivers/input/mouse/bcm5974.c
++++ b/drivers/input/mouse/bcm5974.c
+@@ -920,6 +920,26 @@
+ 	return 0;
+ }
+ 
++static int bcm5974_reset_resume(struct usb_interface *iface)
++{
++	struct bcm5974 *dev = usb_get_intfdata(iface);
++
++	guard(mutex)(&dev->pm_mutex);
++
++	/*
++	 * A full USB reset (triggered by USB_QUIRK_RESET_RESUME) brings the device
++	 * back into HID mode, so the Wellspring mode switch inside
++	 * bcm5974_start_traffic() must run even if last_mode_reset is recent
++	 * (1 s cooldown from the mode_reset_work self-heal path).
++	 */
++	dev->last_mode_reset = 0;
++
++	if (dev->opened)
++		return bcm5974_start_traffic(dev);
++
++	return 0;
++}
++
+ static int bcm5974_probe(struct usb_interface *iface,
+ 			 const struct usb_device_id *id)
+ {
+@@ -1057,6 +1077,7 @@
+ 	.disconnect		= bcm5974_disconnect,
+ 	.suspend		= bcm5974_suspend,
+ 	.resume			= bcm5974_resume,
++	.reset_resume		= bcm5974_reset_resume,
+ 	.id_table		= bcm5974_table,
+ 	.supports_autosuspend	= 1,
+ };
