@@ -23,7 +23,7 @@ proprietary AEC paths with open implementations.
 | [`wifi/`](wifi/) | BCM4360: **brcmfmac** patch series (open replacement for the proprietary `wl`), build against the module kernel, test/fire scripts |
 | [`touchpad/`](touchpad/) | Sleep/resume-dead bcm5974 touchpad — system-sleep hook (rebinds the module); kernel fix lives in `kernel/` (0016–0018) |
 | [`audio/`](audio/) | Bluetooth speaker "Zielony Krasnal": RUNNING sink but silence — dummy AVRCP player for WirePlumber; plus a GStreamer audio-preview fix |
-| [`mikrofon/`](mikrofon/) | Mic in Discord on Chromium: wrong default source (A2DP has no mic) — fix description |
+| [`mic/`](mic/) | Mic in Discord on Chromium: wrong default source (A2DP has no mic) — fix description |
 | [`theme/`](theme/) | **4 Omarchy 4 themes** — [`las`](theme/las/), [`ogien`](theme/ogien/), [`ciemny-las`](theme/ciemny-las/), [`ciemny-ogien`](theme/ciemny-ogien/) + variant tooling |
 | [`aec/`](aec/) | `pw-aec-avx` — on-demand acoustic echo cancellation backend for PipeWire (NLMS, AVX2/FMA) |
 | [`music/`](music/) | Music production on Omarchy — Reason 14 + Native Instruments under Wine, bridged into Ardour (Wine + ASIO + yabridge) |
