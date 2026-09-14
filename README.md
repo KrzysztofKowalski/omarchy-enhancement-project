@@ -1,5 +1,7 @@
 # omarchy-enhancement-project
 
+## WORK IN PROGRESS
+
 A collection of enhancements for **Omarchy on a MacBook Pro Late 2013**
 ([MacBookPro11,3 at EveryMac](https://everymac.com/ultimate-mac-lookup/?identify=MacBookPro11,3)):
 hybrid Intel Iris Pro 5200 (`8086:0d26`) + NVIDIA GT 750M (Kepler, GK107M),
