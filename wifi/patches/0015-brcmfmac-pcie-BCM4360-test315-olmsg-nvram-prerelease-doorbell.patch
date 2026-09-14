@@ -1,115 +1,116 @@
 From: OpenWiFi BCM4360 Project <bcm4360@localhost>
 Subject: [PATCH 15/15] brcmfmac: pcie: BCM4360 test.315 olmsg R3a NVRAM + pre-release doorbell
 
-Fire #8 (0001-0014) przeszedl CZYSTO i przyniosl najglebszy dowod do tej
-pory: transport hosta jest POPRAWNY, a problem siedzi WE FW -- SB intmask
-=0x00000000 (fw nigdy nie uzbroil przerwan), ring rd_ptr=0 (fw nie
-dotknelo ringa), konsola stoi 637 B. Statyka bootu
-(notes/fw-boot-stall-analysis.md) namierzyla stop w kaskadzie
-wlc_bmac_attach/PHY-descent: NASZE poprawne vars (boardtype=0x0552 z
-brcmfmac4360-pcie.txt) otwieraja fw droge w FullMAC D11/PHY init, ktora
-nigdy sie nie konczy. SB intmask=0 w fire #8 to EFEKT stopu, nie
-przyczyna -- jedyny pisarz intmask w obrazie fw to pciedngl_intrs_on
-(fw uzbraja sie SAMO, po ogloszeniu bitu 8, na sciezce open urzadzenia
-dngl -- PO powrocie wl_probe). fw_init_done (si+0x2028) nie ma pisarza
-w obrazie.
+Fire #8 (0001-0014) passed CLEAN and brought the deepest evidence to
+date: the host transport is CORRECT and the problem sits IN THE FW -- SB
+intmask =0x00000000 (the fw never armed interrupts), ring rd_ptr=0 (the
+fw never touched the ring), console stuck at 637 B. The boot statics
+(the fw boot-stall analysis notes) pinpointed the stop in the
+wlc_bmac_attach/PHY-descent cascade: OUR correct vars (boardtype=0x0552
+from brcmfmac4360-pcie.txt) open the fw a path into the FullMAC D11/PHY
+init that never ends. SB intmask=0 in fire #8 is the EFFECT of the
+stop, not the cause -- the only intmask writer in the fw image is
+pciedngl_intrs_on (the fw arms itself, after announcing bit 8, on the
+dngl device-open path -- AFTER wl_probe returns). fw_init_done
+(si+0x2028) has no writer in the image.
 
-Korekta kimptoca (notes/kimptoc-test28-comparison.md): w test.28
-jedyny moment w CALYM projekcie, gdy fw odpowiedzialo hostowi
-doorbellami (intstatus=0x300, mailboxint=0x03), to PRE-RELEASE H2D
-doorbell -- MAILBOXINT:=0xFFFFFFFF zapisany w pcie_mask_irqs PRZED
-zwolnieniem ARM, przy rdzeniu w reset/halt. Tamto fw nie mialo NVRAM
-(bmac_attach err 15 -> TRAP) i mialo BM-off, a mimo to zylo dalej w
-dngl/offload i poslalo 2 sygnaly. Doorbell do zamrozonego WFI = martwa
-sciezka (nasze fire #6/#7 + kimptoc T279). Nieprzetestowana kombinacja
-z pozytywnym precedensem jest wiec jedna: R3a (NVRAM bez boardtype ->
-fw zostaje w dngl/offload, ogloszenie bitu 8, samouzbrojenie intmask,
-adresat kanalu olmsg -- pivot BCM_OL, pelny MAC na hostie) + P1
-(doorbell w oknie bootu, nie do WFI).
+Kimptoc correction (the kimptoc test.28 comparison notes): in test.28
+the ONLY moment in the WHOLE project when the fw answered the host with
+doorbells (intstatus=0x300, mailboxint=0x03) was a PRE-RELEASE H2D
+doorbell -- MAILBOXINT:=0xFFFFFFFF written in pcie_mask_irqs BEFORE
+the ARM release, with the core in reset/halt. That fw had no NVRAM
+(bmac_attach err 15 -> TRAP) and was BM-off, yet it lived on in
+dngl/offload and sent 2 signals. A doorbell to a frozen WFI is a dead
+path (our fires #6/#7 + kimptoc T279). The untested combination with a
+positive precedent is therefore just one: R3a (NVRAM without boardtype,
+the fw stays in dngl/offload, announces bit 8, arms intmask itself,
+the olmsg channel gets an addressee -- BCM_OL pivot, full MAC on the
+host) + P1 (a doorbell in the boot window, not to a WFI).
 
-Latka 0015 (parametry bcm4360_test315 -- master switch, bcm4360_test315_db_val
-i bcm4360_test315_no_master; test315=0 domyslnie -> latka inerta -- zero
-roznicy behawioralnej, jak wszystkie poprzednie):
+Patch 0015 (parameters bcm4360_test315 -- master switch,
+bcm4360_test315_db_val and bcm4360_test315_no_master; test315=0 by
+default -> inert patch -- zero behavioural difference, like all the
+previous ones):
 
-a) R3a: strip zmiennej "boardtype" z NVRAM vars. vars NIE sa tablica
-   w pcie.c -- realny kod: bufor vars przychodzi do
-   brcmf_pcie_download_fw_nvram z brcmf_fw_nvram_strip (firmware.c) z
-   pliku brcmfmac4360-pcie.txt; format: wpisy "klucz=wartosc" NUL-
-   terminated, zero-pad do granicy 4 B, na koncu 4-bajtowy token
-   (token = (~len/4)<<16 | len/4, firmware.c). Strip dziala W MIEJSCU
-   na wejsciu download_fw_nvram -- PRZED dwoma konsumentami: kopie
-   TCM (adres = rambase+ramsize-nvram_len, token laduje na
-   TCM[ramsize-4]) i przed snapshotem test276 (+0x020 varsz,
-   +0x024..0x033 vars16). Kompaktacja in-place z pominieciem wpisu
-   "boardtype=", pozostale vars zachowane bajt-po-bajcie, pad i token
-   przeliczone wzorem firmware.c; bufor tylko maleje (bufor parsera
-   jest wiekszy niz stripniety rozmiar). varsz maleje, vars16
-   (pierwsze 16 B = "sromrev=11\0boardt") pozostaje sensowne. fw bez
-   boardtype -> wlc_bmac_attach err 15 (print "Unsupported Broadcom
-   board type (0x%08x)", test.33) -> dngl/offload zyje dalej:
-   ogloszenie sbtopcimailbox=0x100 (host widzi BAR0+0x48 bit 8 --
-   liveness gate ZADZIALA), pciedngl_intrs_on uzbraja SB intmask
-   0x100, kanal olmsg ma adresata (wl-split/BCM_OL).
+a) R3a: strip the "boardtype" variable from the NVRAM vars. The vars
+   are NOT a table in pcie.c -- the real code: the vars buffer reaches
+   brcmf_pcie_download_fw_nvram from brcmf_fw_nvram_strip (firmware.c)
+   out of the brcmfmac4360-pcie.txt file; format: "key=value" entries
+   NUL-terminated, zero-padded to a 4 B boundary, with a 4 B end token
+   at the end (token = (~len/4)<<16 | len/4, firmware.c). The strip
+   works IN PLACE at the download_fw_nvram entry -- BEFORE the two
+   consumers: the TCM copy (address = rambase+ramsize-nvram_len, the
+   token lands at TCM[ramsize-4]) and before the test276 snapshot
+   (+0x020 varsz, +0x024..0x033 vars16). In-place compaction that
+   drops the "boardtype=" entry, the remaining vars are preserved byte
+   for byte, the pad and token are recomputed with the firmware.c
+   formula; the buffer only shrinks (the parser buffer is larger than
+   the stripped size). varsz shrinks, vars16 (the first 16 B =
+   "sromrev=11\0boardt") stays sensible. fw without boardtype ->
+   wlc_bmac_attach err 15 (prints "Unsupported Broadcom board type
+   (0x%08x)", test.33) -> dngl/offload lives on: announces
+   sbtopcimailbox=0x100 (the host sees BAR0+0x48 bit 8 -- the liveness
+   gate WORKED), pciedngl_intrs_on arms SB intmask 0x100, the olmsg
+   channel has an addressee (wl-split/BCM_OL).
 
-b) P3: odczyt read-only MAILBOXMASK (BAR0+0x4C) PRZED
-   brcmf_chip_set_active, przy ARM w halt (reset-state fw) --
-   odtworzenie anomalii A0 kimptoca (T284: readback 0x318
-   pre-set_active, 0 post-set_active) na naszym substracie.
+b) P3: read-only MAILBOXMASK (BAR0+0x4C) read BEFORE
+   brcmf_chip_set_active, with the ARM in halt (reset-state fw) --
+   reproducing the kimptoc anomaly A0 (T284: readback 0x318
+   pre-set_active, 0 post-set_active) on our substrate.
 
-c) P1: miedzy zapisem shared_info (test276 handshake) a
+c) P1: between the shared_info write (test276 handshake) and
    brcmf_chip_set_active -- PLAIN write MAILBOXINT (BAR0+0x48) :=
-   bcm4360_test315_db_val (domyslnie 0xFFFFFFFF = dokladny wzorzec
-   kimptoca z test.28; warianty do pozniejszych fire'ow: 0x1 =
-   TOSB_FN0_0, 0x3 = FN0_0|FN0_1). To NIE RMW |= (jak 0008/0013) --
-   plain write, dokladnie jak u kimptoca. Bracketing pr_emerg przed
-   zapisem (ostatnia linia, gdyby zapis zabil maszyne) i po zapisem
-   + odczyt kontrolny (klasa 0014(a): czy write zlatchowal, czy
-   skonsumowany).
+   bcm4360_test315_db_val (default 0xFFFFFFFF = the exact kimptoc
+   pattern from test.28; variants for later fires: 0x1 = TOSB_FN0_0,
+   0x3 = FN0_0|FN0_1). This is NOT an RMW |= (like 0008/0013) -- a
+   plain write, exactly as in kimptoc. pr_emerg bracketing before the
+   write (the last line if the write kills the machine) and after the
+   write + a control readback (class 0014(a): whether the write
+   latched or was consumed).
 
-d) DYSKRYMINATOR: BEZPOSREDNIO PO brcmf_chip_set_active -- grupa
-   pojedynczych windowed odczytow z bracketingiem (klasa
-   T276-poll/T312-gate/0014-autopsja, udowodniona na zywym urzadzeniu
-   w #6/#7): SB intstatus (BAR0+0x20), SB intmask (BAR0+0x24),
-   MAILBOXINT (0x48), MAILBOXMASK (0x4C) + konsola fw (mechanizm
-   test277: wskaznik struktury z si[+0x010], wr_idx na struct+0x08),
-   a nastepnie JEDNA linia pr_emerg
-   "DISCRIMINATOR intstatus=0x.. intmask=0x.. mbint=0x.. mbmask=0x..
-   console_wr=0x..". Odczyt rozstrzygajacy calego fire'a #9, biegnie
-   ZAWSZE (przed gate'em test.312 i przed jakimkolwiek doorbellem
-   sciezki 0012/0013). Dyskryminator sukcesu: intstatus ~0x300
-   (zalatchowane bity doorbell D2H -- kimptoc test.28) i/lub intmask
-   0x100 (pciedngl_intrs_on -- jedyny pisarz fw-side) i/lub wr_idx
-   >0x27d (637). Porazka: intmask 0 + wr_idx 0x27d = zamrozone WFI
-   fire'ow #6-#8. Niepoprawny wskaznik konsoli (0 przy t~0 -- fw
-   publikuje go ~10 ms pozniej) pomija tylko drugi odczyt TCM; linia
-   DISCRIMINATOR drukuje sie zawsze.
+d) DISCRIMINATOR: IMMEDIATELY AFTER brcmf_chip_set_active -- a group
+   of single windowed reads bracketed (class
+   T276-poll/T312-gate/0014-autopsy, proven on the live device in
+   #6/#7): SB intstatus (BAR0+0x20), SB intmask (BAR0+0x24),
+   MAILBOXINT (0x48), MAILBOXMASK (0x4C) + the fw console (test277
+   mechanism: struct pointer from si[+0x010], wr_idx at struct+0x08),
+   then ONE pr_emerg line "DISCRIMINATOR intstatus=0x.. intmask=0x..
+   mbint=0x.. mbmask=0x.. console_wr=0x..". The deciding read of the
+   whole fire #9, runs ALWAYS (before the test.312 gate and before any
+   0012/0013 doorbell). Success discriminator: intstatus ~0x300
+   (latched D2H doorbell bits -- kimptoc test.28) and/or intmask 0x100
+   (pciedngl_intrs_on -- the only fw-side writer) and/or wr_idx
+   >0x27d (637). Failure: intmask 0 + wr_idx 0x27d = the frozen WFI of
+   fires #6-#8. An invalid console pointer (0 at t~0 -- the fw
+   publishes it ~10 ms later) skips only the second TCM read; the
+   DISCRIMINATOR line always prints.
 
-e) P4: bcm4360_test315_no_master=1 -- pomin pci_set_master (tylko
-   chip 4360, master switch wymagany) -- kontrola, czy reakcja fw
-   wymaga bus mastera/DMA (kimptoc test.28 bieg z BM-off).
+e) P4: bcm4360_test315_no_master=1 -- skip pci_set_master (chip 4360
+   only, the master switch is required) -- control for whether the fw
+   reaction needs bus mastering/DMA (kimptoc test.28 ran BM-off).
 
-f) Gate 0012 nietkniety. test313 (doorbell-anyway) jawnie NIE jest
-   czescia tego testu: przy timeoutie gate'u (fw nadal zamrozone)
-   sciezka idzie w T309 hold -- to jest POPRAWNA odpowiedz testu
-   (doorbell do zamrozonego WFI to martwa sciezka, fire #7 + T279).
-   test314 zostaje osobnym parametrem: fire #9 ustawi test314=1, zeby
-   autopsja biegla, gdyby gate przeszedl a rxctl umarl.
+f) Gate 0012 untouched. test313 (doorbell-anyway) is explicitly NOT
+   part of this test: on a gate timeout (fw still frozen) the path
+   goes into the T309 hold -- that IS the correct test answer (a
+   doorbell to a frozen WFI is a dead path, fire #7 + T279). test314
+   stays a separate parameter: fire #9 will set test314=1 so the
+   autopsy runs if the gate passed and rxctl died.
 
-Bezpieczenstwo (narzucone przez wedgi #4/#5): wszystkie nowe operacje
-MMIO to pojedyncze odczyty/zapisy windowed (zero petli), kazdy
-bracketed pr_emerg przed/po (wzorzec test.310/311/314); klasa odczytow
-BAR0 post-release = T276-poll/T312-gate/0014 (proven live w #6/#7),
-klasa BAR0 pre-release = experiment #1 fire 2 (T305 zapis+readback
-MAILBOXMASK pre-set_active, WRITE_LANDED). R3a to czysty CPU (host RAM,
-zero MMIO). JEDEN nowy zapis MMIO = pre-release doorbell (tylko przy
-test315=1) -- w oknie, gdy ARM jest w halt (najbezpieczniejszy moment;
-kimptoc robil to w pelnym cyklu release). test315=0 (domyslnie) =>
-zero roznic kodowej i behawioralnej (nowe parametry czytane wylacznie
-pod master switchem, domyslnie 0 -> wszystkie if'y falszywe). T309,
-gate 0012 i test314 nietkniete (nic nie doklada w teardown).
+Safety (imposed by wedges #4/#5): all new MMIO operations are single
+windowed reads/writes (zero loops), each bracketed by pr_emerg before/
+after (pattern test.310/311/314); the post-release BAR0 read class =
+T276-poll/T312-gate/0014 (proven live in #6/#7), the pre-release BAR0
+class = experiment #1 fire 2 (T305 MAILBOXMASK write + readback
+pre-set_active, WRITE_LANDED). R3a is pure CPU (host RAM, zero MMIO).
+ONE new MMIO write = pre-release doorbell (only with test315=1) -- in
+the window where the ARM is in halt (safest moment; kimptoc did it in a
+full release cycle). test315=0 (default) => zero code and behavioural
+difference (the new parameters are read solely under the master switch,
+default 0 -> all ifs false). T309, gate 0012 and test314 untouched
+(nothing added in teardown).
 
-Wymaga: test276=1 + test308=1 (pelny pipeline fire #9); fire tylko po
-setpci ASPM-off + CTO 10-100 ms na zywym urzadzeniu.
+Requires: test276=1 + test308=1 (full fire #9 pipeline); fire only with
+setpci ASPM-off + CTO 10-100 ms on the live device.
 
 ~250 lines, gated on chip 4360 + test315 -- zero behaviour change for
 every other chip and for the msgbuf path.
@@ -127,7 +128,7 @@ Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
 + * MAILBOXINT (BAR0+0x48) := 0xFFFFFFFF as a PLAIN write BEFORE the ARM
 + * release (inside pcie_mask_irqs, while the core was halted) -- the ONLY
 + * moment in the whole project when the fw ever answered (intstatus=0x300,
-+ * mailboxint=0x03, console 1404 B, notes/kimptoc-test28-comparison.md
++ * mailboxint=0x03, console 1404 B, the kimptoc test.28 comparison notes
 + * sec.1/4-H1). Variants for later fires: 0x1 (TOSB_FN0_0), 0x3
 + * (FN0_0|FN0_1). */
 +#define BCM4360_T315_DB_VAL_DEFAULT	0xFFFFFFFF
@@ -141,7 +142,7 @@ Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
 +
 +static uint bcm4360_test315;
 +module_param(bcm4360_test315, uint, 0644);
-+MODULE_PARM_DESC(bcm4360_test315, "BCM4360 test.315 master switch (fire #9; fw-boot-stall-analysis.md R3a + kimptoc-test28-comparison.md P1/P3/P4). (a) R3a NVRAM: strip the \"boardtype=\" var from the stripped NVRAM buffer BEFORE the TCM download and BEFORE the test276 varsz/vars16 snapshot -- the buffer only shrinks, all other vars are preserved byte for byte and the end token is recomputed with the exact brcmf_fw_nvram_strip formula. Without boardtype the fw stays in the dngl/offload runtime (BCM_OL pivot: full MAC on the host), announces BAR0+0x48 bit 8 and arms SB intmask itself -- the olmsg channel gets an addressee. (b) P3: read-only MAILBOXMASK (BAR0+0x4C) pre-set_active with the ARM still halted (kimptoc anomaly A0: 0x318 there, T284). (c) P1: PLAIN write MAILBOXINT (BAR0+0x48) := bcm4360_test315_db_val (default 0xFFFFFFFF, the test.28 pattern; NOT the 0008/0013 RMW |=) between the test276 shared_info write and brcmf_chip_set_active -- the only window in which the fw ever answered a host doorbell. (d) DISCRIMINATOR immediately after brcmf_chip_set_active, ALWAYS when test315=1, before the test.312 gate and before any 0012/0013 doorbell: single windowed reads of SB intstatus (BAR0+0x20), SB intmask (BAR0+0x24), MAILBOXINT (0x48), MAILBOXMASK (0x4C) + one test277-class console wr_idx read (si[+0x010] -> struct+0x08), one pr_emerg summary line. SUCCESS: intstatus ~0x300 (latched D2H doorbell bits) and/or intmask 0x100 (pciedngl_intrs_on -- the only fw-side writer) and/or console wr_idx >0x27d. FAIL: intmask 0 + wr_idx 0x27d = the frozen WFI of fires #6-#8. (e) bcm4360_test315_no_master=1 skips pci_set_master (chip 4360 only; BM-off control, kimptoc test.28 ran BM-off). (f) the test.312 gate and the T309 hold are untouched; test.313 doorbell-anyway is deliberately NOT part of this test -- on a gate timeout the T309 hold IS the correct fail answer. Requires test276=1 + test308=1 for the full pipeline; fire only with ASPM off + CTO 10-100 ms. (1=enable, 0=off)");
++MODULE_PARM_DESC(bcm4360_test315, "BCM4360 test.315 master switch (fire #9; the fw boot-stall analysis notes R3a + the kimptoc test.28 comparison notes P1/P3/P4). (a) R3a NVRAM: strip the \"boardtype=\" var from the stripped NVRAM buffer BEFORE the TCM download and BEFORE the test276 varsz/vars16 snapshot -- the buffer only shrinks, all other vars are preserved byte for byte and the end token is recomputed with the exact brcmf_fw_nvram_strip formula. Without boardtype the fw stays in the dngl/offload runtime (BCM_OL pivot: full MAC on the host), announces BAR0+0x48 bit 8 and arms SB intmask itself -- the olmsg channel gets an addressee. (b) P3: read-only MAILBOXMASK (BAR0+0x4C) pre-set_active with the ARM still halted (kimptoc anomaly A0: 0x318 there, T284). (c) P1: PLAIN write MAILBOXINT (BAR0+0x48) := bcm4360_test315_db_val (default 0xFFFFFFFF, the test.28 pattern; NOT the 0008/0013 RMW |=) between the test276 shared_info write and brcmf_chip_set_active -- the only window in which the fw ever answered a host doorbell. (d) DISCRIMINATOR immediately after brcmf_chip_set_active, ALWAYS when test315=1, before the test.312 gate and before any 0012/0013 doorbell: single windowed reads of SB intstatus (BAR0+0x20), SB intmask (BAR0+0x24), MAILBOXINT (0x48), MAILBOXMASK (0x4C) + one test277-class console wr_idx read (si[+0x010] -> struct+0x08), one pr_emerg summary line. SUCCESS: intstatus ~0x300 (latched D2H doorbell bits) and/or intmask 0x100 (pciedngl_intrs_on -- the only fw-side writer) and/or console wr_idx >0x27d. FAIL: intmask 0 + wr_idx 0x27d = the frozen WFI of fires #6-#8. (e) bcm4360_test315_no_master=1 skips pci_set_master (chip 4360 only; BM-off control, kimptoc test.28 ran BM-off). (f) the test.312 gate and the T309 hold are untouched; test.313 doorbell-anyway is deliberately NOT part of this test -- on a gate timeout the T309 hold IS the correct fail answer. Requires test276=1 + test308=1 for the full pipeline; fire only with ASPM off + CTO 10-100 ms. (1=enable, 0=off)");
 +
 +static uint bcm4360_test315_db_val = BCM4360_T315_DB_VAL_DEFAULT;
 +module_param(bcm4360_test315_db_val, uint, 0644);
@@ -149,7 +150,7 @@ Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
 +
 +static uint bcm4360_test315_no_master;
 +module_param(bcm4360_test315_no_master, uint, 0644);
-+MODULE_PARM_DESC(bcm4360_test315_no_master, "BCM4360 test.315 P4: skip pci_set_master() when 1 (chip 4360 only) -- bus-master/DMA control variable. kimptoc test.28 ran with bus mastering OFF and its fw went further than every brcmfmac port since (kimptoc-test28-comparison.md sec.4-H3); the olmsg transport does not work yet either way, so DMA is not lost. The readback is the test.315 discriminator. Requires bcm4360_test315=1. (1=skip set_master, 0=default)");
++MODULE_PARM_DESC(bcm4360_test315_no_master, "BCM4360 test.315 P4: skip pci_set_master() when 1 (chip 4360 only) -- bus-master/DMA control variable. kimptoc test.28 ran with bus mastering OFF and its fw went further than every brcmfmac port since (the kimptoc test.28 comparison notes sec.4-H3); the olmsg transport does not work yet either way, so DMA is not lost. The readback is the test.315 discriminator. Requires bcm4360_test315=1. (1=skip set_master, 0=default)");
  
  static int bcm4360_test308_olmsg_cdc;
  module_param(bcm4360_test308_olmsg_cdc, int, 0644);
@@ -245,7 +246,7 @@ Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
 +	u32 t315_rd;
 +
 +	/* (P3) reset-state MAILBOXMASK, read-only: kimptoc T284 read
-+	 * 0x318 here PRE-set_active (anomaly A0, kimptoc-test28-comparison
++	 * 0x318 here PRE-set_active (anomaly A0, the kimptoc test.28 comparison
 +	 * sec.4-A0) and 0 post-set_active (the ARM release clears the
 +	 * mask); reproduce the read on our substrate. */
 +	pr_emerg("BCM4360 test.315: P3 MAILBOXMASK read (BAR0+0x4C, ARM halted) now\n");
@@ -280,7 +281,7 @@ Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
 + * and before any 0012/0013 doorbell, so the evidence exists even if
 + * everything later wedges. SUCCESS (R3a hypothesis): intstatus latches
 + * D2H doorbell bits (~0x300, test.28), intmask armed by pciedngl_intrs_on
-+ * (0x100, the ONLY fw-side writer, fw-boot-stall-analysis Q1) and/or
++ * (0x100, the ONLY fw-side writer, the fw boot-stall analysis notes Q1) and/or
 + * console wr_idx > 0x27d. FAIL: intmask 0 + wr_idx 0x27d (637) = the
 + * frozen WFI state of fires #6-#8. */
 +static void bcm4360_t315_discriminator(struct brcmf_pciedev_info *devinfo)

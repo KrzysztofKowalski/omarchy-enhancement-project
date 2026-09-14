@@ -180,7 +180,7 @@ def parse_segments(html, out):
     return out
 
 
-# ------------------------------------------------------------------- źródła
+# ------------------------------------------------------------------- sources
 
 CHROMIUM_DECRYPTOR_JS = r"""
 // Temporary cookie decryptor — the secret is read from the SECRET env var (never argv).

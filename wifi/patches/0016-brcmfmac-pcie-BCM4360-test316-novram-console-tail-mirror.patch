@@ -1,76 +1,85 @@
 From: OpenWiFi BCM4360 Project <bcm4360@localhost>
 Subject: [PATCH 16/16] brcmfmac: pcie: BCM4360 test.316 R3b novram + console tail + P1-T mirror
 
-Fire #9 (0015) dal dwa twarde fakty: (1) R3a -- strip "boardtype=" z NVRAM --
-NIE poruszyla fw: wr_idx konsoli stoi na 0x27d (637), identyczny stall jak w
-fire'ach #6-#8; (2) P1 -- PLAIN write MAILBOXINT (BAR0+0x48) := 0xFFFFFFFF
-przed set_active -- readback 0x3 (zapis zamaskowany do 2 bitow doorbell), ale
-PO set_active mbint=0: brcmf_chip_set_active CZYSCI mailbox, wiec zamrozone fw
-nigdy nie widzialo doorbella. Kimptoc intstatus=0x300 (T284-era,
-pre-set_active) pozostaje jedyna niewyjasniona obserwacja: to albo HW mirror
-jego WLASNEGO pre-release zapisu, albo fw-side latch fw, ktore poszlo dalej
-(1404 B konsoli). Trzy sondy 0016 rozstrzygaja to jednym fire'em #10:
+Fire #9 (0015) gave two hard facts: (1) R3a -- stripping "boardtype="
+from NVRAM -- did NOT move the fw: the console wr_idx stayed at 0x27d
+(637), the same stall as in fires #6-#8; (2) P1 -- PLAIN write
+MAILBOXINT (BAR0+0x48) := 0xFFFFFFFF before set_active -- read back
+0x3 (the write masked down to the two doorbell bits), but AFTER
+set_active mbint=0: brcmf_chip_set_active CLEARS the mailbox, so the
+frozen fw never saw the doorbell. Kimptoc's intstatus=0x300
+(T284-era, pre-set_active) remains the only unexplained observation:
+it is either a HW mirror of HIS OWN pre-release write, or a fw-side
+latch of an fw that went further (1404 B of console). Three probes in
+0016 settle it in a single fire #10:
 
-a) bcm4360_test316=1 (master switch) -- R3b: w brcmf_pcie_download_fw_nvram,
-   w miejscu zapisu NVRAM do TCM (bufor vars + token koncowy, ktory ladauje
-   na TCM[ramsize-4]), CALA galaz zapisu jest POMIJANA: nie ma copy buforu
-   vars, nie ma tokenu; write_ram32(ramsize-4, 0) zostawia marker sharedram
-   na 0 -- dokladny substrat test.28 kimptoca, ktorego fw NIE mialo NVRAM
-   (bmac_attach err 15 -> TRAP) i mimo to poszlo dalej niz 637 B. Kolejnosc
-   guardow: test316 ma pierwszenstwo przed stripem 0015 (R3a) -- przy
-   test316=1 bufor vars w ogole nie opuszcza RAM hosta, wiec strip (gdyby
-   test315 tez byl ustawiony) jest bez znaczenia; snapshot test276
-   varsz/vars16 czyta wtedy zera -- oczekiwane (i tak widzi fw: varsz=0).
-   CPU-only, zero MMIO; bufor zwalniany niezapisany.
+a) bcm4360_test316=1 (master switch) -- R3b: in
+   brcmf_pcie_download_fw_nvram, at the place where NVRAM is written to
+   TCM (vars buffer + the end token that lands at TCM[ramsize-4]),
+   the WHOLE write branch is SKIPPED: no vars buffer copy, no token;
+   the write_ram32(ramsize-4, 0) leaves the sharedram marker at 0 --
+   the exact kimptoc test.28 substrate, whose fw had NO NVRAM
+   (bmac_attach err 15 -> TRAP) and yet went further than 637 B.
+   Guard order: test316 takes precedence over the 0015 strip (R3a) --
+   with test316=1 the vars buffer never leaves host RAM, so a strip
+   (even if test315 is also set) is moot; the test276 varsz/vars16
+   snapshot then reads zeros -- expected (the fw sees the same:
+   varsz=0). CPU-only, zero MMIO; the buffer is freed unwritten.
 
-b) P1-T: warunek bloku P1 z 0015 (P3 read-only MAILBOXMASK + P1 PLAIN write
-   MAILBOXINT := bcm4360_test315_db_val + readback, miedzy resetem
-   INTERNAL_MEM a brcmf_chip_set_active, ARM w halt) rozszerzony o test316
-   (bcm4360_test315 || bcm4360_test316); komunikaty pr_emerg uogolnione na
-   "test.315/316". Bezposrednio PO readbacku P1 dwa pojedyncze windowed
-   odczyty SB-side (BAR0+0x20 intstatus, BAR0+0x24 intmask) z bracketingiem
-   + linia "P1-T mirror check: intstatus=... intmask=... mbint=...":
-   intstatus=0x300 PRE-release (ARM w halt, nasz P1 wlasnie zlatchowal
-   mbint=0x3) => kimptoc 0x300 = HW mirror jego wlasnego zapisu; ~0/0x80 =>
-   brak mirroru -- kimptoc 0x300 = fw-side latch, jego fw poszlo past 637.
+b) P1-T: the 0015 P1 block condition (P3 read-only MAILBOXMASK + P1
+   PLAIN write MAILBOXINT := bcm4360_test315_db_val + readback,
+   between the INTERNAL_MEM reset and brcmf_chip_set_active, ARM in
+   halt) is extended with test316 (bcm4360_test315 || bcm4360_test316);
+   the pr_emerg messages are generalized to "test.315/316".
+   Immediately AFTER the P1 readback, two single windowed SB-side
+   reads (BAR0+0x20 intstatus, BAR0+0x24 intmask), bracketed + a
+   "P1-T mirror check: intstatus=... intmask=... mbint=..." line:
+   intstatus=0x300 PRE-release (ARM in halt, our P1 just latched
+   mbint=0x3) => kimptoc's 0x300 = HW mirror of his own write;
+   ~0/0x80 => no mirror -- kimptoc's 0x300 = a fw-side latch, his fw
+   went past 637.
 
-c) bcm4360_test316_console_tail=1 (NIEZALEZNY od test316 -- dziala przy
-   test277=1): w bloku test.277 POST-POLL, zaraz po istniejacym wydruku
-   naglowka (HEAD, pierwsze 128 B) konsoli -- odczyt OSTATNICH
-   min(wr_idx, 96) bajtow bufora konsoli konczacych sie na wr_idx (guard:
-   wr_idx < 96 -> od 0; wr_idx=0 -> skip z logiem). Mechanizm odczytu TCM
-   identyczny z wydrukiem HEAD (brcmf_pcie_read_ram32 do chunka na stosie),
-   start odczytu wyrownany do 4 B (<=3 B wczesniejszego tekstu konsoli z
-   przodu; dlugosc wydruku konczy sie dokladnie na wr_idx), wydruk jako
-   %*ph hex (<=64 B na linie, jedna linia kontynuacji) + jedna linia %*pE.
-   Struktura niewazna (buf_addr poza TCM, wr_idx > buf_size -- walidacja w
-   stylu test.278) -> skip z logiem. To zamyka najwieksza luke dowodowa:
-   do tej pory znamy tylko NAGLOWEK bufora konsoli, ostatni wydruk fw
-   przed stall jest kluczowy (nazwa funkcji, w ktorej fw utklo).
+c) bcm4360_test316_console_tail=1 (INDEPENDENT of test316 -- works
+   with test277=1): in the test.277 POST-POLL block, right after the
+   existing console HEAD (first 128 B) dump -- read the LAST
+   min(wr_idx, 96) bytes of the console buffer ending at wr_idx
+   (guard: wr_idx < 96 -> from 0; wr_idx=0 -> skip with a log). TCM
+   read mechanism identical to the HEAD dump
+   (brcmf_pcie_read_ram32 into a stack chunk), read start aligned to
+   4 B (<=3 B of earlier console text in front; the printed span ends
+   exactly at wr_idx), printed as %*ph hex (<=64 B per line, one
+   continuation line) + one %*pE line. Invalid struct (buf_addr
+   outside TCM, wr_idx > buf_size -- test.278-style validation) ->
+   skip with a log. This closes the biggest evidence gap: so far we
+   know only the HEAD of the console buffer, and the last fw print
+   before the stall is the key (the name of the function where the fw
+   got stuck).
 
-d) Zadnych innych zmian: T276/T277/T308/T309/T310/T311/T312/T313/T314/T315
-   nietkniete (jedyny dotyk 0015: rozszerzenie warunku bloku P1 +
-   uogolnienie komunikatow); DISCRIMINATOR 0015 zostaje gated na test315;
-   gate 0012 i T309 nietkniete. Wszystkie parametry domyslnie 0 -> latka
-   inerna.
+d) No other changes: T276/T277/T308/T309/T310/T311/T312/T313/T314/T315
+   untouched (the only 0015 touch: extending the P1 block condition +
+   generalizing the messages); the 0015 DISCRIMINATOR stays gated on
+   test315; gate 0012 and T309 untouched. All parameters default to 0
+   -> inert patch.
 
-Bezpieczenstwo (narzucone przez wedgi #4/#5): jedyne nowe operacje MMIO to
-(b) dwa windowed odczyty BAR0 PRE-release z bracketingiem pr_emerg przed/po
-(klasa T305 pre-release WRITE_LANDED + T315 DISCRIMINATOR, proven live w
-#6-#9; stalling reads -- fire TYLKO z CTO 10-100 ms) i (c) petla <=25
-odczytow TCM/BAR1 (brcmf_pcie_read_ram32) -- identyczna klasa co istniejacy
-wydruk HEAD test.277 (32 odczyty, przetrwal kazdy fire #6-#9); ZERO nowych
-zapisow MMIO. R3b to czysty CPU (host RAM, zero MMIO; bufor zwalniany).
-Start odczytu TAIL wyrownany do 4 B (dol), wiec zadnych nie-wyrownanych
-odczytow; dlugosc wydruku konczy sie na wr_idx. test316=0 i
-test316_console_tail=0 (domyslnie) => zero roznicy kodowej i behawioralnej
-(nowe parametry czytane wylacznie pod swoimi guardami). T309, gate 0012,
-test313/test314 nietkniete (nic nie doklada w teardown).
+Safety (imposed by wedges #4/#5): the only new MMIO operations are
+(b) two windowed BAR0 PRE-release reads bracketed by pr_emerg
+before/after (T305 pre-release WRITE_LANDED + T315 DISCRIMINATOR
+class, proven live in #6-#9; stalling reads -- fire ONLY with CTO
+10-100 ms) and (c) a loop of <=25 TCM/BAR1 reads
+(brcmf_pcie_read_ram32) -- the same class as the existing test.277
+HEAD dump (32 reads, survived every fire #6-#9); ZERO new MMIO writes.
+R3b is pure CPU (host RAM, zero MMIO; buffer freed). TAIL read start
+aligned to 4 B (down), so no misaligned reads; the printed span ends
+at wr_idx. test316=0 and test316_console_tail=0 (defaults) => zero
+code and behavioural difference (the new parameters are read solely
+under their own guards). T309, gate 0012, test313/test314 untouched
+(nothing added in teardown).
 
-Wymaga: test276=1 + test308=1 (pelny pipeline); test315 i test313 swiadomie
-NIE ustawione w fire #10 (R3a obalone w #9; doorbell-anyway martwa sciezka);
-bcm4360_test315_db_val=0xFFFFFFFF dalej steruje wartoscia zapisu P1(-T).
-Fire tylko po setpci ASPM-off + CTO 10-100 ms na zywym urzadzeniu.
+Requires: test276=1 + test308=1 (full pipeline); test315 and test313
+deliberately NOT set in fire #10 (R3a disproved in #9; doorbell-anyway
+is a dead path); bcm4360_test315_db_val=0xFFFFFFFF still drives the P1
+(-T) write value. Fire only with setpci ASPM-off + CTO 10-100 ms on
+the live device.
 
 ~160 lines, gated on chip 4360 + test316/test316_console_tail -- zero
 behaviour change for every other chip and for the msgbuf path.

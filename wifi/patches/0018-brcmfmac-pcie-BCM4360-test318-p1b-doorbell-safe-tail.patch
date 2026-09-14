@@ -4,55 +4,62 @@ Date: Wed, 9 Sep 2026 15:58:22 +0200
 Subject: [PATCH 18/18] brcmfmac: pcie: BCM4360 test.318 P1b post-release doorbell +
  safe console TAIL10
 
-Fire #11 (0017) rozwazyl ostatnie nieprzetestowane roznice host-side wzgledem
-test.28 kimptoca: R4 (no_sharedinfo) + R5 (no_olmsg) OBALONE -- wr_idx konsoli
-NADAL 0x27d=637 B przy maksymalnej replikacji test.28 (host pisal tylko
-blob + write_ram32(ramsize-4,0) + resetcore + P1 + MBM:=0 w holdzie).
-Zostaje JEDNA roznica kimptoc-vs-nas i jest ona PO JEGO stronie: jego
-release NIE czyscil mailboxa, a nasz brcmf_chip_set_active CZYSCI (fire #9:
-mbint=0 po set_active) -- jego fw obudzilo sie z PENDING doorbellem D2H
-(0x3 = wzorzec pcie_mask_irqs 0xFFFFFFFF zapisany pre-release), ktory moze
-popychac boot wylamujaco z freeze (dispatch przerwan / PCI-CCB init); nasze
-fw wstaje z mailbox=0 (fire #11 mbint=0).
+Fire #11 (0017) considered the last untested host-side differences
+against kimptoc test.28: R4 (no_sharedinfo) + R5 (no_olmsg) DISPROVED; the console
+wr_idx is STILL 0x27d=637 B with maximal test.28
+replication (the host wrote only the blob + write_ram32(ramsize-4,0) +
+resetcore + P1 + MBM:=0 in the hold). ONE difference kimptoc-vs-us
+remains and it is on HIS side: his release did NOT clear the mailbox,
+while our brcmf_chip_set_active DOES (fire #9: mbint=0 after
+set_active) -- his fw woke up with a PENDING D2H doorbell (0x3 = the
+pcie_mask_irqs 0xFFFFFFFF pattern written pre-release), which may push
+the boot past the freeze (IRQ dispatch / PCI-CCB init); our fw wakes
+up with mailbox=0 (fire #11 mbint=0).
 
-Latka 0018 (parametry bcm4360_test318_p1b_doorbell i bcm4360_test318_cons_tail10;
-domyslnie 0 -> latka inerta, zero roznicy behawioralnej jak wszystkie poprzednie):
+Patch 0018 (parameters bcm4360_test318_p1b_doorbell and
+bcm4360_test318_cons_tail10; default 0 -> inert patch, zero behavioural
+difference like all the previous ones):
 
-a) P1b: PLAIN write MAILBOXINT (BAR0+0x48) := 0xFFFFFFFF BEZPOSREDNIO PO
-   brcmf_chip_set_active, PRZED discriminatorem test.315 (t~0; fw bootuje
-   t+10 ms i publikuje si[+0x010]=0x9af88, wiec pending doorbell JEST na
-   czipie, gdy fw go czyta -- w przeciwieznosci do P1 pre-release, ktore
-   set_active czysci, i fire #7, ktore poked t+5-8 s po freeze). Ten sam
-   mechanizm co blok P1/P1-T z latki 0015: brcmf_pcie_write_reg32 /
-   brcmf_pcie_read_reg32 z makrem BRCMF_PCIE_PCIE2REG_MAILBOXINT (BAR0+0x48),
-   kazdy krok z bramka pr_emerg. Biegnie PRZED discriminatorem CELOWO:
-   discriminator mierzy potem efekt (mbint zalatchowany 0x3? intstatus?).
-   Gated: chip 4360 + wlasny parametr (nie wymaga test315). Fire #12
-   dyskryminator: konsola > 0x27d (1404 B + TRAP err 15 jak u kimptoca)
-   => pending doorbell dzwignia -> bring-up; == 0x27d => R1: deep-dive
-   bootu fw (SP/TCM dump via BAR2, breadcrumbs 0x62E20/0x18/0x88).
+a) P1b: PLAIN write MAILBOXINT (BAR0+0x48) := 0xFFFFFFFF IMMEDIATELY
+   AFTER brcmf_chip_set_active, BEFORE the test.315 discriminator
+   (t~0; the fw boots at t+10 ms and publishes si[+0x010]=0x9af88, so
+   the pending doorbell IS on the chip when the fw reads it -- unlike
+   P1 pre-release, which set_active clears, and fire #7, which poked
+   t+5-8 s after the freeze). Same mechanism as the P1/P1-T block of
+   patch 0015: brcmf_pcie_write_reg32 / brcmf_pcie_read_reg32 with the
+   BRCMF_PCIE_PCIE2REG_MAILBOXINT macro (BAR0+0x48), every step with a
+   pr_emerg bracket. Runs BEFORE the discriminator ON PURPOSE: the
+   discriminator then measures the effect (mbint latched 0x3?
+   intstatus?). Gated: chip 4360 + its own parameter (does not require
+   test315). Fire #12 discriminator: console > 0x27d (1404 B + TRAP
+   err 15 like kimptoc) => the pending doorbell is the lever ->
+   bring-up; == 0x27d => R1: deep-dive the fw boot (SP/TCM dump via
+   BAR2, breadcrumbs 0x62E20/0x18/0x88).
 
-b) TAIL10: bezpieczna wersja console TAIL. Fire #10 pokazal, ze 25-dwordowa
-   burta test316_console_tail zabija printk jadra (nowa klasa zawieszen przy
-   zywej maszynie), wiec okno jest tu obciete do min(wr_idx & ~3, 40) B
-   (<=10 dwordow), czytane tym samym mechanizmem co TAIL test.316
-   (brcmf_pcie_read_ram32 do stack chunka); start 4 B-aligned (bez
-   polowkowego dworda z przodu), koniec na ostatnim PELNYM dwordzie <= wr_idx
-   (<=3 B nowszego tekstu z tylu). Wydruki DOKLADNIE dwie linie w stylu
-   HEAD dump (ta klasa zawsze przetrwala; printk umarl w srodku 25 dwordow):
-   jedna %*ph hex + jedna %*pE ascii, prefiks BCM4360 test.318: POST-POLL
-   console TAIL10. Walidacje jak w test.316 (test.278-style): wr_idx=0 lub
-   struct invalid (buf_addr poza TCM / wr_idx>buf_size) -> skip z linia.
-   Blok ma wylacznie wlasne zmienne (t10_*) z zakresu POST-POLL struct
-   (t277_struct[0..2]), poza klamra bloku test.316, nic nie dotyka poza
-   swoim zakresem. NIEZALEZNY od bcm4360_test316_console_tail i od
-   bcm4360_test316 -- biegnie, gdy biegna tez test.277 POST-POLL dump.
+b) TAIL10: a safe version of the console TAIL. Fire #10 showed that
+   the 25-dword burst of test316_console_tail kills kernel printk (a
+   new hang class on a live machine), so the window here is cut to
+   min(wr_idx & ~3, 40) B (<=10 dwords), read with the same mechanism
+   as the test.316 TAIL (brcmf_pcie_read_ram32 into a stack chunk);
+   start 4 B-aligned (no partial dword in front), end at the last
+   FULL dword <= wr_idx (<=3 B of newer text in back). Exactly TWO
+   prints in the style of the HEAD dump (that class always survived;
+   printk died inside 25 dwords): one %*ph hex + one %*pE ascii line,
+   BCM4360 test.318: POST-POLL console TAIL10 prefix. Validation as
+   in test.316 (test.278-style): wr_idx=0 or invalid struct (buf_addr
+   outside TCM / wr_idx>buf_size) -> skip with a line. The block uses
+   only its own variables (t10_*) scoped to the POST-POLL struct
+   (t277_struct[0..2]), outside the test.316 block braces, touching
+   nothing outside its own scope. INDEPENDENT of
+   bcm4360_test316_console_tail and of bcm4360_test316 -- runs
+   whenever the test.277 POST-POLL dump runs.
 
-Bezpieczenstwo: jedyny nowy zapis MMIO to pojedynczy windowed write P1b
-(klasa 0015 P1, proven live na zywym urzadzeniu w fire #2/#9; zapis w oknie
-t+0 po release, fw nie moze byc w WFI jeszcze przez ~10 ms). TAIL10 to same
-odczyty TCM klasy T277/T316 read, proven w fire #6/#7; brak petli bez dolnej
-granicy, maks. 8 odczytow. (1=enable, 0=off dla obu parametrow)
+Safety: the only new MMIO write is a single windowed P1b write
+(class 0015 P1, proven live on the live device in fires #2/#9; write
+in the t+0 window after release, the fw cannot be in WFI yet for ~10
+ms). TAIL10 is pure TCM reads of the T277/T316 read class, proven in
+fires #6/#7; no unbounded loops, max 8 reads. (1=enable, 0=off for
+both parameters)
 Signed-off-by: OpenWiFi BCM4360 Project <bcm4360@localhost>
 ---
  brcmfmac/pcie.c | 106 ++++++++++++++++++++++++++++++++++++++++++++++++

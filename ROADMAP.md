@@ -27,7 +27,7 @@
 - [ ] Per-module sanity CI: `bash -n`, `shellcheck`, `python -m py_compile`
 - [ ] Wiki-style module docs for grant/sustainability reviewers
 - [ ] WebP pipeline fully owned by the theme server (no JPG sources in the tree)
-- [ ] English-only pass on deep source comments (in progress)
+- [x] English-only pass on deep source comments (done 2026-09-14)
 
 ## Notes on process
 

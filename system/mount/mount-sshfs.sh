@@ -5,7 +5,7 @@
 # Edit SERVER / Paths to match your NAS.
 set -euo pipefail
 
-SERVER="user@192.168.1.0"     # <-- replace with your SSH user@host
+SERVER="user@<nas-address>"     # <-- replace with your SSH user@host
 BASE="$HOME/mnt/sshfs-nas"
 IDENT="$HOME/.ssh/id_ed25519"
 

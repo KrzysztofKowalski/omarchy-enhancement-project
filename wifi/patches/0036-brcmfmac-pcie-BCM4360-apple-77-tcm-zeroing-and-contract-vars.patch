@@ -4,43 +4,43 @@
  #define BCM4360_T338_SI_VARS		(BCM4360_T336_SI_VARS)
  #define BCM4360_T338_VARS_MAX		0x4000	/* MAXSZ_NVRAM_VARS (7.77): vars_size limit */
  
-+/* ==== BCM4360 patch 0036 (luki 7 i 3 z runbooka): podloze 7.77 jak u hosta
-+ * Apple -- WLACZONE NA STALE dla obrazow 7.77, bez nowego parametru ====
++/* ==== BCM4360 patch 0036 (gaps 7 and 3 from the runbook): the 7.77 substrate exactly as on the Apple host
++ * -- ENABLED PERMANENTLY for 7.77 images, with no new parameter ====
 + *
-+ * Runbook: notes/ (luki 7 i 3), konsolidacja:
-+ * notes/ par. 2. Dwie rzeczy, ktore host
-+ * Apple robi przy starcie, a nasz sterownik nie:
++ * Runbook: the project notes (gaps 7 and 3), consolidated:
++ * project notes par. 2. Two things the Apple host
++ * does on boot, and our driver does not:
 + *
-+ *  (7) ZEROWANIE reszty TCM po kopii obrazu. Kext _wlc_ol_up (0x73b78-0x73bc2,
-+ *      tmp/re-host-etap1-2/v-olup2.txt): memset(TCM + ol+0x68 + ol+0x78, 0,
-+ *      ol+0x90 - (ol+0x68 + ol+0x78)) -- od konca obrazu (ol+0x78 = 0x6E324)
-+ *      do VA kontraktu (ol+0x90 = TCM + 0x9A080). Dla 4360 (ramsize 0xA0000):
-+ *      [0x6E324, 0x9A080) = 179 548 B. TCM NIE czysci sie rebootem, wiec bez
-+ *      tego fw 7.77 startuje na smieciach z poprzedniego przebiegu. (Pierwszy
-+ *      memset Apple -- memset(TCM + ol+0x60, 0, ol+0x68 - ol+0x60) -- to dla
-+ *      4360 zakres pusty [0,0), wiec nie ma go co powtarzac.)
++ *  (7) ZEROING the rest of TCM after the image copy. Kext _wlc_ol_up (0x73b78-0x73bc2,
++ *      re-host stage 1-2 trace v-olup2.txt): memset(TCM + ol+0x68 + ol+0x78, 0,
++ *      ol+0x90 - (ol+0x68 + ol+0x78)) -- from the end of the image (ol+0x78 = 0x6E324)
++ *      to the VA contract (ol+0x90 = TCM + 0x9A080). For 4360 (ramsize 0xA0000):
++ *      [0x6E324, 0x9A080) = 179 548 B. TCM is not cleared by reboot, so without
++ *      this the fw 7.77 boots on garbage from the previous run. (Apple's first
++ *      memset -- memset(TCM + ol+0x60, 0, ol+0x68 - ol+0x60) -- is an empty
++ *      [0,0) range for 4360, so there is no point repeating it.)
 + *
-+ *  (3) VARS W KONTRAKCIE, NIE NA CZUBKU TCM. Host Apple pisze wylacznie pare
-+ *      +0x20 (rozmiar) / +0x24 (tekst) w strukturze hosta (writer items 8/9:
++ *  (3) VARS IN THE CONTRACT, NOT AT THE TOP OF TCM. The Apple host writes only the
++ *      +0x20 (size) / +0x24 (text) pair in the host struct (writer items 8/9:
 + *      memmove(base+0x24, osh->vars, vars_size); base+0x20 = vars_size --
-+ *      notes/:1036-1045) i fw 7.77 czyta ja
-+ *      STAMTAD -- ZMIERZONE w test.340: fw wzial pare (0x9A0A4, 0xEC7) do
-+ *      wlc_hw+0x84/+0x88 (memory test340-clk-zero-i-vars-skonsumowane).
-+ *      Nasz zapis na czubku TCM to nvram_len = 212 B kitu .txt (T276 zmierzyl
-+ *      varsz=212), czyli [TCM_end-212, TCM_end) = kontrakt+[0x5EAC, 0x5F80) --
-+ *      DOKLADNIE slot rekordu TRAP (+0x5ED8..+0x5F5C) i marker_end (+0x5F5C),
-+ *      czyli pola kontraktu, ktore fw czyta i ktore waliduje
-+ *      _wlc_ol_validate_shared_info. Dlatego na sciezce 7.77 zapis na czubku
-+ *      TCM jest POMIJANY, a vars ida pod kontrakt+0x24 -- z ta sama trescia,
-+ *      co w tescie.338 (3783 B z SPROMu ukladu, nie 212 B kitu .txt).
++ *      notes:1036-1045) and the fw 7.77 reads it
++ *      FROM THERE -- MEASURED in test.340: the fw took the pair (0x9A0A4, 0xEC7) into
++ *      wlc_hw+0x84/+0x88 (memory test 340-clk-zero-i-vars-skonsumowane).
++ *      Our write at the top of TCM is nvram_len = 212 B of .txt filler (T276 measured
++ *      varsz=212), i.e. [TCM_end-212, TCM_end) = contract+[0x5EAC, 0x5F80) --
++ *      EXACTLY the TRAP record slot (+0x5ED8..+0x5F5C) and marker_end (+0x5F5C),
++ *      the contract fields the fw reads and validates in
++ *      _wlc_ol_validate_shared_info. That is why on the 7.77 path the write at
++ *      the top of TCM is SKIPPED and vars go to contract+0x24 -- with the same content,
++ *      as in test.338 (3783 B from the chip SPROM, not 212 B of .txt filler).
 + *
-+ * Bramka: bcm4360_ol77_path() = chip 4360 + obraz 7.77 (test321_fw_apple 2/3).
-+ * Dla obrazow 0/1 (oryginal 6.30.223 i 7.15.124.12) kod jest bit w bit stary.
-+ * ZERO dostepow do D11 (HARD RULE, CLAUDE.md p. 7). */
++ * Gate: bcm4360_ol77_path() = chip 4360 + 7.77 image (test321_fw_apple 2/3).
++ * For images 0/1 (original 6.30.223 and 7.15.124.12) the code is bit-for-bit old.
++ * ZERO D11 access (HARD RULE, project rulebook item 7). */
 +#define BCM4360_OL77_CONTRACT_SIZE	(BCM4360_T336_HOST_SHARED_SIZE)	/* 0x5F80 */
 +#define BCM4360_OL77_VARS_SIZE_OFF	(BCM4360_T336_SI_VARS_SIZE)	/* +0x20 */
 +#define BCM4360_OL77_VARS_OFF		(BCM4360_T336_SI_VARS)		/* +0x24 */
-+#define BCM4360_OL77_ZERO_CHUNK		4096	/* B na jeden zapis zerowania */
++#define BCM4360_OL77_ZERO_CHUNK		4096	/* B per one zeroing write */
 +
  /* BCM4360 test.278: periodic console delta dump. */
  #define BCM4360_T278_CHUNK_BYTES	128	/* per pr_emerg line */
@@ -49,27 +49,27 @@
  				   BRCMF_RANDOM_SEED_LENGTH);
  }
  
-+/* ==== BCM4360 patch 0036: podloze 7.77 (luki 7 i 3) ==== */
++/* ==== BCM4360 patch 0036: 7.77 substrate (gaps 7 and 3) ==== */
 +
-+/* Sciezka 7.77: obraz Apple (test321_fw_apple = 2 = 7.77.0.0, 3 = 7.77.61.0)
-+ * na naszej karcie. Tylko tam obowiazuje kontrakt hosta Apple -- i tylko tam
-+ * wolno nam przestawic podloze TCM. Dla obrazow 0 (oryginal) i 1 (7.15)
-+ * funkcja zwraca false i caly kod patch 0036 jest nieaktywny (zachowanie bit
-+ * w bit jak patch 0035). */
++/* 7.77 path: the Apple image (test321_fw_apple = 2 = 7.77.0.0, 3 = 7.77.61.0)
++ * on our card. Only there does the Apple host contract apply -- and only there
++ * may we move the TCM substrate. For images 0 (original) and 1 (7.15)
++ * this function returns false and all patch 0036 code is inactive (behaviour
++ * bit for bit as in patch 0035). */
 +static bool bcm4360_ol77_path(struct brcmf_pciedev_info *devinfo)
 +{
 +	return devinfo->ci->chip == BRCM_CC_4360_CHIP_ID &&
 +	       (bcm4360_test321_fw_apple == 2 || bcm4360_test321_fw_apple == 3);
 +}
 +
-+/* Zerowanie zakresu [from, to) TCM (offsety WZGLEDNE wobec rambase, ta sama
-+ * umowa co brcmf_pcie_read_ram32/write_ram32; kopia obrazu uzywa offsetow
-+ * absolutnych, bo brcmf_pcie_copy_mem_to_dev nie dodaje rambase -- dla 4360
-+ * rambase = 0, ale trzymamy sie umowy). Droga zapisu ta sama, co kopia obrazu
-+ * (brcmf_pcie_copy_mem_to_dev: 32-bit iowrite32, wymog 4360 z patcha 0003 --
-+ * 64-bit memcpy_toio wiesza magistrale). Bufor zer jest JEDEN, 4 KiB, wiec
-+ * zero dodatkowych ~179 KB TCM nie kosztuje alokacji rozmiaru zakresu.
-+ * Zwraca liczbe zapisanych bajtow (0 = nie udalo sie / zakres pusty). */
++/* Zero the TCM range [from, to) (offsets RELATIVE to rambase, the same
++ * convention as brcmf_pcie_read_ram32/write_ram32; the image copy uses
++ * absolute offsets, because brcmf_pcie_copy_mem_to_dev does not add rambase -- for
++ * 4360 rambase = 0, but we stick to the convention). Write path the same as the
++ * image copy (brcmf_pcie_copy_mem_to_dev: 32-bit iowrite32, the 4360 requirement
++ * from patch 0003 -- 64-bit memcpy_toio hangs the bus). The zero buffer is a
++ * SINGLE 4 KiB one, so zeroing the extra ~179 KB of TCM costs no range-sized
++ * allocation. Returns the number of bytes written (0 = failed / empty range). */
 +static u32 bcm4360_ol77_zero_range(struct brcmf_pciedev_info *devinfo,
 +				   u32 from, u32 to)
 +{
@@ -85,7 +85,7 @@
 +	chunk = min_t(u32, left, BCM4360_OL77_ZERO_CHUNK);
 +	zero = kzalloc(chunk, GFP_KERNEL);
 +	if (!zero) {
-+		pr_emerg("BCM4360 patch 0036: kzalloc(%u) FAILED -- zakres [0x%05x,0x%05x) NIE wyzerowany (fw zobaczy smieci z poprzedniego przebiegu)\n",
++		pr_emerg("BCM4360 patch 0036: kzalloc(%u) FAILED -- range [0x%05x,0x%05x) NOT zeroed (the fw will see garbage from the previous run)\n",
 +			 chunk, from, to);
 +		return 0;
 +	}
@@ -104,13 +104,13 @@
 +	return done;
 +}
 +
-+/* Para vars w strukturze hosta: rozmiar @+0x20, tekst @+0x24 (writer items
-+ * 8/9 hosta Apple). 1:1 to samo, co robil test.338 (patch 0031) -- ta sama
-+ * tresc (bcm4360_vars_rev11_apple: 176 kluczy / 3783 B z SPROMu ukladu), ten
-+ * sam odczyt zwrotny calego tekstu jako dowod, ze zapis DOTARL. Rozni sie
-+ * tylko bramka: tu wchodzi sie z bcm4360_ol77_path(), bez parametru.
-+ * base = offset WZGLEDNY wobec rambase. Zwraca liczbe niezgodnych bajtow
-+ * odczytu zwrotnego (0 = OK; UINT_MAX = blok nie wszedl -- bramki). */
++/* The vars pair in the host struct: the size @+0x20, the text @+0x24 (writer items
++ * 8/9 of the Apple host). 1:1 what test.338 did (patch 0031) -- the same
++ * content (bcm4360_vars_rev11_apple: 176 keys / 3783 B from the chip SPROM), the
++ * same full-text readback as proof the write LANDED. It differs
++ * only in the gate: here it enters via bcm4360_ol77_path(), with no parameter.
++ * base = offset RELATIVE to rambase. Returns the number of mismatched readback
++ * bytes (0 = OK; UINT_MAX = the block did not run -- gates). */
 +static u32 bcm4360_ol77_write_vars(struct brcmf_pciedev_info *devinfo, u32 base)
 +{
 +	size_t len = sizeof(bcm4360_vars_rev11_apple);
@@ -118,25 +118,25 @@
 +	u32 mism = 0;
 +	u32 i;
 +
-+	/* Bramki PRZED pierwszym MMIO (jak w tescie.338). */
++	/* Gates BEFORE the first MMIO (as in test.338). */
 +	if (len > BCM4360_T338_VARS_MAX) {
 +		pr_emerg("BCM4360 patch 0036: sizeof(vars)=%zu > 0x%x (MAXSZ_NVRAM_VARS) -- SKIP, zero MMIO\n",
 +			 len, BCM4360_T338_VARS_MAX);
 +		return UINT_MAX;
 +	}
 +	if (BCM4360_OL77_VARS_OFF + len > BCM4360_OL77_CONTRACT_SIZE) {
-+		pr_emerg("BCM4360 patch 0036: vars (+0x%x, %zu B) nie mieszcza sie w strukturze hosta (0x%x B) -- SKIP, zero MMIO\n",
++		pr_emerg("BCM4360 patch 0036: vars (+0x%x, %zu B) do not fit in the host struct (0x%x B) -- SKIP, zero MMIO\n",
 +			 BCM4360_OL77_VARS_OFF, len,
 +			 BCM4360_OL77_CONTRACT_SIZE);
 +		return UINT_MAX;
 +	}
 +	if (base + BCM4360_OL77_VARS_OFF + len > devinfo->ci->ramsize) {
-+		pr_emerg("BCM4360 patch 0036: vars na 0x%05x+0x%x przekraczaja ramsize 0x%05x -- SKIP, zero MMIO\n",
++		pr_emerg("BCM4360 patch 0036: vars at 0x%05x+0x%x exceed ramsize 0x%05x -- SKIP, zero MMIO\n",
 +			 base, BCM4360_OL77_VARS_OFF, devinfo->ci->ramsize);
 +		return UINT_MAX;
 +	}
 +
-+	pr_emerg("BCM4360 patch 0036 (luka 3): vars do kontraktu apple: vars_size=0x%zx @TCM[0x%05x], tekst @TCM[0x%05x..0x%05x] (176 kluczy ze SPROMu ukladu; bez zapisu na czubku TCM)\n",
++	pr_emerg("BCM4360 patch 0036 (gap 3): vars into the apple contract: vars_size=0x%zx @TCM[0x%05x], text @TCM[0x%05x..0x%05x] (176 keys from the chip SPROM; no top-of-TCM write)\n",
 +		 len, base + BCM4360_OL77_VARS_SIZE_OFF,
 +		 base + BCM4360_OL77_VARS_OFF,
 +		 base + BCM4360_OL77_VARS_OFF + (u32)len - 1);
@@ -144,9 +144,9 @@
 +	brcmf_pcie_write_ram32(devinfo, base + BCM4360_OL77_VARS_SIZE_OFF,
 +			       (u32)len);
 +
-+	/* Tekst dword po dwordzie; ostatni dword jest skladany z 3 bajtow +
-+	 * jednego zera, ktore lezy JUZ ZA dlugoscia podana w +0x20 -- fw zna
-+	 * dlugosc z +0x20, nie ze skanu NUL. */
++	/* Text dword by dword; the last dword is assembled from 3 bytes +
++	 * one zero that ALREADY lies beyond the length given in +0x20 -- the
++	 * fw knows the length from +0x20, not from a NUL scan. */
 +	for (i = 0; i < (u32)len; i += 4) {
 +		u32 w = 0;
 +		u32 k;
@@ -163,8 +163,8 @@
 +		dwords++;
 +	}
 +
-+	/* Odczyt zwrotny CALEGO tekstu i porownanie z tablica: dowod, ze zapis
-+	 * DOTARL, a nie tylko ze zostal wydany. */
++	/* Full-text readback and comparison against the table: proof the write
++	 * LANDED, not just that it was issued. */
 +	for (i = 0; i < (u32)len; i += 4) {
 +		u32 rb = brcmf_pcie_read_ram32(devinfo,
 +					       base + BCM4360_OL77_VARS_OFF + i);
@@ -181,7 +181,7 @@
 +		}
 +	}
 +
-+	pr_emerg("BCM4360 patch 0036 (luka 3): readback: vars_size@+0x20=0x%08x (exp 0x%zx) dwordow=0x%x bajtow-niezgodnych=%u pierwszy=0x%08x ostatni=0x%08x\n",
++	pr_emerg("BCM4360 patch 0036 (gap 3): readback: vars_size@+0x20=0x%08x (exp 0x%zx) dwords=0x%x mismatched-bytes=%u first=0x%08x last=0x%08x\n",
 +		 brcmf_pcie_read_ram32(devinfo,
 +				       base + BCM4360_OL77_VARS_SIZE_OFF),
 +		 len, dwords, mism,
@@ -201,16 +201,16 @@
  	resetintr = get_unaligned_le32(t321_fw_src);
  	release_firmware(fw);
  
-+	/* ==== BCM4360 patch 0036 (luka 7): zerowanie reszty TCM po kopii obrazu
-+	 * -- DOKLADNIE to, co robi host Apple w _wlc_ol_up (0x73b78-0x73bc2):
++	/* ==== BCM4360 patch 0036 (gap 7): zero the rest of TCM after the
++	 * image copy -- EXACTLY what the Apple host does in _wlc_ol_up (0x73b78-0x73bc2):
 +	 * memset(TCM + ol+0x68 + ol+0x78, 0, ol+0x90 - (ol+0x68 + ol+0x78)),
-+	 * czyli od konca obrazu (ol+0x78 = 0x6E324 dla 7.77) do VA kontraktu
-+	 * (ol+0x90 = TCM + 0x9A080 = TCM_end - 0x5F80). Dla naszej karty:
-+	 * [0x6E324, 0x9A080) = 179 548 B. TCM nie czysci sie rebootem (CLAUDE.md
-+	 * p. 5), wiec bez tego fw startuje na resztkach poprzedniego przebiegu.
-+	 * Wylacznie sciezka 7.77; dla obrazow 0/1 zero zmian. Zaden inny nasz
-+	 * zapis nie lezy w tym zakresie (T276 od 0x9D0A4, T325 od 0x9C960 --
-+	 * oba POWYZEJ kontraktu), wiec kolejnosc wobec nich nie ma znaczenia. */
++	 * i.e. from the end of the image (ol+0x78 = 0x6E324 for 7.77) to the VA contract
++	 * (ol+0x90 = TCM + 0x9A080 = TCM_end - 0x5F80). For our card:
++	 * [0x6E324, 0x9A080) = 179 548 B. TCM is not cleared by reboot (project
++	 * rulebook item 5), so without this the fw boots on remnants of the previous run.
++	 * 7.77 path only; for images 0/1 zero change. No other write of
++	 * ours lies in this range (T276 from 0x9D0A4, T325 from 0x9C960 --
++	 * both ABOVE the contract), so the order relative to them does not matter. */
 +	if (bcm4360_ol77_path(devinfo)) {
 +		u32 t336_zero_from = t321_fw_len;
 +		u32 t336_zero_to = devinfo->ci->ramsize -
@@ -218,7 +218,7 @@
 +
 +		if (devinfo->ci->ramsize <= BCM4360_OL77_CONTRACT_SIZE ||
 +		    t336_zero_to <= t336_zero_from) {
-+			pr_emerg("BCM4360 patch 0036 (luka 7): obraz %u B, kontrakt od 0x%05x -- zakres zerowania pusty lub ramsize za male, SKIP, zero MMIO\n",
++			pr_emerg("BCM4360 patch 0036 (gap 7): image %u B, contract from 0x%05x -- zeroing range empty or ramsize too small, SKIP, zero MMIO\n",
 +				 t336_zero_from,
 +				 devinfo->ci->ramsize >
 +				 BCM4360_OL77_CONTRACT_SIZE ?
@@ -227,14 +227,14 @@
 +		} else {
 +			u32 t336_zeroed;
 +
-+			pr_emerg("BCM4360 patch 0036 (luka 7): zerowanie TCM [0x%05x,0x%05x) = %u B (od konca obrazu 7.77 do kontraktu TCM_end-0x%x; Apple _wlc_ol_up 0x73b78-0x73bc2) -- TCM nie czysci sie rebootem, to smieci z poprzedniego przebiegu\n",
++			pr_emerg("BCM4360 patch 0036 (gap 7): zeroing TCM [0x%05x,0x%05x) = %u B (from the end of the 7.77 image to the TCM_end-0x%x contract; Apple _wlc_ol_up 0x73b78-0x73bc2) -- TCM is not cleared by reboot, this is garbage from the previous run\n",
 +				 t336_zero_from, t336_zero_to,
 +				 t336_zero_to - t336_zero_from,
 +				 BCM4360_OL77_CONTRACT_SIZE);
 +			t336_zeroed = bcm4360_ol77_zero_range(devinfo,
 +							      t336_zero_from,
 +							      t336_zero_to);
-+			pr_emerg("BCM4360 patch 0036 (luka 7): zerowanie -- zapisano %u B, kontrola TCM[0x%05x]=0x%08x TCM[0x%05x]=0x%08x (exp 0x0 0x0)\n",
++			pr_emerg("BCM4360 patch 0036 (gap 7): zeroing -- wrote %u B, check TCM[0x%05x]=0x%08x TCM[0x%05x]=0x%08x (exp 0x0 0x0)\n",
 +				 t336_zeroed, t336_zero_from,
 +				 brcmf_pcie_read_ram32(devinfo,
 +						       t336_zero_from),
@@ -254,25 +254,25 @@
 -		brcmf_pcie_copy_mem_to_dev(devinfo, address, nvram,
 -					   nvram_len);
 +
-+		/* ==== BCM4360 patch 0036 (luka 3): na sciezce 7.77 zapis NVRAM
-+		 * na CZUBKU TCM jest POMIJANY -- te 212 B (T276 zmierzyl
-+		 * varsz=212) trafialyby w [TCM_end-212, TCM_end) =
-+		 * kontrakt+[0x5EAC, 0x5F80), czyli DOKLADNIE w slot rekordu TRAP
-+		 * (+0x5ED8..+0x5F5C) i w marker_end (+0x5F5C) -- w pola
-+		 * kontraktu, ktore fw czyta i ktore waliduje
-+		 * _wlc_ol_validate_shared_info. Host Apple nie pisze tam nic
-+		 * (jego jedyny zapis vars to memmove do base+0x24), a fw 7.77
-+		 * bierze vars wlasnie z kontraktu (test.340: fw wzial pare
-+		 * (0x9A0A4, 0xEC7) do wlc_hw+0x84/+0x88). Vars ida pod
-+		 * kontrakt+0x24 nizej, w oknie pre-release (funkcja
-+		 * bcm4360_ol77_write_vars). Snapshot T276 ponizej zostaje bez
-+		 * zmian -- .txt leci dalej do pol T276 (te sa dla 7.77
-+		 * bezznaczeniowe, ale T276 ma zostac odtwarzalny). */
++		/* ==== BCM4360 patch 0036 (gap 3): on the 7.77 path the NVRAM write
++		 * at the TOP of TCM is SKIPPED -- those 212 B (T276 measured
++		 * varsz=212) would land in [TCM_end-212, TCM_end) =
++		 * contract+[0x5EAC, 0x5F80), i.e. EXACTLY in the TRAP record slot
++		 * (+0x5ED8..+0x5F5C) and in marker_end (+0x5F5C) -- the contract
++		 * fields the fw reads and validates in
++		 * _wlc_ol_validate_shared_info. The Apple host writes nothing there
++		 * (its only vars write is the memmove to base+0x24), and the fw 7.77
++		 * takes vars precisely from the contract (test.340: the fw took the
++		 * pair (0x9A0A4, 0xEC7) into wlc_hw+0x84/+0x88). The vars go under
++		 * contract+0x24 below, in the pre-release window (the
++		 * bcm4360_ol77_write_vars function). The T276 snapshot below stays
++		 * unchanged -- the .txt flows to the T276 fields (those are
++		 * meaningless for 7.77, but T276 must stay reproducible). */
 +		if (bcm4360_ol77_path(devinfo)) {
 +			u32 ol77_off = nvram_len < BCM4360_OL77_CONTRACT_SIZE ?
 +				       BCM4360_OL77_CONTRACT_SIZE - nvram_len : 0;
 +
-+			pr_emerg("BCM4360 patch 0036 (luka 3): NVRAM %u B z %s NIE jest zapisany na czubku TCM (bylby w kontrakcie +[0x%x,0x%x) = slot rekordu TRAP +0x5ED8 i marker_end +0x5F5C); vars dla fw 7.77 ida pod kontrakt+0x%x (sciezka 7.77, patch 0036)\n",
++			pr_emerg("BCM4360 patch 0036 (gap 3): NVRAM %u B from %s is NOT written at the top of TCM (it would land in the contract +[0x%x,0x%x) = the TRAP record slot +0x5ED8 and marker_end +0x5F5C); vars for the fw 7.77 go to contract+0x%x (7.77 path, patch 0036)\n",
 +				 nvram_len, devinfo->nvram_name,
 +				 ol77_off, BCM4360_OL77_CONTRACT_SIZE,
 +				 BCM4360_OL77_VARS_OFF);
@@ -288,27 +288,27 @@
  			}
  		}
 +
-+		/* ==== BCM4360 patch 0036 (luka 3): VARS POD KONTRAKTEM na sciezce
-+		 * 7.77 -- NA STALE, bez parametru (ta sama tresc i ten sam odczyt
-+		 * zwrotny, co test.338 z patcha 0031: 176 kluczy / 3783 B z SPROMu
-+		 * ukladu, bo fw 7.77 bierze vars wlasnie z +0x20/+0x24 -- test.340
-+		 * zmierzyl pare (0x9A0A4, 0xEC7) w wlc_hw+0x84/+0x88).
++		/* ==== BCM4360 patch 0036 (gap 3): VARS UNDER THE CONTRACT on the
++		 * 7.77 path -- PERMANENTLY, no parameter (the same content and the same
++		 * readback as test.338 from patch 0031: 176 keys / 3783 B from the
++		 * chip SPROM, because the fw 7.77 takes vars precisely from +0x20/+0x24 --
++		 * test.340 measured the pair (0x9A0A4, 0xEC7) in wlc_hw+0x84/+0x88).
 +		 *
-+		 * Miejsce: koniec okna pre-release -- PO tescie.336 (markery
-+		 * +0x0/+0x5F5C i msgbuf +0x4/+0x8/+0xC) i PO bloku T325 (ktory
-+		 * zeruje [host+0x28E0, TCM_end); nasz zakres +0x24..+0xEEB lezy
-+		 * PONIZEJ tego zeroowania), czyli ostatni zapis TCM przed
-+		 * brcmf_chip_set_active -- dokladnie tam, gdzie pisze go test.338.
-+		 * Gdy test338=1, jego blok robi to samo; wtedy ten sie wycofuje
-+		 * (jedna linia logu), zeby nie pisac dwa razy. ZERO dostepow do
-+		 * D11. */
++		 * Place: the end of the pre-release window -- AFTER test.336 (markers
++		 * +0x0/+0x5F5C and msgbuf +0x4/+0x8/+0xC) and AFTER the T325 block (which
++		 * zeroes [host+0x28E0, TCM_end); our +0x24..+0xEEB range lies
++		 * BELOW that zeroing), i.e. the last TCM write before
++		 * brcmf_chip_set_active -- exactly where test.338 writes it.
++		 * When test338=1, that block does the same; then this one backs off
++		 * (one log line), so nothing is written twice. ZERO
++		 * D11 access. */
 +		if (bcm4360_ol77_path(devinfo) &&
 +		    devinfo->ci->ramsize > BCM4360_OL77_CONTRACT_SIZE) {
 +			if (bcm4360_test338_vars) {
-+				pr_emerg("BCM4360 patch 0036 (luka 3): vars pod kontraktem pisze test.338 (patch 0031) -- ten blok sie wycofuje, zero MMIO\n");
++				pr_emerg("BCM4360 patch 0036 (gap 3): vars under the contract are written by test.338 (patch 0031) -- this block backs off, zero MMIO\n");
 +			} else {
 +				if (!bcm4360_test336_apple_shared_host)
-+					pr_emerg("BCM4360 patch 0036 (luka 3): UWAGA test336=0 -- markery apple (+0x0/+0x5F5C) i msgbuf (+0x4/+0x8/+0xC) NIE sa zapisane, wiec walidator fw odrzuci strukture niezaleznie od vars; ten zapis mierzy ZAPIS, nie start fw\n");
++					pr_emerg("BCM4360 patch 0036 (gap 3): WARNING test336=0 -- the apple markers (+0x0/+0x5F5C) and msgbuf (+0x4/+0x8/+0xC) are NOT written, so the fw validator will reject the struct regardless of vars; this write measures the WRITE, not the fw boot\n");
 +				bcm4360_ol77_write_vars(devinfo,
 +							devinfo->ci->ramsize -
 +							BCM4360_OL77_CONTRACT_SIZE);
@@ -317,3 +317,4 @@
  	}
  
  	sharedram_addr_written = brcmf_pcie_read_ram32(devinfo,
+

@@ -2,7 +2,7 @@
 +++ b/brcmfmac/pcie.c
 @@ -244,6 +244,80 @@
  #define BCM4360_OL77_VARS_OFF		(BCM4360_T336_SI_VARS)		/* +0x24 */
- #define BCM4360_OL77_ZERO_CHUNK		4096	/* B na jeden zapis zerowania */
+ #define BCM4360_OL77_ZERO_CHUNK		4096	/* B per one zeroing write */
  
 +/* ==== BCM4360 patch 0037 (gaps 4b and 2a from the runbook + R1/R2/R3/R5 from the
 + * DMA-IRQ-addresses audit): closes the 7.77 substrate -- ENABLED PERMANENTLY for
@@ -72,7 +72,7 @@
 + * 0x0FFFFFFF = 28 bits = 256 MB and granularity 0x800, index 7 -- that is a
 + * different number and mechanism than the addressing window; do not mix them.) */
 +#define BCM4360_OL77_DMA_WIN_MASK	0x03FFFFFF	/* bity [25:0] w fw */
-+#define BCM4360_OL77_DMA_WIN_SIZE	0x04000000	/* 64 MiB okna SB->PCIE */
++#define BCM4360_OL77_DMA_WIN_SIZE	0x04000000	/* 64 MiB SB->PCIE window */
 +/* patch 0037 (L4-b): delay before the post-doorbell evidence. In test.344/345 the
 + * evidence (autopsy T314 + console dump T343) lived in the rxctl TIMEOUT branch
 + * -- after 5 s of waiting. The new path has no timeout, so the delay must be
@@ -216,14 +216,14 @@
  		devinfo->olmsg_resp_wait, !devinfo->olmsg_resp_pending,
  		msecs_to_jiffies(BCM4360_OLMSG_CTL_RESP_TIMEOUT_MS));
 @@ -5429,10 +5601,52 @@
-  * w bit jak patch 0035). */
+  * bit for bit as patch 0035). */
  static bool bcm4360_ol77_path(struct brcmf_pciedev_info *devinfo)
  {
 -	return devinfo->ci->chip == BRCM_CC_4360_CHIP_ID &&
-+	/* patch 0037: guard na devinfo->ci (tak jak w bcm4360_olmsg_active,
-+	 * pcie.c:1609) -- ta funkcja ma juz 7 miejsc wolania, m.in. cztery nowe
-+	 * z 0037, a wolanie jej przed przypisaniem ci = oops. Zero zmian
-+	 * zachowania: dzisiaj kazde miejsce wolania jest po ustawieniu ci. */
++	/* patch 0037: guard on devinfo->ci (as in bcm4360_olmsg_active,
++	 * pcie.c:1609) -- this function already has 7 call sites, incl. four new
++	 * ones from 0037, and calling it before ci is assigned = oops. Zero
++	 * behavior change: today every call site runs after ci is set. */
 +	return devinfo->ci && devinfo->ci->chip == BRCM_CC_4360_CHIP_ID &&
  	       (bcm4360_test321_fw_apple == 2 || bcm4360_test321_fw_apple == 3);
  }
@@ -306,20 +306,20 @@
  				u32 t336_t276_magic;
 +				bool t336_msgbuf_ok;
 +
-+				/* BCM4360 patch 0037 (R3): bramka adresu DMA przed
-+				 * publikacja pol msgbuf (+0x4/+0x8). Uzasadnienie
-+				 * i dowody: bcm4360_ol77_dma_addr_ok() powyzej.
-+				 * Bramka dziala TYLKO na sciezce 7.77 -- poza nia
-+				 * (obrazy 0/1) zapis jest bezwarunkowy, jak przed
-+				 * patchem 0037. Gdy adres odpada, NIE publikujemy
-+				 * tych dwoch pol (reszta kontraktu idzie jak dotad:
-+				 * markery, heartbeat i flaga TRAP sa potrzebne
-+				 * bramce T337 i nie zaleza od adresu), a odczyt
-+				 * zwrotny nizej pokaze, co zostalo w TCM. */
++				/* BCM4360 patch 0037 (R3): DMA-address gate before
++				 * publishing the msgbuf fields (+0x4/+0x8). Rationale
++				 * and evidence: bcm4360_ol77_dma_addr_ok() above.
++				 * The gate acts ONLY on the 7.77 path -- outside it
++				 * (images 0/1) the write is unconditional, as before
++				 * patch 0037. When the address fails, we do NOT publish
++				 * these two fields (the rest of the contract goes on as
++				 * before: markers, heartbeat and the TRAP flag are needed
++				 * by the T337 gate and do not depend on the address), and
++				 * the readback below will show what is left in TCM. */
 +				t336_msgbuf_ok = !bcm4360_ol77_path(devinfo) ||
 +						 bcm4360_ol77_dma_addr_ok(t336_dma);
 +				if (!t336_msgbuf_ok)
-+					pr_err("BCM4360 patch 0037 (R3): adres DMA msgbuf 0x%llx ODPADA na bramce (fw czyta tylko dolny dword i buduje z niego okno SB->PCIE: wymagane <4GiB ORAZ (adres & 0x%08x) + 0x%x <= 0x%x) -- pol +0x4/+0x8 NIE publikuje; reszta kontraktu bez zmian\n",
++					pr_err("BCM4360 patch 0037 (R3): msgbuf DMA address 0x%llx FAILS the gate (the fw reads only the low dword and builds the SB->PCIE window from it: needs <4GiB AND (address & 0x%08x) + 0x%x <= 0x%x) -- NOT publishing +0x4/+0x8; the rest of the contract unchanged\n",
 +					       (unsigned long long)t336_dma,
 +					       BCM4360_OL77_DMA_WIN_MASK,
 +					       BCM4360_T276_OLMSG_BUF_SIZE,
@@ -337,8 +337,8 @@
 -				brcmf_pcie_write_ram32(devinfo,
 -					t336_base + BCM4360_T336_SI_MSGBUFADDR_HI,
 -					upper_32_bits(t336_dma));
-+				/* patch 0037 (R3): pola msgbuf publikujemy tylko
-+				 * gdy adres przechodzi bramke (patrz wyzej). */
++				/* patch 0037 (R3): publish the msgbuf fields only
++				 * when the address passes the gate (see above). */
 +				if (t336_msgbuf_ok) {
 +					brcmf_pcie_write_ram32(devinfo,
 +						t336_base + BCM4360_T336_SI_MSGBUFADDR_LO,
@@ -355,33 +355,33 @@
  			}
  		}
 +
-+		/* ==== BCM4360 patch 0037 (L2-a, R1 z audytu): POLA SEMAFORA okna
-+		 * TCM -- flag[0] (+0x14) i flag[1] (+0x18) := 0, DOKLADNIE jak host
-+		 * Apple (0x73a3d: movl %r15d,-0x10(%r12) i 0x73a42: movl %r15d,
-+		 * -0xc(%r12), gdzie r12 = baza+0x24, czyli baza+0x14 / baza+0x18;
++		/* ==== BCM4360 patch 0037 (L2-a, R1 from the audit): SEMAPHORE FIELDS of
++		 * the TCM window -- flag[0] (+0x14) and flag[1] (+0x18) := 0, EXACTLY as
++		 * the Apple host (0x73a3d: movl %r15d,-0x10(%r12) and 0x73a42: movl
++		 * %r15d,-0xc(%r12), where r12 = base+0x24, i.e. base+0x14 / base+0x18;
 +		 * tmp/re-kext-verify/full.dis:125773-125790).
 +		 *
-+		 * Dlaczego to nie kosmetyka: to semafor Petersona na okno TCM
-+		 * (notes/). Fw w tcm_sem_enter (0x13022-0x13058)
-+		 * ustawia flag[1]=1 i turn=0, po czym czeka w petli BEZ WYJSCIA na
-+		 * flag[0] != 1 (po 3000 obrotach jeden printf i dalszy spin).
-+		 * Zastane flag[0]=1 -- a TCM NIE czysci sie rebootem (CLAUDE.md p. 5),
-+		 * wiec pole przenosi wartosc miedzy biegami -- to cicha, wieczna
-+		 * petla fw. Fw czyta +0x14 w calym obrazie 7.77 DOKLADNIE RAZ
-+		 * (0x1304e; tmp/audyt-dma-fw-kontrakt-gtrack.txt:116) i NIGDY go nie
-+		 * zapisuje, wiec nie ma komu tego sprzatnac poza hostem.
++		 * Why this is not cosmetics: it is a Peterson semaphore over the TCM
++		 * window (notes/). The fw in tcm_sem_enter (0x13022-0x13058)
++		 * sets flag[1]=1 and turn=0, then waits in a loop WITH NO EXIT for
++		 * flag[0] != 1 (after 3000 rotations one printf and further spinning).
++		 * A leftover flag[0]=1 -- and TCM does NOT clear on reboot (CLAUDE.md
++		 * p. 5), so the field carries its value between runs -- is a silent,
++		 * eternal fw loop. The fw reads +0x14 across the whole 7.77 image
++		 * EXACTLY ONCE (0x1304e; tmp/audyt-dma-fw-kontrakt-gtrack.txt:116) and
++		 * NEVER writes it, so nobody can clean it up except the host.
 +		 *
-+		 * turn (+0x1C) zostawiamy NIETKNIETY: nie pisze go ani Apple (jego
-+		 * dwa movl dotycza tylko +0x14/+0x18), ani wl.ko, a fw sam zeruje go
-+		 * w tcm_sem_enter; przy flag[0]=0 warunek petli i tak nie zachodzi.
-+		 * Odczyt turn w logu ponizej jest tylko kontrola, ze nasz patch go
-+		 * nie rusza.
++		 * turn (+0x1C) is left UNTOUCHED: neither Apple (its two movl concern
++		 * only +0x14/+0x18), nor wl.ko writes it, and the fw zeroes it itself in
++		 * tcm_sem_enter; with flag[0]=0 the loop condition does not hold anyway.
++		 * The turn read in the log below is only a check that our patch does not
++		 * move it.
 +		 *
-+		 * Bramki: tylko sciezka 7.77 + ramsize > 0x5F80 (bez tego drugiego
-+		 * baza kontraktu liczylaby sie ujemnie). Zapis idzie na SAMYM KONCU
-+		 * okna pre-release (po bloku T276, po T325 i po vars z 0036 --
-+		 * zaden z nich nie dotyka +0x14/+0x18 przy tej bazie), tuz przed
-+		 * brcmf_chip_set_active. ZERO dostepow do D11. */
++		 * Gates: only the 7.77 path + ramsize > 0x5F80 (without the second one
++		 * the contract base would compute negative). The write goes at the VERY
++		 * END of the pre-release window (after the T276 block, after T325 and
++		 * after the 0036 vars -- none of them touches +0x14/+0x18 at this base),
++		 * right before brcmf_chip_set_active. ZERO accesses to D11. */
 +		if (bcm4360_ol77_path(devinfo) &&
 +		    devinfo->ci->ramsize > BCM4360_OL77_CONTRACT_SIZE) {
 +			u32 t336o_base = devinfo->ci->ramsize -
@@ -390,34 +390,34 @@
 +			u32 t336o_f1_pre;
 +			u32 t336o_turn;
 +
-+			/* Kontrola H-T1 (notes/ par. 1.3
-+			 * poz. L2-e): co bylo w tych polach PRZED naszym zapisem.
-+			 * Zmierzone wczesniej smieci (np. 0x5dc8ca30) to cudza
-+			 * tresc w oknie, ktorego nikt nie zeruje -- ten odczyt
-+			 * pokazuje to wprost w logu fire'a. */
++			/* Check H-T1 (notes/ par. 1.3
++			 * item L2-e): what was in these fields BEFORE our write.
++			 * Previously measured junk (e.g. 0x5dc8ca30) is foreign
++			 * content in a window nobody zeroes -- this read shows
++			 * exactly that in the fire's log. */
 +			t336o_f0_pre = brcmf_pcie_read_ram32(devinfo,
 +					t336o_base + BCM4360_OL77_SI_FLAG0);
 +			t336o_f1_pre = brcmf_pcie_read_ram32(devinfo,
 +					t336o_base + BCM4360_OL77_SI_FLAG1);
 +			t336o_turn = brcmf_pcie_read_ram32(devinfo,
 +					t336o_base + BCM4360_OL77_SI_TURN);
-+			pr_emerg("BCM4360 patch 0037 (L2-a): semafor TCM przed zapisem: flag0@+0x%x=0x%08x flag1@+0x%x=0x%08x turn@+0x%x=0x%08x (turn NIETKNIETY -- nie pisze go ani Apple, ani wl.ko)\n",
++			pr_emerg("BCM4360 patch 0037 (L2-a): TCM semaphore before the write: flag0@+0x%x=0x%08x flag1@+0x%x=0x%08x turn@+0x%x=0x%08x (turn UNTOUCHED -- neither Apple, nor wl.ko writes it)\n",
 +				 BCM4360_OL77_SI_FLAG0, t336o_f0_pre,
 +				 BCM4360_OL77_SI_FLAG1, t336o_f1_pre,
 +				 BCM4360_OL77_SI_TURN, t336o_turn);
 +
-+			/* Wlasciwy zapis: 1:1 jak Apple (0x73a3d / 0x73a42).
-+			 * Wylacznie ZERA -- w te pola nigdy nie wolno wpisac 1
-+			 * (flag0=1 przy turn=0 zakleszcza fw, notes/flag-turn-
++			/* The actual write: 1:1 as Apple (0x73a3d / 0x73a42).
++			 * ONLY ZEROS -- these fields must never hold a 1
++			 * (flag0=1 with turn=0 deadlocks the fw, notes/flag-turn-
 +			 * semafor.md). */
 +			brcmf_pcie_write_ram32(devinfo,
 +					t336o_base + BCM4360_OL77_SI_FLAG0, 0);
 +			brcmf_pcie_write_ram32(devinfo,
 +					t336o_base + BCM4360_OL77_SI_FLAG1, 0);
 +
-+			/* Odczyt zwrotny: dowod, ze zapis DOTARL (a nie tylko
-+			 * zostal wydany) + turn bez zmian. */
-+			pr_emerg("BCM4360 patch 0037 (L2-a): semafor TCM po zapisie: flag0=0x%08x flag1=0x%08x turn=0x%08x (exp 0x0 0x0 i turn bez zmian; zapis jak Apple 0x73a3d/0x73a42 -- fw czyta +0x14 raz, w tcm_sem_enter 0x1304e)\n",
++			/* Readback: proof that the write ARRIVED (not just issued)
++			 * plus turn unchanged. */
++			pr_emerg("BCM4360 patch 0037 (L2-a): TCM semaphore after the write: flag0=0x%08x flag1=0x%08x turn=0x%08x (exp 0x0 0x0 and turn unchanged; write as Apple 0x73a3d/0x73a42 -- the fw reads +0x14 once, in tcm_sem_enter 0x1304e)\n",
 +				 brcmf_pcie_read_ram32(devinfo,
 +						t336o_base + BCM4360_OL77_SI_FLAG0),
 +				 brcmf_pcie_read_ram32(devinfo,

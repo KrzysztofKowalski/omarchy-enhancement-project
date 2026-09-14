@@ -4,7 +4,7 @@
 # Edit SERVER / SHARES / CRED to match your NAS.
 set -euo pipefail
 
-SERVER=192.168.1.0            # <-- replace with your NAS address
+SERVER=<nas-address>            # <-- replace with your NAS address
 USER="$USER"                  # <-- your SMB username
 BASE=/mnt/nas
 CRED="$HOME/.smbcred-nas"

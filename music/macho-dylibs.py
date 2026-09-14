@@ -15,8 +15,8 @@ import sys
 
 # magic (stored little-endian in the file)
 MH_MAGIC_64 = 0xFEEDFACF  # thin 64-bit
-FAT_MAGIC = 0xCAFEBABE     # FAT, wpisy fat_arch (32-bitowe)
-FAT_MAGIC_64 = 0xCAFEBABF  # FAT, wpisy fat_arch_64
+FAT_MAGIC = 0xCAFEBABE     # FAT, fat_arch entries (32-bit)
+FAT_MAGIC_64 = 0xCAFEBABF  # FAT, fat_arch_64 entries
 
 CPU_TYPE_X86_64 = 0x01000007
 CPU_TYPE_ARM64 = 0x0100000C
@@ -90,11 +90,11 @@ def main():
 
     data = open(path, "rb").read()
     raw = data[:4]
-    if raw == b"\xfe\xed\xfa\xcf":  # MH_MAGIC_64 (LE w pliku)
+    if raw == b"\xfe\xed\xfa\xcf":  # MH_MAGIC_64 (LE in file)
         magic = MH_MAGIC_64
-    elif raw == b"\xca\xfe\xba\xbe":  # FAT_MAGIC (BE w pliku)
+    elif raw == b"\xca\xfe\xba\xbe":  # FAT_MAGIC (BE in file)
         magic = FAT_MAGIC
-    elif raw == b"\xca\xfe\xba\xbf":  # FAT_MAGIC_64 (BE w pliku)
+    elif raw == b"\xca\xfe\xba\xbf":  # FAT_MAGIC_64 (BE in file)
         magic = FAT_MAGIC_64
     else:
         print(f"Unknown format: first bytes {raw.hex()} (not Mach-O 64-bit nor FAT)")

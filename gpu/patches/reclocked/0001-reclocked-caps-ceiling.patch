@@ -35,9 +35,9 @@ index 7163b56..955d778 100644
 +    // below), max (ceiling), busy-up (own UP-LOAD threshold, %; 0 = global).
 +    // Syntax: "class = floor=0a, max=0e, busy-up=50" (each key optional).
 +    struct ClassCap {
-+        int floor   = -1;   // idx w LADDER; -1 = brak floor (IDLE do 07)
-+        int max     = -1;   // idx w LADDER; -1 = ceiling profilu
-+        int busy_up = 0;    // % busy do UP-LOAD; 0 = globalny busy-up (80)
++        int floor   = -1;   // idx in LADDER; -1 = no floor (IDLE down to 07)
++        int max     = -1;   // idx in LADDER; -1 = profile ceiling
++        int busy_up = 0;    // % busy for UP-LOAD; 0 = global busy-up (80)
 +    };
 +    std::map<std::string, ClassCap> class_caps;
  
@@ -47,7 +47,7 @@ index 7163b56..955d778 100644
              cfg.low_power_classes.insert(t);
              continue;
          }
-+        // v4.4: sekcja "caps" — per-klasowa polityka: "klasa = floor=0a, max=0e, busy-up=50".
++        // v4.4: the "caps" section — per-class policy: "class = floor=0a, max=0e, busy-up=50".
 +        if (section == "caps") {
 +            size_t eqc = t.find('=');
 +            if (eqc == std::string::npos) continue;
@@ -81,9 +81,9 @@ index 7163b56..955d778 100644
          // z focusem trzyma 07.
          bool low_power_focused = hypr_alive && !focused_class.empty() &&
                                   g_cfg.low_power_classes.count(focused_class) > 0;
-+        // v4.4: klasa z wpisem [caps] — per-klasowa polityka (floor/max/busy-up).
++        // v4.4: class with an entry [caps] — per-class policy (floor/max/busy-up).
 +        // Applied when the class is FOCUSED; a browser tab (chromium etc.)
-+        // nie ma wpisu → title-priority force-0e bez zmian.
++        // no entry → title-priority force-0e unchanged.
 +        const Config::ClassCap* ccap = nullptr;
 +        if (hypr_alive && !focused_class.empty()) {
 +            auto cit = g_cfg.class_caps.find(focused_class);
@@ -94,21 +94,21 @@ index 7163b56..955d778 100644
          bool pref_sig = false;
          if (hypr_alive && !low_power_focused) {
 -            // focused ∈ lista?
-+            // focused ∈ lista ([preferred] lub [caps])?
++            // focused ∈ list ([preferred] or [caps])?
              if (!focused_class.empty() &&
 -                g_cfg.preferred_classes.count(focused_class))
 +                (g_cfg.preferred_classes.count(focused_class) ||
 +                 cap_class_focused))
                  pref_sig = true;
 -            // running ∈ lista AND busy > busy_up?
-+            // running ∈ lista ([preferred]) AND busy > busy_up?  [caps] tylko gdy focused.
++            // running ∈ list ([preferred]) AND busy > busy_up?  [caps] only when focused.
              if (!pref_sig && (int)busy_avg > busy_up_pp) {
                  for (auto& r : running_classes) {
                      if (g_cfg.preferred_classes.count(r)) { pref_sig = true; break; }
 @@ -1365,7 +1422,11 @@ int main(int argc, char** argv)
              // are browser tabs — detection by window title, case-insensitive.)
              // v4.3: title-match has the TOP priority — sets title_pref=true, which
-             // wymusza UP do ceiling bez busy-gate i suppress IDLE (patrz UP-LOAD/IDLE).
+             // forces UP to the ceiling without a busy-gate and suppresses IDLE (see UP-LOAD/IDLE).
 -            if (!focused_title.empty()) {
 +            // v4.4: skip title-match for [caps] classes — desktop Discord is
 +            // handled by [caps] (floor/busy-gate), not a title force-0e.

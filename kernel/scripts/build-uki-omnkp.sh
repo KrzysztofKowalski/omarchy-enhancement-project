@@ -45,7 +45,7 @@ CMDLINE_FILE="$TMP/omnkp-cmdline.txt"
 # of the root partition (`blkid`) and resume_offset (`filefrag -v` on the swapfile).
 # Same disk/partitions as nvkp — omnkp REPLACES nvkp, it is not a separate system.
 # ----------------------------------------------------------------------------
-CMDLINE="cryptdevice=PARTUUID=<PARTUUID-partycji-root-z-blkid>:root root=/dev/mapper/root zswap.enabled=0 rootflags=subvol=@ rw rootfstype=btrfs resume=/dev/mapper/root resume_offset=<OFFSET-Z-filefrag> initramfs_async=0 cryptkey=rootfs:/crypto_keyfile.bin loglevel=7 systemd.show_status=true"
+CMDLINE="cryptdevice=PARTUUID=<PARTUUID-of-root-partition-via-blkid>:root root=/dev/mapper/root zswap.enabled=0 rootflags=subvol=@ rw rootfstype=btrfs resume=/dev/mapper/root resume_offset=<OFFSET-from-filefrag> initramfs_async=0 cryptkey=rootfs:/crypto_keyfile.bin loglevel=7 systemd.show_status=true"
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -243,6 +243,6 @@ yellow "Removing the UKI entry: sudo limine-entry-tool --remove-uki ${UKI_NAME}"
 
 # ----------------------------------------------------------------------------
 # Quiet version (once stability is confirmed) — replace CMDLINE with:
-#   cryptdevice=PARTUUID=<PARTUUID-partycji-root-z-blkid>:root root=/dev/mapper/root zswap.enabled=0 rootflags=subvol=@ rw rootfstype=btrfs resume=/dev/mapper/root resume_offset=<OFFSET-Z-filefrag> initramfs_async=0 cryptkey=rootfs:/crypto_keyfile.bin quiet splash loglevel=0 systemd.show_status=false rd.udev.log_level=0 vt.global_cursor_default=0
+#   cryptdevice=PARTUUID=<PARTUUID-of-root-partition-via-blkid>:root root=/dev/mapper/root zswap.enabled=0 rootflags=subvol=@ rw rootfstype=btrfs resume=/dev/mapper/root resume_offset=<OFFSET-from-filefrag> initramfs_async=0 cryptkey=rootfs:/crypto_keyfile.bin quiet splash loglevel=0 systemd.show_status=false rd.udev.log_level=0 vt.global_cursor_default=0
 # and run the script again (it will rebuild the UKI with the new cmdline).
 # ----------------------------------------------------------------------------

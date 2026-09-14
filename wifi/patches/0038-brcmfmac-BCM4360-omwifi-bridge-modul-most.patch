@@ -2,12 +2,12 @@
 +++ b/brcmfmac/Makefile
 @@ -1,6 +1,13 @@
  # SPDX-License-Identifier: ISC
-+# ==== BCM4360 patch 0038: modul-most omwifi_bridge (osobny modul OBOK brcmfmac.ko)
-+# brcmfmac zostaje bez zmian bit w bit; most trzyma karte BCM4360 (14e4:43a0) na
-+# wlasnosc i wystawia strone hosta fw 7.77 userspace'owi przez /dev/omwifi.
-+# Zrodlo: brcmfmac/omwifi_bridge.c (ten sam patch). Wstawka lezy po linii SPDX
-+# celowo: linie 1-6 Makefile sa identyczne w drzewie przed i po wstawce
-+# forced-config.mk, wiec latka wchodzi bez offsetu w OBU stanach drzewa.
++# ==== BCM4360 patch 0038: bridge module omwifi_bridge (a separate module NEXT TO brcmfmac.ko)
++# brcmfmac stays bit-for-bit unchanged; the bridge holds the BCM4360 card (14e4:43a0)
++# and exposes the 7.77 fw host side to userspace through /dev/omwifi.
++# Source: brcmfmac/omwifi_bridge.c (this same patch). The insert sits after the SPDX line
++# on purpose: Makefile lines 1-6 are identical in the tree before and after the insert
++# forced-config.mk, so the patch applies without an offset in BOTH tree states.
 +obj-m += omwifi_bridge.o
  #
  # Makefile fragment for Broadcom 802.11 Networking Device Driver
@@ -19,71 +19,71 @@
 @@ -0,0 +1,2446 @@
 +// SPDX-License-Identifier: ISC
 +/* ============================================================================
-+ * omwifi_bridge.c -- MOST do karty BCM4360 (14e4:43a0) z firmware Broadcom 7.77
-+ * zaembedowanym przez Apple (patch 0038).
++ * omwifi_bridge.c -- a BRIDGE to the BCM4360 card (14e4:43a0) with Broadcom 7.77 firmware
++ * embedded by Apple (patch 0038).
 + *
-+ * PO CO: dzisiaj KAZDE podejscie do karty konczy sie rebootem -- po insmodzie
-+ * karta jest BOUND (CLAUDE.md p. 5: zakaz rmmod), a SBR nie czysci TCM
-+ * (CLAUDE.md p. 5), wiec kolejny test wymaga rebootu i przebudowy. Ten modul
-+ * jest ladowany RAZ i trzyma karte na wlasnosc (brcmfmac NIE jest ladowany),
-+ * a cala strone hosta fw 7.77 wystawia userspace'owi przez /dev/omwifi
-+ * z protokolem TEKSTOWYM (jedna komenda = jedna linia). Iteracja to komenda:
-+ * `reset` + `zero` robia to, co dotad wymagalo rebootu.
++ * WHY: today EVERY touch of the card ends in a reboot -- after insmod
++ * the card is BOUND (project rulebook, item 5: rmmod forbidden), and SBR does not clear TCM
++ * (project rulebook, item 5), so the next test needs a reboot and a rebuild. This module
++ * is loaded ONCE and owns the card (brcmfmac is NOT loaded),
++ * and exposes the whole 7.77 fw host side to userspace through /dev/omwifi
++ * with a TEXT protocol (one command = one line). Iteration means a command:
++ * `reset` + `zero` do what until now required a reboot.
 + *
-+ * SKAD LOGIKA: jest przeniesiona z narzedzia userspace `tmp/minihost/minihost.c`
-+ * (zweryfikowanego liczbowo -- notes/ sekcje 1-10)
-+ * i z notatek wymienionych przy kazdej komendzie. Roznice modul-vs-minihost sa
-+ * wylacznie tam, gdzie w kernelu nie ma odpowiednika albo gdzie minihost ma blad:
-+ *  (a) bufor DMA: `dma_alloc_coherent` zamiast mmap+mlock+pagemap z userspace
-+ *      (minihost MUSI szukac okna 16 kolejnych stron pod naciskiem pamieciowym
-+ *      -- notes/ par. 10; jadro dostaje niski
-+ *      adres od razu, w fire'ach 0x01280000),
-+ *  (b) `zero` z poczatkiem 0x6E322 (nie%4==0): minihost ma tam TWARDY blad --
-+ *      jego tcm_write32() odrzuca zapis niewyrownany (minihost.c:367-374), wiec
-+ *      realny `zero 0x6e322 0x9a080` konczylby sie `blad("TCM: zapis
-+ *      niewyrownany")` i NIC by nie wyzerowal. Modul (patch 0036, pcie.c
-+ *      bcm4360_ol77_zero_range) te bajty zapisuje i to zostalo ZMIERZONE
-+ *      w test.345 -- most robi jak modul,
-+ *  (c) konsola i rejestry: BAR2/BAR0 (mmap zastepuje ioread32).
++ * WHERE THE LOGIC COMES FROM: ported from the userspace reference tool
++ * (verified numerically -- the project notes, sections 1-10)
++ * and from the notes cited at each command. The module-vs-reference differences are
++ * only where the kernel has no equivalent or where the reference tool has a bug:
++ *  (a) DMA buffer: `dma_alloc_coherent` instead of mmap+mlock+pagemap from userspace
++ *      (the reference tool must hunt for a window of 16 consecutive pages under memory pressure
++ *      -- the project notes par. 10; the kernel gets a low
++ *      address right away, 0x01280000 in the fires),
++ *  (b) `zero` starting at 0x6E322 (not %4==0): the reference tool has a HARD bug there --
++ *      its tcm_write32() rejects an unaligned write (reference tool l. 367-374), so
++ *      a real `zero 0x6e322 0x9a080` would end with the tool's "TCM: unaligned
++ *      write" error and zero NOTHING. The module (patch 0036, pcie.c
++ *      bcm4360_ol77_zero_range) writes those bytes and this was MEASURED
++ *      in test.345 -- the bridge does it like the module,
++ *  (c) console and registers: BAR2/BAR0 (mmap replaced by ioread32).
 + *
-+ * -- PROTOKOL (kazda komenda = jedna linia na /dev/omwifi) -----------------
-+ *   help | status | reset | zero <od_hex> <do_hex> | loadfw <sciezka> |
-+ *   ringinit | contract | vars <sciezka> | maccontrol <hex> d11-ok | release |
++ * -- PROTOCOL (each command = one line on /dev/omwifi) -----------------
++ *   help | status | reset | zero <from_hex> <to_hex> | loadfw <path> |
++ *   ringinit | contract | vars <path> | maccontrol <hex> d11-ok | release |
 + *   gate [ms] | send <typ_hex> <len_hex> <payload_hex|-> | sendtrio |
 + *   irq on|off | read contract|console|rings|heartbeat|trap|tcm <adr> <len> | d2h
-+ *   Zapis:  echo "status" > /dev/omwifi
-+ *   Odczyt: cat /dev/omwifi      (odpowiedz RAZ, potem EOF -- `cat` konczy)
++ *   Write:  echo "status" > /dev/omwifi
++ *   Read: cat /dev/omwifi      (the answer comes ONCE, then EOF -- `cat` exits)
 + *
-+ * -- ZASADY TWARDE W KODZIE ------------------------------------------------
-+ *  1. Strona rdzenia D11 0x18001000..0x18001fff to HARD RULE (CLAUDE.md p. 7;
-+ *     fire #21 = zwis maszyny). Kazdy dostep przez BAR0 przechodzi przez
-+ *     om_bp_read32/om_bp_write32, ktore ODRZUCAJA ta strone PRZED dotknieciem
-+ *     BAR0 (predykat 1:1 z bcm4360_t328_is_d11_page(), pcie.c:2784-2792).
-+ *     Jedyny dopuszczony dostep to seed D11 maccontrol (0x18001120) i tylko za
-+ *     PODWOJNA bramka: parametr modulu `d11_ok=1` ORAZ token `d11-ok` w samej
-+ *     komendzie. Bez obu -- ODMOWA przed jakimkolwiek MMIO.
-+ *  2. Okno backplane (config 0x80) jest ZAWSZE zapisywane z KONTROLA ODCZYTU
-+ *     przed dotknieciem BAR0 (wzorzec bcm4360_t328_bp_read32, pcie.c:2796-2817)
-+ *     i ZAWSZE wraca na PCIE2 (0x18003000) po operacji -- takze na sciezkach
-+ *     bledu (notes/).
-+ *  3. Zapis TCM jednym sposobem: 32-bitowy iowrite32 (wymog 4360 z patcha 0003:
-+ *     64-bit memcpy_toio wiesza magistrale -- pcie.c brcmf_pcie_copy_mem_to_dev).
-+ *  4. Zero odczytow/zapisow poza BAR0, BAR2 i config space. Zadnych innych
-+ *     BAR-ow, zadnych rejestrow D11.
-+ *  5. Pola msgbufaddr_lo/hi kontraktu ida do TCM TYLKO wtedy, gdy adres bufora
-+ *     DMA przechodzi bramke `adres < 4 GiB` ORAZ
-+ *     `(adres & 0x3FFFFFF) + 0x10000 <= 0x4000000` (minihost.c:517-521;
-+ *     notes/ par. 1; binarium fw 7.77: 0x3a7c ldr
-+ *     r3,[r2,#4] -> bic #0xfc000000 -> orr #0x08000000 -> str [r0,#0x38] oraz
-+ *     sbtopcie0 := (low & 0xFC000000) | 0xC). Gdy nie przechodzi -- NIE
-+ *     publikujemy i krzyczymy (nie "zakladamy").
-+ *  6. `loadfw` NIE pisze TCM[ramsize-4] (R2 z notes/:
-+ *     ten zapis jest ze sciezki msgbuf i trafia w kontrakt+0x5F7C, ktorego
-+ *     Apple nie pisze; patch 0037 robi to samo na sciezce 7.77).
-+ *  7. Semafor okna TCM (flag[0] +0x14, flag[1] +0x18, turn +0x1C) piszemy TYLKO
-+ *     zerami -- notes/: fw w tcm_sem_enter (0x1304e-0x13058)
-+ *     czeka w petli BEZ WYJSCIA, dopoki flag[0]==1 && turn==0, a TCM nie czysci
-+ *     sie rebootem => zastane flag[0]=1 = cicha, wieczysta petla fw.
++ * -- HARD RULES IN THE CODE ------------------------------------------------
++ *  1. The D11 core page 0x18001000..0x18001fff is a HARD RULE (project rulebook, item 7;
++ *     fire #21 = machine hang). Every BAR0 access goes through
++ *     om_bp_read32/om_bp_write32, which REJECT that page BEFORE touching
++ *     BAR0 (predicate 1:1 with bcm4360_t328_is_d11_page(), pcie.c:2784-2792).
++ *     The only allowed access is the D11 maccontrol seed (0x18001120), only behind
++ *     a DOUBLE gate: the module parameter `d11_ok=1` AND the token `d11-ok` in the
++ *     command itself. Without both -- REFUSAL before any MMIO.
++ *  2. The backplane window (config 0x80) is ALWAYS written with a READBACK
++ *     before touching BAR0 (pattern bcm4360_t328_bp_read32, pcie.c:2796-2817)
++ *     and ALWAYS returns to PCIE2 (0x18003000) after the operation -- also on error
++ *     paths (the project notes).
++ *  3. TCM writes one way only: 32-bit iowrite32 (the 4360 requirement from patch 0003:
++ *     64-bit memcpy_toio hangs the bus -- pcie.c brcmf_pcie_copy_mem_to_dev).
++ *  4. No reads/writes outside BAR0, BAR2 and config space. No other
++ *     BARs, no D11 registers.
++ *  5. The contract msgbufaddr_lo/hi fields go to TCM ONLY when the address of the buffer
++ *     passes the `address < 4 GiB` AND
++ *     `(address & 0x3FFFFFF) + 0x10000 <= 0x4000000` (reference tool l. 517-521;
++ *     the project notes par. 1; fw 7.77 binary: 0x3a7c ldr
++ *     r3,[r2,#4] -> bic #0xfc000000 -> orr #0x08000000 -> str [r0,#0x38] and
++ *     sbtopcie0 := (low & 0xFC000000) | 0xC). When it does not pass -- we do NOT
++ *     publish and we shout (we do not "assume").
++ *  6. `loadfw` does NOT write TCM[ramsize-4] (R2 from the project notes:
++ *     that write belongs to the msgbuf path and lands in contract+0x5F7C, which
++ *     Apple does not write; patch 0037 does the same on the 7.77 path).
++ *  7. The TCM window semaphore (flag[0] +0x14, flag[1] +0x18, turn +0x1C) is written ONLY
++ *     with zeros -- project notes: in tcm_sem_enter (0x1304e-0x13058) the fw
++ *     waits in a loop WITHOUT AN EXIT while flag[0]==1 && turn==0, and TCM does not clear
++ *     on reboot => a stale flag[0]=1 = a silent, eternal fw loop.
 + * ==========================================================================*/
 +
 +#include <linux/module.h>
@@ -104,34 +104,34 @@
 +#include <linux/interrupt.h>
 +#include <linux/init.h>
 +
-+/* ======================================================== identyfikacja karty */
++/* ======================================================== card identification */
 +
 +#define OM_VENDOR		0x14e4u	/* Broadcom (PCI_VENDOR_ID_BROADCOM) */
 +#define OM_DEVICE_4360		0x43a0u	/* BRCM_PCIE_4360_DEVICE_ID, brcm_hw_ids.h:87 */
 +#define OM_NAZWA		"omwifi_bridge"
 +#define OM_DEV			"/dev/omwifi"
 +
-+/* BAR-y (logi fire'ow: resource0 = 0x8000, resource2 = 0x200000) */
-+#define OM_BAR0_ROZMIAR		0x8000u		/* 32 KiB: rejestry PCIE2 + okno */
-+#define OM_BAR2_ROZMIAR		0x200000u	/* 2 MiB: okno na RAM fw (TCM) */
-+#define OM_BAR0_WINDOW		0x80u		/* config: okno backplane (pcie.c:674) */
-+#define OM_BAR0_REG_SIZE	0x1000u		/* strona okna (pcie.c:675) */
++/* BARs (fire logs: resource0 = 0x8000, resource2 = 0x200000) */
++#define OM_BAR0_ROZMIAR		0x8000u		/* 32 KiB: PCIE2 registers + window */
++#define OM_BAR2_ROZMIAR		0x200000u	/* 2 MiB: window onto the fw RAM (TCM) */
++#define OM_BAR0_WINDOW		0x80u		/* config: backplane window (pcie.c:674) */
++#define OM_BAR0_REG_SIZE	0x1000u		/* window page (pcie.c:675) */
 +
-+/* ============================================================== mapa rdzeni
++/* ============================================================== core map
 + *
-+ * WZORZEC: ten sam co w minihost.c:16-21 -- stale z logow fire'a, nie z DMP.
-+ * Zrodlo: logs/test.345.journalctl.txt:14-19 (`cores_check`). Modul NIE parsuje
-+ * DMP (to ~1000 linii chip.c i kolejne zrodlo bledu); rozpoznaje karte po ID
-+ * (14e4:43a0) i WERYFIKUJE chipid/chiprev odczytem z ChipCommon
-+ * (0x18000000 + 0x0) -- ta sama metoda co brcmf_chip_recognition()
++ * PATTERN: the same as in the reference tool l. 16-21 -- constants from fire logs, not from DMP.
++ * Source: the test.345 journalctl fire log:14-19 (`cores_check`). The module does NOT parse
++ * DMP (that is ~1000 lines of chip.c and another error source); it recognizes the card by ID
++ * (14e4:43a0) and VERIFIES chipid/chiprev with a ChipCommon read
++ * (0x18000000 + 0x0) -- the same method as brcmf_chip_recognition()
 + * (chip.c:990-1000), adres bazowy SI_ENUM_BASE_DEFAULT = 0x18000000
-+ * (include/soc.h:9), pola chipid: CID_ID_MASK 0xffff / CID_REV_MASK 0xf0000
-+ * (include/chipcommon.h:222-224). Oczekiwane 0x4360 / 3 (chiprev 3 --
-+ * notes/).
++ * (include/soc.h:9), chipid fields: CID_ID_MASK 0xffff / CID_REV_MASK 0xf0000
++ * (include/chipcommon.h:222-224). Expected 0x4360 / 3 (chiprev 3 --
++ * the project notes).
 + */
 +#define OM_CC_BASE		0x18000000u	/* ChipCommon (0x800) */
 +#define OM_CC_WRAP		0x18100000u
-+#define OM_D11_BASE		0x18001000u	/* 802.11 (0x812) -- STRONA ZAKAZANA */
++#define OM_D11_BASE		0x18001000u	/* 802.11 (0x812) -- FORBIDDEN PAGE */
 +#define OM_D11_WRAP		0x18101000u
 +#define OM_ARM_BASE		0x18002000u	/* ARM CR4 (0x83e) */
 +#define OM_ARM_WRAP		0x18102000u
@@ -144,11 +144,11 @@
 +#define OM_CHIPID_4360		0x4360u
 +#define OM_CHIPREV_4360		3u
 +
-+/* ============================================================ TCM / kontrakt
++/* ============================================================ TCM / contract
 + *
-+ * rambase = 0, ramsize = 0xA0000 (chip.c, BRCM_CC_4360). Kontrakt OL lezy pod
-+ * TCM_end - 0x5F80 = 0x9A080 (pcie.c:161, :940; notes/re-apple-host-etap1-2-
-+ * przod.md par.1). Offsety pol: pcie.c:162-176 (BCM4360_T336_*).
++ * rambase = 0, ramsize = 0xA0000 (chip.c, BRCM_CC_4360). The OL contract lies below
++ * TCM_end - 0x5F80 = 0x9A080 (pcie.c:161, :940; the project notes on the re-apple host, stages 1-2,
++ * part 1). Field offsets: pcie.c:162-176 (BCM4360_T336_*).
 + */
 +#define OM_RAMBASE		0x0u
 +#define OM_RAMSIZE		0xa0000u			/* 640 KiB */
@@ -156,16 +156,16 @@
 +#define OM_K_MSGBUFADDR_LO	0x0004u
 +#define OM_K_MSGBUFADDR_HI	0x0008u
 +#define OM_K_MSGBUF_SZ		0x000cu
-+#define OM_K_CONSOLE_PTR	0x0010u		/* si[+0x010] -- publikuje FW */
-+#define OM_K_FLAG0		0x0014u		/* semafor Petersona: NIGDY 1 */
++#define OM_K_CONSOLE_PTR	0x0010u		/* si[+0x010] -- published by the FW */
++#define OM_K_FLAG0		0x0014u		/* Peterson semaphore: NEVER 1 */
 +#define OM_K_FLAG1		0x0018u
 +#define OM_K_TURN		0x001cu
 +#define OM_K_VARS_SIZE		0x0020u
 +#define OM_K_VARS		0x0024u
-+#define OM_K_HEARTBEAT		0x5028u		/* bramka gotowosci fw */
++#define OM_K_HEARTBEAT		0x5028u		/* fw readiness gate */
 +#define OM_K_TRAP_FLAG		0x502cu
 +#define OM_K_TRAP_REC		0x5ed8u
-+#define OM_K_TRAP_REC_BAJTY	132u		/* 0x84 = 33 dwordy (pcie.c:175) */
++#define OM_K_TRAP_REC_BAJTY	132u		/* 0x84 = 33 dwords (pcie.c:175) */
 +#define OM_K_MARKER_END		0x5f5cu
 +
 +#define OM_MARKER_BEGIN_VAL	0xa5a5a5a5u
@@ -173,11 +173,11 @@
 +#define OM_TRAP_FLAG_VAL	0xdeadbeefu
 +#define OM_MSGBUF_SZ		0x10000u	/* 64 KiB (pcie.c:108) */
 +#define OM_VARS_MAX		0x4000u		/* MAXSZ_NVRAM_VARS */
-+#define OM_OBRAZ_ROZMIAR_777	451362u		/* obraz 7.77.0.0 = 0x6E322 (md5 e942afb0...) */
-+#define OM_ZERO_OD_777		0x6e322u	/* poczatek zerowania (koniec obrazu) */
++#define OM_OBRAZ_ROZMIAR_777	451362u		/* image 7.77.0.0 = 0x6E322 (md5 e942afb0...) */
++#define OM_ZERO_OD_777		0x6e322u	/* zeroing start (end of the image) */
 +#define OM_ZERO_DO_777		OM_KONTRAKT	/* == 0x9a080; 179550 B */
 +
-+/* rejestry wrappera (include/linux/bcma/bcma_regs.h:29-43) */
++/* wrapper registers (include/linux/bcma/bcma_regs.h:29-43) */
 +#define OM_BCMA_IOCTL		0x0408u
 +#define OM_BCMA_IOCTL_CLK	0x0001u
 +#define OM_BCMA_IOCTL_FGC	0x0002u
@@ -189,42 +189,42 @@
 +#define OM_BCMA_IOCTL_PHYRESET	0x0008u		/* D11_BCMA_IOCTL_PHYRESET   (chip.c:82) */
 +#define OM_ARMCR4_IOCTL_CPUHALT	0x0020u		/* chip.c ARMCR4_BCMA_IOCTL_CPUHALT */
 +
-+/* rejestry PCIE2 widziane w BAR0 (pcie.c:690-692; sbpcieregs intstatus 0x20,
-+ * intmask 0x24 -- notes/ par.2) */
++/* PCIE2 registers as seen in BAR0 (pcie.c:690-692; sbpcieregs intstatus 0x20,
++ * intmask 0x24 -- project notes par. 2) */
 +#define OM_R_INTSTATUS		0x20u
 +#define OM_R_INTMASK		0x24u
 +#define OM_R_MAILBOXINT		0x48u
 +#define OM_R_MAILBOXMASK	0x4cu
 +#define OM_R_CLKCTLST		0x1e0u
 +#define OM_INT_D2H		0x00000100u	/* bit 8: D2H doorbell (pcie.c:398) */
-+#define OM_INT_MASK		0x00000100u	/* maska D2H re-arm (pcie.c:402) */
++#define OM_INT_MASK		0x00000100u	/* D2H re-arm mask (pcie.c:402) */
 +#define OM_DB_H2D		0x00000001u	/* bit 0: H2D doorbell (pcie.c:393) */
 +
-+/* D11 maccontrol (notes/:53; test.342) */
++/* D11 maccontrol (the project notes; test.342) */
 +#define OM_D11_MACCONTROL_OFF	0x120u
 +#define OM_D11_MACCONTROL_SEED	0x04000400u
 +
 +/* ============================================== hardening PCIe (config space)
 + *
-+ * ASPM-off + Completion Timeout, 1:1 ze skryptami projektu:
-+ *   scripts/minihost.sh:167-180  (cztery zapisy + readback wszystkich czterech
-+ *                                 + sciezka awaryjna "REBOOT + setpci z czystego boota")
-+ *   scripts/fire-extended-noreboot.sh:128-136 (te same cztery wartosci, BDF mostka 00:1c.2)
-+ * ZNACZENIE: 0x50/0xbc to LnkCtl (bity 0-1 = ASPM; w kazdej z tych wartosci
-+ * ZEROWANE => ASPM off -- notes/:279), a 0x68/0xd4 to
-+ * DevCtl2 (programowanie Completion Timeout -- notes/:67-68,
++ * ASPM-off + Completion Timeout, 1:1 with the project scripts:
++ *   the reference bridge script l. 167-180  (four writes + readback of all four
++ *                                 + fallback path "REBOOT + setpci from a clean boot")
++ *   the reference fire script l. 128-136 (the same four values, bridge BDF 00:1c.2)
++ * MEANING: 0x50/0xbc is LnkCtl (bits 0-1 = ASPM; in each of those values
++ * ZERO => ASPM off -- project notes), and 0x68/0xd4 is
++ * DevCtl2 (programming the Completion Timeout -- project notes,
 + * `PCI_EXP_DEVCTL2_COMP_TIMEOUT`, include/uapi/linux/pci_regs.h).
-+ * Offsety sa SUROWE, bo zaleza od bazy capability PCIe tego konkretnego ukladu
-+ * (mostek: 0x50/0x68, endpoint: 0xbc/0xd4 -- to sa wartosci z dzialajacych
-+ * skryptow, nie wyliczenia).
++ * The offsets are RAW because they depend on this specific board's PCIe capability base
++ * (bridge: 0x50/0x68, endpoint: 0xbc/0xd4 -- those are values from working
++ * scripts, not computations).
 + *
-+ * PO CO TO W MOUSTU: CLAUDE.md p.5 -- hardening GINIE Z REBOOTEM, dlatego
-+ * skrypty nakladaja go przed KAZDYM firem. W moscie odpowiednikiem "kazdego
-+ * fire" jest KAZDE `reset`: SBR przywraca domyslne Device Control endpointu,
-+ * wiec hardening trzeba nalozyc PO SBR -- i `reset` robi to sam (kolejnosc
-+ * jak w minihost.sh: SBR -> hardening -> re-init mapowan/okna/rdzeni).
-+ * Bez tego user po `reset` siedzialby w konfiguracji, w ktorej zaden
-+ * dotychczasowy fire nie chodzil. */
++ * WHY IN THE BRIDGE: project rulebook item 5 -- hardening DIES WITH A REBOOT, so
++ * the scripts apply it before EVERY fire. In the bridge, the equivalent of "every
++ * fire" is every `reset`: SBR restores the endpoint's default Device Control,
++ * so hardening must be applied AFTER SBR -- and `reset` does it itself (the order
++ * as in the reference bridge script: SBR -> hardening -> re-init of mappings/window/cores).
++ * Without that, after `reset` the user would sit in a configuration in which no
++ * previous fire has ever run. */
 +#define OM_HARD_MOSTEK_LNKCTL	0x50u
 +#define OM_HARD_MOSTEK_LNKCTL_V	0x0c40u
 +#define OM_HARD_MOSTEK_DEVCTL2	0x68u
@@ -234,44 +234,44 @@
 +#define OM_HARD_EP_DEVCTL2	0xd4u
 +#define OM_HARD_EP_DEVCTL2_V	0x040bu
 +
-+/* ====================================================== pierscien olmsg (DMA)
++/* ====================================================== olmsg ring (DMA)
 + *
-+ * Geometria 1:1 z minihost.c:176-184 i pcie.c:368-375, rownowazna z
-+ * `bcm_olmsg_init` @0x4f38 w obrazie 7.77: kanal H2D = buf+0x00, kanal D2H =
-+ * buf+0x10, naglowek kanalu {data_off, size, rd, wr}, komunikat
++ * Geometry 1:1 with the reference tool l. 176-184 and pcie.c:368-375, equivalent to
++ * `bcm_olmsg_init` @0x4f38 in the 7.77 image: H2D channel = buf+0x00, D2H channel =
++ * buf+0x10, channel header {data_off, size, rd, wr}, message
 + * {type, seq, len} + payload, total = len + 12.
-+ * UWAGA (notes/ par.4.2): total > 0x400 => fw
-+ * zapetla sie na tej samej wiadomosci w ISR (spam konsoli) -- dlatego limit.
++ * NOTE (project notes par. 4.2): total > 0x400 => the fw
++ * loops on the same message in the ISR (console spam) -- hence the limit.
 + */
-+#define OM_DMA_ROZMIAR		0x10000u	/* 64 KiB = msgbuf_sz kontraktu */
++#define OM_DMA_ROZMIAR		0x10000u	/* 64 KiB = contract msgbuf_sz */
 +#define OM_RING_HDR_H2D		0x00u
 +#define OM_RING_HDR_D2H		0x10u
 +#define OM_RING_DATA_H2D	0x20u
 +#define OM_RING_DATA_D2H	0x7820u
-+#define OM_RING_H2D_RD		0x08u		/* pisze FW (zuzycie) */
-+#define OM_RING_H2D_WR		0x0cu		/* pisze HOST (publikacja) */
-+/* UWAGA -- naprawione 11.09.2026 (pomiar surowego bufora: `kread phys 0x1280000 0x40`).
-+ * Te dwa offsety musza byc WZGLEDNE wobec OM_RING_HDR_D2H (0x10) -- tak samo, jak para
-+ * H2D wyzej jest wzgledna wobec 0x00 -- bo KAZDE uzycie w tym pliku ma postac
-+ * `OM_RING_HDR_D2H + OM_RING_D2H_RD/WR`. W pierwszej wersji byly BEZWZGLEDNE
-+ * (0x18/0x1c) i baza byla dodawana drugi raz: kod czytal 0x28/0x2c, czyli pole
-+ * "len" i "payload" NASZEGO komunikatu 0x42 w pierscieniu H2D. Skutki:
-+ *  (a) `read rings`/`read d2h`/`status` klamaly ("D2H rd=4 wr=288740"), bo braly
-+ *      cudze bajty -- i stad wziela sie falszywa teza "to fw zapisal 288740";
-+ *  (b) `om_d2h_scan` (ISR!) zapisywalby `rd` pod 0x28, czyli NADPISALBY dlugosc
-+ *      komunikatu #1 w H2D -- realne uszkodzenie wlasnej publikacji, gdy fw zyje.
-+ * Pomiar (11.09, po biegu): prawdziwe D2H to rd=0, wr=12, a pod 0x7820 lezy
-+ * {type=0x41, seq=0, len=0} = BCM_OL_TRAP_IND -- dokladnie to, co fw ogloszyl
-+ * w konsoli ("Offload Message: Type: BCM_OL_TRAP_IND Seq:0 len:0"). */
-+#define OM_RING_D2H_RD		0x08u		/* pisze HOST (wzgledem OM_RING_HDR_D2H) */
-+#define OM_RING_D2H_WR		0x0cu		/* pisze FW   (wzgledem OM_RING_HDR_D2H) */
++#define OM_RING_H2D_RD		0x08u		/* written by FW (consumption) */
++#define OM_RING_H2D_WR		0x0cu		/* written by HOST (publication) */
++/* NOTE -- fixed 11.09.2026 (raw buffer measurement: `kread phys 0x1280000 0x40`).
++ * These two offsets must be RELATIVE to OM_RING_HDR_D2H (0x10) -- just like the
++ * H2D pair above is relative to 0x00 -- because EVERY use in this file has the form
++ * `OM_RING_HDR_D2H + OM_RING_D2H_RD/WR`. In the first version they were ABSOLUTE
++ * (0x18/0x1c) and the base was added a second time: the code read 0x28/0x2c, i.e. the
++ * "len" and "payload" fields of OUR 0x42 message in the H2D ring. Effects:
++ *  (a) `read rings`/`read d2h`/`status` lied ("D2H rd=4 wr=288740") because they took
++ *      someone else's bytes -- and that is where the false claim "the fw wrote 288740" came from;
++ *  (b) `om_d2h_scan` (ISR!) would write `rd` at 0x28, i.e. it would OVERWRITE the length
++ *      of message #1 in H2D -- real corruption of its own publication while the fw is alive.
++ * Measurement (11.09, after the run): the real D2H is rd=0, wr=12, and at 0x7820 lies
++ * {type=0x41, seq=0, len=0} = BCM_OL_TRAP_IND -- exactly what the fw announced
++ * on the console ("Offload Message: Type: BCM_OL_TRAP_IND Seq:0 len:0"). */
++#define OM_RING_D2H_RD		0x08u		/* written by HOST (relative to OM_RING_HDR_D2H) */
++#define OM_RING_D2H_WR		0x0cu		/* written by FW   (relative to OM_RING_HDR_D2H) */
 +#define OM_RING_ROZMIAR		0x7800u
 +#define OM_OLMSG_HDR		12u		/* {type, seq, len} po 4 B */
 +
-+/* Trio startowe Apple (notes/ par.4 i par.6;
-+ * minihost.c:193-204): 0x42 + 0x45 + 0x38, publikowany `wr` = 16+16+34 = 66.
-+ * KOREKTA z 11.09: `wr` to 66, NIE 50 (przy 50 fw czytalby uciety trzeci
-+ * komunikat: z 34 B zostaloby 18). */
++/* The Apple startup trio (project notes par. 4 and par. 6;
++ * reference tool l. 193-204): 0x42 + 0x45 + 0x38, published `wr` = 16+16+34 = 66.
++ * CORRECTION of 11.09: `wr` is 66, NOT 50 (at 50 the fw would read a truncated third
++ * message: of the 34 B only 18 would remain). */
 +#define OM_TRIO_WR		66u
 +#define OM_TRIO_TYP_TS		0x00000042u	/* BCM_OL_SYNC_HOST_TIMESTAMP */
 +#define OM_TRIO_TYP_EWT		0x00000045u	/* BCM_OL_EXCESS_WAKE_TIMEOUT */
@@ -281,85 +281,85 @@
 +#define OM_TRIO_LTR_LEN		0x16u		/* 22 B */
 +#define OM_TRIO_EWT_VAL		30u		/* iovar wowl_excess_wake_timeout */
 +
-+/* Bramka gotowosci: Apple polluje kontrakt+0x5028 2000 x 1 ms i po timeoucie
-+ * tylko loguje (brak galezi bledu) -- i my tak robimy (notes/
-+ * luka2-4-kontrakt-i-bramka.md par.2.1; minihost.c:206-210). */
++/* Readiness gate: Apple polls contract+0x5028 2000 x 1 ms and after the timeout
++ * only logs (no error branch) -- and we do the same (project notes
++ * notes on the contract and its gate, par. 2.1; reference tool l. 206-210). */
 +#define OM_GATE_ITERACJE	2000u
-+#define OM_OLMSG_MAX_TOTAL	0x400u		/* limit fw na komunikat (pcie.c:435) */
++#define OM_OLMSG_MAX_TOTAL	0x400u		/* fw limit per message (pcie.c:435) */
 +
-+/* Doczekanie linii `pciedngl_open called` w konsoli fw przed doorbellem
-+ * (notes/ par.6 p. 5): fw czyta pierscien
-+ * WYLACZNIE w ISR, a pciedngl_open (fw 0x387c: `bus+0x24 |= 0x100`) to moment
-+ * uzbrojenia przerwania -- doorbell przed nim moze zostac zatrzasniety
-+ * i nieobsluzony. Pomiar: linia pojawia sie ~0,052 s czasu fw. */
++/* Waiting for the `pciedngl_open called` line in the fw console before the doorbell
++ * (project notes par. 6, item 5): the fw reads the ring
++ * ONLY in its ISR, and pciedngl_open (fw 0x387c: `bus+0x24 |= 0x100`) is the moment
++ * the interrupt is armed -- a doorbell before it may get latched
++ * and unserviced. Measurement: the line appears at ~0.052 s of fw time. */
 +#define OM_KONSOLA_LINIA	"pciedngl_open called"
 +#define OM_KONSOLA_CZEKAJ_MS	2000u
 +
-+/* limit odpowiedzi /dev/omwifi -- konsola fw to ~1,6 KB, zrzut D2H <= 3000 B,
-+ * `read tcm` <= 256 B; 16 KiB daje zapas bez ryzyka dla pamieci jadra */
++/* /dev/omwifi response limit -- the fw console is ~1.6 KB, a D2H dump <= 3000 B,
++ * `read tcm` <= 256 B; 16 KiB gives headroom without risk to kernel memory */
 +#define OM_RESP_MAX		16384u
-+#define OM_RESP_ZAPAS		96u		/* rezerwa na linie-markier uciecia */
-+#define OM_LINIA_MAX		4096u		/* max dlugosc komendy z userspace */
-+#define OM_LOG_MAX		512u		/* dlugosc jednej linii logu */
-+#define OM_KONSOLA_LINII	100u		/* ile linii konsoli maksymalnie w odpowiedzi */
++#define OM_RESP_ZAPAS		96u		/* reserve for the truncation marker line */
++#define OM_LINIA_MAX		4096u		/* max command length from userspace */
++#define OM_LOG_MAX		512u		/* length of one log line */
++#define OM_KONSOLA_LINII	100u		/* max console lines in one response */
 +
-+/* ====================================================================== stan */
++/* ====================================================================== state */
 +
 +struct om_bridge {
 +	struct pci_dev		*pdev;
-+	void __iomem		*bar0;		/* resource0: PCIE2 + okno backplane */
-+	void __iomem		*bar2;		/* resource2: RAM fw (TCM) */
++	void __iomem		*bar0;		/* resource0: PCIE2 + backplane window */
++	void __iomem		*bar2;		/* resource2: fw RAM (TCM) */
 +	resource_size_t		bar2_len;
 +
 +	void			*dma_va;	/* 64 KiB, dma_alloc_coherent */
 +	dma_addr_t		dma_fiz;
-+	bool			dma_ok;		/* czy adres przeszedl bramke fw */
++	bool			dma_ok;		/* whether the address passed the fw gate */
 +
-+	u32			rstvec;		/* pierwszy dword obrazu (loadfw) */
++	u32			rstvec;		/* first dword of the image (loadfw) */
 +	bool			rstvec_znamy;
 +	bool			arm_wypuszczony;
 +	bool			irq_on;
 +	bool			msi_on;
-+	bool			hardening_bylo;	/* czy hardening byl nakladany w tej sesji */
-+	bool			hardening_ok;	/* czy ostatni hardening przeszedl readback */
-+	bool			odmowa_d11_log;	/* jedna linia odmowy na komende */
-+	bool			okno_mask_log;	/* jedna linia o maskowaniu IRQ na obce okno */
++	bool			hardening_bylo;	/* whether hardening was applied in this session */
++	bool			hardening_ok;	/* whether the last hardening passed the readback */
++	bool			odmowa_d11_log;	/* one refusal line per command */
++	bool			okno_mask_log;	/* one line about IRQ masking for a foreign window */
 +
-+	char			*resp;		/* bufor odpowiedzi */
++	char			*resp;		/* response buffer */
 +	size_t			resp_len;
 +	size_t			resp_pos;
-+	bool			resp_uciete;	/* czy odpowiedz dotknela limitu (jedna linia-markier) */
++	bool			resp_uciete;	/* whether the response hit the limit (one marker line) */
 +
 +	struct miscdevice	misc;
 +};
 +
-+static struct om_bridge *om;			/* jeden egzemplarz karty */
-+static DEFINE_MUTEX(om_lock);			/* chroni `om` i cala sekwencje */
++static struct om_bridge *om;			/* one card instance */
++static DEFINE_MUTEX(om_lock);			/* protects `om` and the whole sequence */
 +
-+/* Wymaganie 2: most NIE MOZE dzialac bez pci_reset_function (caly cykl bez
-+ * rebootu stoi na SBR), wiec SYMBOL jest wymuszony przez wskaznik:
-+ *  (a) modul ZAWSZE go referuje => kernel bez tego symbolu NIE ZALADUJE modulu
-+ *      (insmod: unresolved symbol) -- to jest wlasciwa, glosna bramka,
-+ *  (b) test `!om_reset_fn` wykonuje sie przy kazdym wywolaniu i NIE znika
-+ *      w optymalizacji, a przy tym nie generuje -Waddress (bezposrednie
-+ *      `!pci_reset_function` gcc redukuje do stalej i OSTRZEGA -- bramka builda
-+ *      wymaga zera ostrzezen). */
++/* Requirement 2: the bridge CANNOT work without pci_reset_function (the whole loop
++ * without a reboot stands on SBR), so the SYMBOL is forced through a pointer:
++ *  (a) the module ALWAYS references it => a kernel without that symbol will NOT LOAD the module
++ *      (insmod: unresolved symbol) -- that is the proper, loud gate,
++ *  (b) the `!om_reset_fn` check runs at every call and does NOT vanish
++ *      under optimization and does not generate -Waddress either (a direct
++ *      `!pci_reset_function` gets reduced by gcc to a constant and WARNS -- the build gate
++ *      requires zero warnings). */
 +static int (*const om_reset_fn)(struct pci_dev *) = pci_reset_function;
 +
-+/* parametr modulu: JEDYNA nowa opcja (wymaganie 5) -- polowa podwojnej bramki D11 */
++/* module parameter: THE ONLY new option (requirement 5) -- half of the double D11 gate */
 +static bool d11_ok;
 +module_param(d11_ok, bool, 0644);
 +MODULE_PARM_DESC(d11_ok,
-+	"omwifi_bridge: dopuszcza JEDEN dostep do strony rdzenia D11 0x18001000 (seed maccontrol 0x18001120). HARD RULE CLAUDE.md p.7 (fire #21 = zwis maszyny): bez tego parametru ORAZ bez tokenu `d11-ok` w samej komendzie maccontrol modul ODMOWUJE przed jakimkolwiek MMIO. (1=dopusc, 0=odmawiaj (domyslnie))");
++	"omwifi_bridge: allows ONE access to the D11 core page 0x18001000 (maccontrol seed 0x18001120). HARD RULE project rulebook item 7 (fire #21 = machine hang): without this parameter AND without the token `d11-ok` in the maccontrol command itself the module REFUSES before any MMIO. (1=allow, 0=refuse (default))");
 +
-+/* ============================================================== log/odpowiedz
++/* ============================================================== log/response
 + *
-+ * Kazda linia idzie JEDNOCZESNIE do logu jadra (z prefiksem omwifi_bridge:)
-+ * i do bufora czytanego przez `cat /dev/omwifi`. Tresc jest ta sama -- raport
-+ * z fire'a i odpowiedz na komende to ten sam tekst (bez prefiksu w odpowiedzi).
-+ * Kolejne poziomy: 0 = pr_info (normalny krok), 1 = pr_err (blad/odmowa),
-+ * 2 = pr_emerg (linia PRZED operacja na sprzecie -- ostatnia, jezeli operacja
-+ * zamrozi maszyne; konwencja z pcie.c test.3xx).
++ * Every line goes SIMULTANEOUSLY to the kernel log (with the omwifi_bridge: prefix)
++ * and to the buffer read by `cat /dev/omwifi`. The content is the same -- the fire report
++ * and the command response are the same text (without the prefix in the response).
++ * Levels: 0 = pr_info (normal step), 1 = pr_err (error/refusal),
++ * 2 = pr_emerg (a line BEFORE a hardware operation -- the last one if the operation
++ * freezes the machine; the convention from pcie.c test.3xx).
 + */
 +
 +static void om_linia(struct om_bridge *b, int poziom, const char *fmt, ...)
@@ -375,14 +375,14 @@
 +	n = vscnprintf(tmp, sizeof(tmp), fmt, ap);
 +	va_end(ap);
 +
-+	/* Zapas OM_RESP_ZAPAS trzymamy na JEDNA linie-markier uciecia: klient
-+	 * userspace musi wiedziec, ze odpowiedz jest niepelna (kontrakt:
-+	 * kazda komenda cos odpowiada, a odpowiedz konczy sie \n). */
++	/* We hold OM_RESP_ZAPAS as reserve for ONE truncation marker line: the client
++	 * must know that the response is incomplete (the contract:
++	 * every command answers something and the response ends with \n). */
 +	if (b && b->resp && b->resp_len + (size_t)n <= OM_RESP_MAX - OM_RESP_ZAPAS) {
 +		memcpy(b->resp + b->resp_len, tmp, n);
 +		b->resp_len += n;
 +	} else if (b && b->resp && !b->resp_uciete) {
-+		const char *marker = "[...] odpowiedz ucieta na limicie bufora -- pelna tresc linii jest w dmesg\n";
++		const char *marker = "[...] response truncated at the buffer limit -- the full line is in dmesg\n";
 +		size_t dl = strlen(marker);
 +
 +		b->resp_uciete = true;
@@ -403,10 +403,10 @@
 +#define om_blad(b, fmt, ...)	om_linia((b), 1, fmt, ##__VA_ARGS__)
 +#define om_emrg(b, fmt, ...)	om_linia((b), 2, fmt, ##__VA_ARGS__)
 +
-+/* ================================================================ okno / TCM */
++/* ================================================================ window / TCM */
 +
-+/* Predykat 1:1 z bcm4360_t328_is_d11_page() (pcie.c:2784-2792): porownanie
-+ * stron 4-KB, czyli dokladnie 0x18001000..0x18001FFF. */
++/* Predicate 1:1 with bcm4360_t328_is_d11_page() (pcie.c:2784-2792): a comparison
++ * of 4-KB pages, i.e. exactly 0x18001000..0x18001FFF. */
 +static bool om_jest_strona_d11(u32 addr)
 +{
 +	return (addr & OM_PAGE_MASK) == (OM_D11_BASE & OM_PAGE_MASK);
@@ -416,45 +416,45 @@
 +{
 +	if (!b->odmowa_d11_log) {
 +		b->odmowa_d11_log = true;
-+		om_blad(b, "ODMOWA: strona D11 0x%08x (%s) -- HARD RULE CLAUDE.md p.7 (fire #21 = zwis maszyny); zero dotkniecia BAR0\n",
++		om_blad(b, "REFUSAL: D11 page 0x%08x (%s) -- HARD RULE project rulebook item 7 (fire #21 = machine hang); zero BAR0 touches\n",
 +			addr, co);
 +	}
 +}
 +
-+/* Okno backplane na PCIE2 -- stan spoczynkowy po KAZDEJ operacji (wymaganie 3;
-+ * wzorzec: minihost.c:331-337 `okno_restore`). */
++/* Backplane window on PCIE2 -- the resting state after EVERY operation (requirement 3;
++ * pattern: the reference tool's window-restore helper (l. 331-337). */
 +static void om_okno_restore(struct om_bridge *b)
 +{
 +	pci_write_config_dword(b->pdev, OM_BAR0_WINDOW,
 +			       OM_PCIE2_BASE & OM_PAGE_MASK);
 +}
 +
-+/* Czy strona docelowa jest OBCA (poza PCIE2)? BAR0 jest OKNEM -- znaczenie jego
-+ * rejestrow zalezy od strony wpisanej w config 0x80. */
++/* Is the target page FOREIGN (outside PCIE2)? BAR0 is a WINDOW -- the meaning of its
++ * registers depends on the page written into config 0x80. */
 +static bool om_okno_obce(u32 page)
 +{
 +	return page != (OM_PCIE2_BASE & OM_PAGE_MASK);
 +}
 +
-+/* WYSCIG Z ISR (znaleziony w audycie 11.09.2026, po biegu 19:44): `om_isr_szybki`
-+ * czyta, a `om_isr_watek` W1C-PISZE BAR0+0x48/+0x4C, i ZADEN z nich nie bierze
-+ * om_lock (komentarz przy om_isr_watek). Dopoki okno stoi na PCIE2, to jest ten
-+ * sam rejestr co zawsze -- ale gdy `_ogon` przestawia okno na inna strone, ISR
-+ * trafia w OBCY rejestr: na stronie D11 0x18001048 to ZLAMANIE HARD RULE
-+ * (fire #21 = zwis), a W1C pod obcym adresem to niekontrolowany zapis.
-+ * Sciezka jest realna takze w sekwencji kanonicznej: `status` chodzi PO `irq on`
-+ * i czyta ChipCommon oraz ARM wrap, a `reset` NIE zwalnia linii, wiec powtorka
-+ * sekwencji bez przeladowania modulu ma uzbrojony ISR na `d11release`/`maccontrol`.
-+ * Na czas obcego okna maskujemy linie: `disable_irq` czeka na handler w locie,
-+ * wiec po powrocie nikt nie dotyka BAR0 (a przerwanie dostarczone w tym oknie
-+ * jest obslugiwane po `enable_irq`, juz z oknem na PCIE2). */
++/* RACE WITH THE ISR (found in the 11.09.2026 audit, after the 19:44 run): `om_isr_szybki`
++ * reads and `om_isr_watek` W1C-WRITES BAR0+0x48/+0x4C, and NEITHER takes
++ * om_lock (comment at om_isr_watek). While the window stands on PCIE2 it is the
++ * same register as always -- but when `_ogon` moves the window to another page, the ISR
++ * hits a FOREIGN register: on the D11 page 0x18001048 that is a HARD RULE VIOLATION
++ * (fire #21 = hang), and a W1C at a foreign address is an uncontrolled write.
++ * The path is real in the canonical sequence too: `status` runs AFTER `irq on`
++ * and reads ChipCommon and the ARM wrap, and `reset` does NOT release the line, so a repeat
++ * of the sequence without reloading the module has an armed ISR for `d11release`/`maccontrol`.
++ * While the window is foreign we mask the line: `disable_irq` waits for an in-flight handler,
++ * so after the return nobody touches BAR0 (and an interrupt delivered in that window
++ * is serviced after `enable_irq`, already with the window on PCIE2). */
 +static void om_okno_irq_maskuj(struct om_bridge *b, bool maskuj, u32 page)
 +{
 +	if (!maskuj)
 +		return;
 +	if (!b->okno_mask_log) {
 +		b->okno_mask_log = true;
-+		om_odp(b, "okno: strona 0x%08x != PCIE2 0x%08x -- linia przerwania ZAMASKOWANA na czas dostepu (ISR dotyka BAR0+0x%03x/+0x%03x bez om_lock, a BAR0 jest oknem)\n",
++		om_odp(b, "window: page 0x%08x != PCIE2 0x%08x -- the interrupt line MASKED for the access duration (the ISR touches BAR0+0x%03x/+0x%03x without om_lock, and BAR0 is a window)\n",
 +		       page, OM_PCIE2_BASE, OM_R_MAILBOXINT, OM_R_MAILBOXMASK);
 +	}
 +	disable_irq(b->pdev->irq);
@@ -466,11 +466,11 @@
 +		enable_irq(b->pdev->irq);
 +}
 +
-+/* Ogon dostepu do backplane: strona do config 0x80 + KONTROLA ODCZYTU, dopiero
-+ * potem BAR0 (wzorzec bcm4360_t328_bp_read32, pcie.c:2796-2817). Zwraca 0 albo
-+ * -EIO (okno sie nie ustawilo -- BAR0 NIE dotkniete).
-+ * UWAGA: ta funkcja NIE MA predykatu strony D11 -- o dopuszczeniu strony decyduje
-+ * WYLACZNIE wolajacy. Wolno ja wolac tylko z dwoch miejsc nizej. */
++/* Backplane access tail: page into config 0x80 + READBACK, only then
++ * BAR0 (pattern bcm4360_t328_bp_read32, pcie.c:2796-2817). Returns 0 or
++ * -EIO (the window did not set -- BAR0 NOT touched).
++ * NOTE: this function has NO D11 page predicate -- the page's admission is decided
++ * SOLELY by the caller. It may only be called from the two places below. */
 +static int om_bp_read32_ogon(struct om_bridge *b, u32 addr, u32 *val)
 +{
 +	u32 page = addr & OM_PAGE_MASK;
@@ -481,7 +481,7 @@
 +	pci_write_config_dword(b->pdev, OM_BAR0_WINDOW, page);
 +	pci_read_config_dword(b->pdev, OM_BAR0_WINDOW, &win);
 +	if (win != page) {
-+		om_blad(b, "okno 0x%08x != strona 0x%08x (dla 0x%08x) -- dostep POMINIETY, zero dotkniecia BAR0\n",
++		om_blad(b, "window 0x%08x != page 0x%08x (for 0x%08x) -- access SKIPPED, zero BAR0 touches\n",
 +			win, page, addr);
 +		om_okno_restore(b);
 +		om_okno_irq_odmaskuj(b, maskuj);
@@ -503,7 +503,7 @@
 +	pci_write_config_dword(b->pdev, OM_BAR0_WINDOW, page);
 +	pci_read_config_dword(b->pdev, OM_BAR0_WINDOW, &win);
 +	if (win != page) {
-+		om_blad(b, "okno 0x%08x != strona 0x%08x (dla 0x%08x) -- zapis POMINIETY, zero dotkniecia BAR0\n",
++		om_blad(b, "window 0x%08x != page 0x%08x (for 0x%08x) -- write SKIPPED, zero BAR0 touches\n",
 +			win, page, addr);
 +		om_okno_restore(b);
 +		om_okno_irq_odmaskuj(b, maskuj);
@@ -515,13 +515,13 @@
 +	return 0;
 +}
 +
-+/* Domyslny dostep do backplane: strona D11 ODRZUCONA (HARD RULE). Zwraca 0 albo
-+ * -EPERM (strona D11) / -EIO (okno sie nie ustawilo) -- w obu przypadkach BAR0
-+ * NIE jest dotkniete. */
++/* Default backplane access: the D11 page REJECTED (HARD RULE). Returns 0 or
++ * -EPERM (D11 page) / -EIO (the window did not set) -- in both cases BAR0
++ * is NOT touched. */
 +static int om_bp_read32(struct om_bridge *b, u32 addr, u32 *val)
 +{
 +	if (om_jest_strona_d11(addr)) {
-+		om_odmowa_d11(b, addr, "odczyt backplane");
++		om_odmowa_d11(b, addr, "backplane read");
 +		return -EPERM;
 +	}
 +	return om_bp_read32_ogon(b, addr, val);
@@ -530,22 +530,22 @@
 +static int om_bp_write32(struct om_bridge *b, u32 addr, u32 val)
 +{
 +	if (om_jest_strona_d11(addr)) {
-+		om_odmowa_d11(b, addr, "zapis backplane");
++		om_odmowa_d11(b, addr, "backplane write");
 +		return -EPERM;
 +	}
 +	return om_bp_write32_ogon(b, addr, val);
 +}
 +
-+/* JEDYNE wejscie na STRONE RDZENIA D11 (0x18001000..0x18001FFF) w calym module.
-+ * Uzywa go WYLACZNIE `om_op_maccontrol` i WYLACZNIE po podwojnej bramce:
-+ * parametr `d11_ok=1` + token `d11-ok` w komendzie + swiezy odczyt wrappera
-+ * mowiacy, ze D11 jest POZA RESETEM (bramka FAIL-CLOSED). HARD RULE
-+ * CLAUDE.md p.7 -- kazde inne uzycie to blad (patrz verify.sh sekcja [C]).
++/* The ONLY entry onto the D11 CORE PAGE (0x18001000..0x18001FFF) in the whole module.
++ * Used EXCLUSIVELY by `om_op_maccontrol` and ONLY behind the double gate:
++ * the `d11_ok=1` parameter + the `d11-ok` token in the command + a fresh wrapper read
++ * saying D11 is OUT OF RESET (a FAIL-CLOSED gate). HARD RULE
++ * project rulebook item 7 -- any other use is an error (see the verify script, section [C]).
 + *
-+ * HISTORIA (11.09.2026, bieg mostu o 19:44): `maccontrol` wolal `om_bp_read32`/
-+ * `om_bp_write32` i dostawal `-EPERM` z predykatu -- wyjatek "pod podwojna
-+ * bramka" byl opisany w komentarzu i w `help`, ale NIE ISTNIAL w kodzie, wiec
-+ * zapis nigdy nie poszedl, a fw zostal bez seedu `maccontrol`. Stad te funkcje. */
++ * HISTORY (11.09.2026, bridge run at 19:44): `maccontrol` called `om_bp_read32`/
++ * `om_bp_write32` and got `-EPERM` from the predicate -- the "behind the double
++ * gate" case was described in the comment and in `help` but did NOT EXIST in the code, so
++ * the write never went, and the fw was left without the `maccontrol` seed. Hence these functions. */
 +static int om_bp_read32_d11(struct om_bridge *b, u32 addr, u32 *val)
 +{
 +	return om_bp_read32_ogon(b, addr, val);
@@ -556,35 +556,35 @@
 +	return om_bp_write32_ogon(b, addr, val);
 +}
 +
-+/* Odczyt TCM (BAR2 = RAM fw). To pamiec, nie rejestry -- zero okna. */
++/* TCM read (BAR2 = fw RAM). That is memory, not registers -- no window. */
 +static int om_tcm_read32(struct om_bridge *b, u32 off, u32 *val)
 +{
 +	if (off + 4 > OM_RAMSIZE || off + 4 > b->bar2_len) {
-+		om_blad(b, "TCM: odczyt 0x%05x poza ramsize 0x%05x\n", off, OM_RAMSIZE);
++		om_blad(b, "TCM: read 0x%05x outside ramsize 0x%05x\n", off, OM_RAMSIZE);
 +		return -EINVAL;
 +	}
 +	*val = ioread32(b->bar2 + off);
 +	return 0;
 +}
 +
-+/* Zapis TCM -- WYLACZNIE 32-bitowy (wymog 4360 z patcha 0003: 64-bit
-+ * memcpy_toio wiesza magistrale -- pcie.c brcmf_pcie_copy_mem_to_dev).
-+ * Adres moze byc NIEWYROWNANY -- to celowe, patrz om_tcm_zero(). */
++/* TCM write -- 32-bit ONLY (the 4360 requirement from patch 0003: 64-bit
++ * memcpy_toio hangs the bus -- pcie.c brcmf_pcie_copy_mem_to_dev).
++ * The address may be UNALIGNED -- that is on purpose, see om_tcm_zero(). */
 +static int om_tcm_write32(struct om_bridge *b, u32 off, u32 val)
 +{
 +	if (off + 4 > OM_RAMSIZE || off + 4 > b->bar2_len) {
-+		om_blad(b, "TCM: zapis 0x%05x poza ramsize 0x%05x\n", off, OM_RAMSIZE);
++		om_blad(b, "TCM: write 0x%05x outside ramsize 0x%05x\n", off, OM_RAMSIZE);
 +		return -EINVAL;
 +	}
 +	iowrite32(val, b->bar2 + off);
 +	return 0;
 +}
 +
-+/* Kopia bajtow do TCM dword po dwordzie (LE), ostatni dword dopelniony zerami
-+ * -- 1:1 z minihost.c:378-401 i brcmf_pcie_copy_mem_to_dev (pcie.c). Dla
-+ * loadfw/vars ogon jest bezpieczny: lezy w TCM tuz za tekstem, ktorego
-+ * dlugosc odbiorca zna z pola rozmiaru (+0x20 dla vars; dla obrazu -- z rozmiaru
-+ * obrazu). */
++/* Byte copy to TCM dword by dword (LE), the last dword padded with zeros
++ * -- 1:1 with the reference tool l. 378-401 and brcmf_pcie_copy_mem_to_dev (pcie.c). For
++ * loadfw/vars the tail is safe: it lies in TCM right after the text, whose
++ * length the receiver knows from the size field (+0x20 for vars; for the image -- from the
++ * image size). */
 +static void om_tcm_copy(struct om_bridge *b, u32 off, const u8 *src, u32 len)
 +{
 +	u32 i;
@@ -605,29 +605,29 @@
 +	}
 +}
 +
-+/* Zerowanie zakresu [from,to) TCM -- klasa z patcha 0036
-+ * (bcm4360_ol77_zero_range, pcie.c:5658-5696: porcje 4 KiB, zapis 32-bitowy,
-+ * jeden wspolny bufor zer). MINIHOST TEGO NIE UMIE: jego tcm_write32()
-+ * odrzuca zapis niewyrownany (minihost.c:367-374), a zakres z luki 7 ma
-+ * poczatek 0x6E322 (0x6E322 % 4 = 2) -- realne `zero 0x6e322 0x9a080`
-+ * w userspace konczyloby sie `blad()` BEZ wyzerowania czegokolwiek. Modul
-+ * (patch 0036) i ten most zapisuja 32-bitowo pod adresem niewyrownanym, bo to
-+ * wlasnie zostalo ZMIERZONE w test.345.
++/* Zeroing the TCM range [from,to) -- the class from patch 0036
++ * (bcm4360_ol77_zero_range, pcie.c:5658-5696: 4 KiB chunks, 32-bit writes,
++ * one shared zero buffer). THE REFERENCE TOOL CANNOT DO THIS: its tcm_write32()
++ * rejects an unaligned write (reference tool l. 367-374), and the gap-7 range has
++ * a start of 0x6E322 (0x6E322 % 4 = 2) -- a real `zero 0x6e322 0x9a080`
++ * in userspace would end in the tool's error path WITHOUT zeroing anything. The module
++ * (patch 0036) and this bridge write 32-bit at the unaligned address, because that
++ * is exactly what was MEASURED in test.345.
 + *
-+ * CALY ZAKRES MUSI BYC POKRYTY: petla dwordowa idzie od `from` skokiem 4 i przy
-+ * dlugosci niepodzielnej przez 4 zostawia na koncu ogon 1..3 B -- dla zakresu
-+ * domyslnego [0x6e322,0x9a080) sa to 2 B [0x9a07e,0x9a080), a to jest ogon
-+ * obszaru-heapy, ktory luka 7 kazala czyscic (test.345 / patch 0036 zerowal
-+ * CALY zakres; SBR tych smieci nie czysci, wiec zostawienie ich = jedyne
-+ * odejscie od zmierzonego podloza).
-+ * Ogon domykamy dwordem pod (to - 4): lezy on CALY w zakresie (jego dolne
-+ * 2-3 B byly juz zerowane -- nadpisujemy je zerem, co jest nieszkodliwe),
-+ * a GORNE 2-3 B to wlasnie ogon. To jest lepsze niz patch 0036, ktory kopiuje
-+ * ostatnia porcje z dopelnieniem i tym samym siega 2 B ZA `to` (w kontrakt,
-+ * ktory pozniej nadpisuje komenda `contract`): tu `to` i wszystko za nim
-+ * zostaje NIETKNIETE. Zakres krotszy niz dword (to - from < 4) nadal da sie
-+ * pokryc tylko wyjsciem za `to`, wiec jest POMIJANY i ZALOGOWANY.
-+ * Zwraca liczbe bajtow POKRYTYCH (to - from, gdy ogon domkniety). */
++ * THE WHOLE RANGE MUST BE COVERED: the dword loop goes from `from` in steps of 4 and with
++ * a length not divisible by 4 leaves a 1..3 B tail at the end -- for the default
++ * range [0x6e322,0x9a080) those are the 2 B [0x9a07e,0x9a080), and that is the tail
++ * of the heap area that gap 7 ordered to be cleaned (test.345 / patch 0036 zeroed
++ * the WHOLE range; SBR does not clear that junk, so leaving it = the only
++ * departure from the measured substrate).
++ * We close the tail with a dword at (to - 4): it lies ENTIRELY in the range (its lower
++ * 2-3 B were already zeroed -- we overwrite them with zero, which is harmless),
++ * and the UPPER 2-3 B are exactly the tail. This is better than patch 0036, which copies
++ * the last chunk with padding and thereby reaches 2 B BEYOND `to` (into the contract,
++ * which the `contract` command later overwrites): here `to` and everything behind it
++ * stays UNTOUCHED. A range shorter than a dword (to - from < 4) can still only be
++ * covered by going past `to`, so it is SKIPPED and LOGGED.
++ * Returns the number of bytes COVERED (to - from when the tail is closed). */
 +static u32 om_tcm_zero(struct om_bridge *b, u32 from, u32 to)
 +{
 +	u32 off;
@@ -638,30 +638,30 @@
 +	zapisane = off - from;
 +
 +	if (off == to)
-+		return zapisane;		/* dlugosc podzielna przez 4 */
++		return zapisane;		/* length divisible by 4 */
 +
 +	if (to - from >= 4) {
 +		om_tcm_write32(b, to - 4, 0);
-+		om_odp(b, "zero: ogon %u B [0x%05x,0x%05x) domkniety dwordem pod 0x%05x (caly w zakresie; `to` i wszystko za nim NIETKNIETE)\n",
++		om_odp(b, "zero: tail of %u B [0x%05x,0x%05x) closed with a dword at 0x%05x (fully in range; `to` and everything behind it UNTOUCHED)\n",
 +		       to - off, off, to, to - 4);
 +		return to - from;
 +	}
-+	om_blad(b, "zero: zakres %u B [0x%05x,0x%05x) krotszy niz dword -- POMINIETY (zapis TCM jest tylko 32-bitowy, a pokrycie wymagaloby wyjscia za `to`; wymog 4360)\n",
++	om_blad(b, "zero: range of %u B [0x%05x,0x%05x) shorter than a dword -- SKIPPED (TCM writes are only 32-bit, and coverage would require going past `to`; the 4360 requirement)\n",
 +		 to - from, from, to);
 +	return zapisane;
 +}
 +
-+/* ================================================================ bufor DMA */
++/* ================================================================ DMA buffer */
 +
-+/* Bramka adresu bufora dla fw 7.77 -- warunek 1:1 z minihost.c:517-521.
-+ * UZASADNIENIE (binarium fw, notes/ par. 1.3):
-+ *   0x3a7c ldr r3,[r2,#4]           (fw czyta z kontraktu TYLKO dolny dword)
-+ *   0x3a7e bic.w r3,r3,#0xfc000000  (okno 64 MiB)
-+ *   0x3a82 orr.w r3,r3,#0x8000000   (baza okna SB->PCIE 0x08000000)
++/* Buffer address gate for fw 7.77 -- condition 1:1 with the reference tool l. 517-521.
++ * JUSTIFICATION (fw binary, project notes par. 1.3):
++ *   0x3a7c ldr r3,[r2,#4]           (the fw reads from the contract ONLY the low dword)
++ *   0x3a7e bic.w r3,r3,#0xfc000000  (64 MiB window)
++ *   0x3a82 orr.w r3,r3,#0x8000000   (SB->PCIE window base 0x08000000)
 + *   0x3a90-0x3a98 sbtopcie0 := (low & 0xFC000000) | 0xC
-+ * Adres >= 4 GiB jest bezuzyteczny (fragment +0x8 nie jest czytany), a okno
-+ * przechodzace przez granice 64 MiB podstawia koniec pierscienia pod POCZATEK
-+ * okna -- a fw tam PISZE (pierscien D2H) => uszkodzenie cudzej pamieci hosta. */
++ * An address >= 4 GiB is useless (the +0x8 fragment is not read), and a window
++ * crossing the 64 MiB boundary puts the ring end under the START
++ * of the window -- and the fw WRITES there (D2H ring) => corruption of someone else's host memory. */
 +static bool om_dma_adres_ok(dma_addr_t dma)
 +{
 +	return (u64)dma < 0x100000000ULL &&
@@ -682,7 +682,7 @@
 +	return p[off / 4];
 +}
 +
-+/* =========================================================== operacje: TCM */
++/* =========================================================== operations: TCM */
 +
 +static void om_op_zero(struct om_bridge *b, int argc, char **argv)
 +{
@@ -693,29 +693,29 @@
 +
 +	if (argc >= 3) {
 +		if (kstrtouint(argv[1], 0, &from) || kstrtouint(argv[2], 0, &to)) {
-+			om_blad(b, "zero: uzycie `zero <od_hex> <do_hex>` (domyslnie 0x%05x 0x%05x)\n",
++			om_blad(b, "zero: usage `zero <from_hex> <to_hex>` (default 0x%05x 0x%05x)\n",
 +				OM_ZERO_OD_777, OM_ZERO_DO_777);
 +			return;
 +		}
 +	}
 +	if (to <= from || to > OM_RAMSIZE) {
-+		om_blad(b, "zero: zakres niepoprawny (0x%05x..0x%05x, ramsize 0x%05x)\n",
++		om_blad(b, "zero: invalid range (0x%05x..0x%05x, ramsize 0x%05x)\n",
 +			from, to, OM_RAMSIZE);
 +		return;
 +	}
-+	om_emrg(b, "zero TCM [0x%05x,0x%05x) = %u B, klasa z patcha 0036 (porcje 4 KiB, zapis 32-bitowy) -- start\n",
++	om_emrg(b, "zero TCM [0x%05x,0x%05x) = %u B, the class from patch 0036 (4 KiB chunks, 32-bit writes) -- start\n",
 +		from, to, to - from);
 +	zapisane = om_tcm_zero(b, from, to);
 +	(void)om_tcm_read32(b, from, &v0);
 +	(void)om_tcm_read32(b, to - 4, &v1);
-+	om_odp(b, "zero: zapisane %u B z %u; kontrola TCM[0x%05x]=0x%08x TCM[0x%05x]=0x%08x (oczekiwane 0x0 0x0)\n",
++	om_odp(b, "zero: wrote %u B of %u; check TCM[0x%05x]=0x%08x TCM[0x%05x]=0x%08x (expected 0x0 0x0)\n",
 +	       zapisane, to - from, from, v0, to - 4, v1);
-+	om_odp(b, "zero: TCM NIE czysci sie rebootem (CLAUDE.md p.5) -- ta komenda zastepuje reboot\n");
++	om_odp(b, "zero: TCM is NOT cleared by a reboot (project rulebook item 5) -- this command replaces the reboot\n");
 +}
 +
-+/* loadfw: obraz do TCM od 0 (32-bit, ostatni dword dopelniony zerami).
-+ * NIE piszemy TCM[ramsize-4] (R2 z notes/; patch 0037
-+ * robi to samo na sciezce 7.77). */
++/* loadfw: image to TCM from 0 (32-bit, the last dword padded with zeros).
++ * We do NOT write TCM[ramsize-4] (R2 from the project notes; patch 0037
++ * does the same on the 7.77 path). */
 +static void om_op_loadfw(struct om_bridge *b, int argc, char **argv)
 +{
 +	struct file *f;
@@ -726,35 +726,35 @@
 +	u32 v0 = 0, v1 = 0;
 +
 +	if (argc < 2) {
-+		om_blad(b, "loadfw: uzycie `loadfw <sciezka>`\n");
++		om_blad(b, "loadfw: usage `loadfw <path>`\n");
 +		return;
 +	}
 +	f = filp_open(argv[1], O_RDONLY, 0);
 +	if (IS_ERR(f)) {
-+		om_blad(b, "loadfw: nie moge otworzyc %s (%ld)\n", argv[1], PTR_ERR(f));
++		om_blad(b, "loadfw: cannot open %s (%ld)\n", argv[1], PTR_ERR(f));
 +		return;
 +	}
 +	len = (u32)i_size_read(file_inode(f));
 +	if (len == 0 || len > OM_KONTRAKT) {
-+		om_blad(b, "loadfw: rozmiar %u B poza zakresem (1..0x%05x = podstawa kontraktu)\n",
++		om_blad(b, "loadfw: size %u B out of range (1..0x%05x = the contract base)\n",
 +			len, OM_KONTRAKT);
 +		filp_close(f, NULL);
 +		return;
 +	}
 +	dane = vmalloc(len);
 +	if (!dane) {
-+		om_blad(b, "loadfw: brak pamieci na %u B obrazu\n", len);
++		om_blad(b, "loadfw: no memory for a %u B image\n", len);
 +		filp_close(f, NULL);
 +		return;
 +	}
 +	n = kernel_read(f, dane, len, &pos);
 +	filp_close(f, NULL);
 +	if (n != (ssize_t)len) {
-+		om_blad(b, "loadfw: odczytano %zd z %u B\n", n, len);
++		om_blad(b, "loadfw: read %zd of %u B\n", n, len);
 +		vfree(dane);
 +		return;
 +	}
-+	om_emrg(b, "loadfw: %s = %u B -> TCM[0x00000..), zapis 32-bitowy -- start\n", argv[1], len);
++	om_emrg(b, "loadfw: %s = %u B -> TCM[0x00000..), 32-bit writes -- start\n", argv[1], len);
 +	om_tcm_copy(b, OM_RAMBASE, dane, len);
 +	b->rstvec = (u32)dane[0] | ((u32)dane[1] << 8) |
 +		    ((u32)dane[2] << 16) | ((u32)dane[3] << 24);
@@ -762,30 +762,30 @@
 +	vfree(dane);
 +	(void)om_tcm_read32(b, 0, &v0);
 +	(void)om_tcm_read32(b, OM_RAMSIZE - 4, &v1);
-+	om_odp(b, "loadfw: kontrola TCM[0x00000]=0x%08x (exp 0x%08x = rstvec); TCM[0x%05x]=0x%08x (tego pola NIE piszemy -- R2)\n",
++	om_odp(b, "loadfw: check TCM[0x00000]=0x%08x (exp 0x%08x = rstvec); TCM[0x%05x]=0x%08x (we do NOT write this field -- R2)\n",
 +	       v0, b->rstvec, OM_RAMSIZE - 4, v1);
 +	if (len == OM_OBRAZ_ROZMIAR_777)
-+		om_odp(b, "loadfw: rstvec = 0x%08x (pierwszy dword obrazu 7.77.0.0; uzyje go `release`)\n",
++		om_odp(b, "loadfw: rstvec = 0x%08x (first dword of the 7.77.0.0 image; `release` will use it)\n",
 +		       b->rstvec);
 +	else
-+		om_odp(b, "loadfw: UWAGA rozmiar != 0x%05x (obraz 7.77.0.0) -- rstvec = 0x%08x z tego pliku\n",
++		om_odp(b, "loadfw: NOTE size != 0x%05x (the 7.77.0.0 image) -- rstvec = 0x%08x from this file\n",
 +		       OM_OBRAZ_ROZMIAR_777, b->rstvec);
 +}
 +
-+/* ================================================ operacje: kontrakt i vars */
++/* ================================================ operations: contract and vars */
 +
-+/* Kontrakt: 12 pol. Kolejnosc i wartosci jak w minihost.c:1129-1197 i pcie.c
-+ * (patch 0036 + 0037). Semafory piszemy ZERAMI (zasada 7 w naglowku pliku);
-+ * Apple pisze 0 do +0x14/+0x18 (_wlc_ol_up, full.dis 0x73a3d/0x73a42), turn
-+ * zostawia -- my zerujemy takze turn (minihost.c:1156), bo przy flag[0]=0
-+ * warunek petli fw i tak nie zachodzi, a TCM nie czysci sie rebootem. */
++/* Contract: 12 fields. Order and values as in the reference tool l. 1129-1197 and pcie.c
++ * (patch 0036 + 0037). We write the semaphores as ZEROS (rule 7 in the file header);
++ * Apple writes 0 to +0x14/+0x18 (_wlc_ol_up, full.dis 0x73a3d/0x73a42), turn
++ * it leaves alone -- we zero turn too (reference tool l. 1156), because with flag[0]=0
++ * the fw loop condition does not hold anyway, and TCM is not cleared by a reboot. */
 +static void om_op_contract(struct om_bridge *b, int argc, char **argv)
 +{
 +	u32 rb[12];
 +	u32 hb = 0, fl = 0, rec = 0, me = 0;
 +	u32 i;
 +
-+	om_emrg(b, "contract: 12 pol @0x%05x (TCM_end - 0x5F80) -- start zapisu\n", OM_KONTRAKT);
++	om_emrg(b, "contract: 12 fields @0x%05x (TCM_end - 0x5F80) -- start of the write\n", OM_KONTRAKT);
 +	(void)om_tcm_write32(b, OM_KONTRAKT + 0x0000, OM_MARKER_BEGIN_VAL);
 +	if (b->dma_ok) {
 +		(void)om_tcm_write32(b, OM_KONTRAKT + OM_K_MSGBUFADDR_LO,
@@ -793,7 +793,7 @@
 +		(void)om_tcm_write32(b, OM_KONTRAKT + OM_K_MSGBUFADDR_HI,
 +				     (u32)((u64)b->dma_fiz >> 32));
 +	} else {
-+		om_blad(b, "contract: pola +0x%04x/+0x%04x POMINIETE -- adres bufora DMA 0x%llx NIE przechodzi bramki fw 7.77 (<4 GiB i okno 64 MiB); nie wymyslamy adresu\n",
++		om_blad(b, "contract: fields +0x%04x/+0x%04x SKIPPED -- the DMA buffer address 0x%llx does NOT pass the fw 7.77 gate (<4 GiB and the 64 MiB window); we do not invent an address\n",
 +			OM_K_MSGBUFADDR_LO, OM_K_MSGBUFADDR_HI,
 +			(unsigned long long)b->dma_fiz);
 +	}
@@ -810,9 +810,9 @@
 +		(void)om_tcm_read32(b, OM_KONTRAKT + i * 4, &rb[i]);
 +	om_odp(b, "contract: +0x0 marker=0x%08x (exp 0x%08x)  +0x4 msgbuf_lo=0x%08x  +0x8 msgbuf_hi=0x%08x  +0xc sz=0x%08x\n",
 +	       rb[0], OM_MARKER_BEGIN_VAL, rb[1], rb[2], rb[3]);
-+	om_odp(b, "contract: +0x10 konsola_ptr=0x%08x (pisze FW)  +0x14 flag[0]=0x%08x  +0x18 flag[1]=0x%08x  +0x1c turn=0x%08x (exp 0 0 0)\n",
++	om_odp(b, "contract: +0x10 console_ptr=0x%08x (written by FW)  +0x14 flag[0]=0x%08x  +0x18 flag[1]=0x%08x  +0x1c turn=0x%08x (exp 0 0 0)\n",
 +	       rb[4], rb[5], rb[6], rb[7]);
-+	om_odp(b, "contract: +0x20 vars_size=0x%08x (0 = vars jeszcze nie wgrane)\n", rb[8]);
++	om_odp(b, "contract: +0x20 vars_size=0x%08x (0 = vars not loaded yet)\n", rb[8]);
 +	(void)om_tcm_read32(b, OM_KONTRAKT + OM_K_HEARTBEAT, &hb);
 +	(void)om_tcm_read32(b, OM_KONTRAKT + OM_K_TRAP_FLAG, &fl);
 +	(void)om_tcm_read32(b, OM_KONTRAKT + OM_K_TRAP_REC, &rec);
@@ -820,14 +820,14 @@
 +	om_odp(b, "contract: +0x5028 hb=0x%08x  +0x502c trap=0x%08x  +0x5ed8 rec=0x%08x  +0x5f5c marker_end=0x%08x (exp 0x%08x)\n",
 +	       hb, fl, rec, me, OM_MARKER_END_VAL);
 +	if (rb[0] != OM_MARKER_BEGIN_VAL || me != OM_MARKER_END_VAL)
-+		om_blad(b, "contract: UWAGA markery NIE zapisaly sie (walidator hosta @0x774e2/_wlc_ol_validate_shared_info je sprawdza; fw ich NIE waliduje)\n");
++		om_blad(b, "contract: NOTE the markers did NOT get written (the host validator @0x774e2/_wlc_ol_validate_shared_info checks them; the fw does NOT validate them)\n");
 +	if (fl == OM_TRAP_FLAG_VAL)
-+		om_blad(b, "contract: UWAGA trap_flag bylo 0xDEADBEEF -- fw na zastanym 0xDEADBEEF wchodzi w wieczny spin (die() 0x344c -> b.n 0x3466), dlatego zerujemy to pole PRZED releasem\n");
++		om_blad(b, "contract: NOTE trap_flag was 0xDEADBEEF -- on a stale 0xDEADBEEF the fw enters an eternal spin (die() 0x344c -> b.n 0x3466), so we zero that field BEFORE the release\n");
 +}
 +
-+/* vars: rozmiar @+0x20, tekst @+0x24 + odczyt zwrotny CALOSCI -- 1:1 z
-+ * bcm4360_ol77_write_vars (pcie.c:5699-5760) i z komenda `vars` minihosta
-+ * (minihost.c:1201-1245). Bramka rozmiaru: MAXSZ_NVRAM_VARS 0x4000. */
++/* vars: size @+0x20, text @+0x24 + FULL readback -- 1:1 with
++ * bcm4360_ol77_write_vars (pcie.c:5699-5760) and with the reference tool's `vars` command
++ * (reference tool l. 1201-1245). Size gate: MAXSZ_NVRAM_VARS 0x4000. */
 +static void om_op_vars(struct om_bridge *b, int argc, char **argv)
 +{
 +	struct file *f;
@@ -838,43 +838,43 @@
 +	u32 rozmiar_rb = 0;
 +
 +	if (argc < 2) {
-+		om_blad(b, "vars: uzycie `vars <sciezka>`\n");
++		om_blad(b, "vars: usage `vars <path>`\n");
 +		return;
 +	}
 +	f = filp_open(argv[1], O_RDONLY, 0);
 +	if (IS_ERR(f)) {
-+		om_blad(b, "vars: nie moge otworzyc %s (%ld)\n", argv[1], PTR_ERR(f));
++		om_blad(b, "vars: cannot open %s (%ld)\n", argv[1], PTR_ERR(f));
 +		return;
 +	}
 +	len = (u32)i_size_read(file_inode(f));
 +	if (len == 0 || len > OM_VARS_MAX) {
-+		om_blad(b, "vars: rozmiar %u B poza zakresem 1..0x%x (MAXSZ_NVRAM_VARS)\n",
++		om_blad(b, "vars: size %u B out of the 1..0x%x range (MAXSZ_NVRAM_VARS)\n",
 +			len, OM_VARS_MAX);
 +		filp_close(f, NULL);
 +		return;
 +	}
 +	if (OM_K_VARS + len > 0x5f80u) {
-+		om_blad(b, "vars: %u B nie miesci sie w strukturze hosta (0x5F80 B)\n", len);
++		om_blad(b, "vars: %u B does not fit in the host struct (0x5F80 B)\n", len);
 +		filp_close(f, NULL);
 +		return;
 +	}
 +	dane = vmalloc(len);
 +	if (!dane) {
-+		om_blad(b, "vars: brak pamieci na %u B\n", len);
++		om_blad(b, "vars: no memory for %u B\n", len);
 +		filp_close(f, NULL);
 +		return;
 +	}
 +	n = kernel_read(f, dane, len, &pos);
 +	filp_close(f, NULL);
 +	if (n != (ssize_t)len) {
-+		om_blad(b, "vars: odczytano %zd z %u B\n", n, len);
++		om_blad(b, "vars: read %zd of %u B\n", n, len);
 +		vfree(dane);
 +		return;
 +	}
-+	om_emrg(b, "vars: %s = %u B -> kontrakt+0x%02x (TCM[0x%05x..0x%05x]) -- start\n",
++	om_emrg(b, "vars: %s = %u B -> contract+0x%02x (TCM[0x%05x..0x%05x]) -- start\n",
 +		argv[1], len, OM_K_VARS, OM_KONTRAKT + OM_K_VARS,
 +		OM_KONTRAKT + OM_K_VARS + len - 1);
-+	/* Kolejnosc jak w module i minihoscie: NAJPIERW rozmiar, potem tekst */
++	/* Order as in the module and the reference tool: size FIRST, then the text */
 +	(void)om_tcm_write32(b, OM_KONTRAKT + OM_K_VARS_SIZE, len);
 +	om_tcm_copy(b, OM_KONTRAKT + OM_K_VARS, dane, len);
 +	for (i = 0; i < len; i += 4) {
@@ -891,34 +891,34 @@
 +		}
 +	}
 +	(void)om_tcm_read32(b, OM_KONTRAKT + OM_K_VARS_SIZE, &rozmiar_rb);
-+	om_odp(b, "vars: readback vars_size=0x%08x (exp 0x%x) bajtow-niezgodnych=%u\n",
++	om_odp(b, "vars: readback vars_size=0x%08x (exp 0x%x) mismatched-bytes=%u\n",
 +	       rozmiar_rb, len, niezgodne);
 +	vfree(dane);
 +}
 +
-+/* ===================================== D11: zdjecie resetu przez WRAPPER (0x18101000)
++/* ===================================== D11: taking the reset off via the WRAPPER (0x18101000)
 + *
-+ * PO CO: fw 7.77 w attachu czyta `clk_ctl_st` = D11+0x1e0 (`ldr.w r2,[r3,#0x1e0]`
-+ * @pc 0x12cc2 przy r3 = 0x18001000 => dfar 0x180011e0) i dostaje **AXI timeout**,
-+ * bo **D11 jest W RESECIE i jego przestrzen rejestrow nie odpowiada na szynie**.
-+ * To ten sam objaw i ta sama przyczyna, co w fire #20 (TRAP 4 @pc 0xe40a na
-+ * 0x180011e0). Zmierzone w pierwszym biegu mostu: `dfar 0x180011e0`, `pc 0x12cc2`
-+ * (notes/ par.2).
++ * WHY: in attach the fw 7.77 reads `clk_ctl_st` = D11+0x1e0 (`ldr.w r2,[r3,#0x1e0]`
++ * @pc 0x12cc2 with r3 = 0x18001000 => dfar 0x180011e0) and gets an **AXI timeout**,
++ * because **D11 IS IN RESET and its register space does not answer on the bus**.
++ * That is the same symptom and the same cause as in fire #20 (TRAP 4 @pc 0xe40a at
++ * 0x180011e0). Measured in the first bridge run: `dfar 0x180011e0`, `pc 0x12cc2`
++ * (project notes par. 2).
 + *
-+ * PRZEPIS 1:1 z brcmfmac `brcmf_chip_ai_resetcore` (chip.c:434-489) -- ta sama
-+ * droga, ktora w FIRE #23 (test.329, patch 0027) uwolnila D11 i wypuscila fw za
-+ * pc=0xe40a. Pomiar z tamtego fire (notes/):
++ * RECIPE 1:1 from brcmfmac `brcmf_chip_ai_resetcore` (chip.c:434-489) -- the same
++ * path that in FIRE #23 (test.329, patch 0027) freed D11 and released the fw past
++ * pc=0xe40a. Measurement from that fire (project notes):
 + *     BEFORE: IOCTL(0x18101408) = 0x7   RESET_CTL(0x18101800) = 0x1
 + *     AFTER : IOCTL             = 0x5   RESET_CTL              = 0x0
-+ * Trojak dla D11: prereset = PHYRESET|PHYCLOCKEN (0xc), reset = postreset =
-+ * PHYCLOCKEN (0x4) -- ten sam, ktory sterownik podaje dla D11 na innych chipach
++ * Triplet for D11: prereset = PHYRESET|PHYCLOCKEN (0xc), reset = postreset =
++ * PHYCLOCKEN (0x4) -- the same one the driver feeds D11 on other chips
 + * (chip.c:1288-1291, :1360-1363).
 + *
-+ * GRANICA: dotykamy WYLACZNIE strony WRAPPERA 0x18101000 (+0x408/+0x800/+0x804/
-+ * +0x1e0) -- tak samo, jak `om_reset_internal_mem` dotyka wrappera SOCRAM, a
-+ * `release` wrappera ARM. Strona rdzenia 0x18001000 pozostaje ZAKAZANA (HARD
-+ * RULE, fire #21) -- i tak nie odpowiada, dopoki RESET_CTL b0 = 1. Zero zapisow
-+ * do rdzenia; kazda petla jest ograniczona, kazdy zapis ma readback.
++ * BOUNDARY: we touch ONLY the WRAPPER page 0x18101000 (+0x408/+0x800/+0x804/
++ * +0x1e0) -- just as `om_reset_internal_mem` touches the SOCRAM wrapper and
++ * `release` the ARM wrapper. The core page 0x18001000 stays FORBIDDEN (HARD
++ * RULE, fire #21) -- and anyway it does not answer while RESET_CTL b0 = 1. No writes
++ * to the core; every loop is bounded, every write has a readback.
 + */
 +static int om_d11_w_reset_ctl(struct om_bridge *b, u32 *val)
 +{
@@ -932,30 +932,30 @@
 +	const u32 postreset = OM_BCMA_IOCTL_PHYCLOCKEN;				/* 0x4 */
 +	u32 ioctl_przed = 0, reset_przed = 0, st_przed = 0, clk_przed = 0;
 +	u32 ioctl_cfg = 0, ioctl_po = 0, reset_po = 0, st_po = 0, clk_po = 0;
-+	u32 reset_ost = 0;	/* ostatni UDANY odczyt RESET_CTL = podstawa werdyktu */
-+	bool po_ok = false;	/* czy odczyt RESET_CTL po zdjeciu resetu sie udal */
++	u32 reset_ost = 0;	/* last SUCCESSFUL RESET_CTL read = the verdict basis */
++	bool po_ok = false;	/* whether the RESET_CTL read after removing the reset succeeded */
 +	u32 i;
 +
 +	(void)argc;
 +	(void)argv;
-+	om_emrg(b, "d11release: wrapper D11 0x%08x -- zapisy TYLKO do strony wrappera; rdzen 0x%08x ZAKAZANY (HARD RULE, fire #21)\n",
++	om_emrg(b, "d11release: D11 wrapper 0x%08x -- writes ONLY to the wrapper page; the core 0x%08x FORBIDDEN (HARD RULE, fire #21)\n",
 +		OM_D11_WRAP, OM_D11_BASE);
 +	(void)om_bp_read32(b, OM_D11_WRAP + OM_BCMA_IOCTL, &ioctl_przed);
 +	if (om_d11_w_reset_ctl(b, &reset_przed) != 0) {
-+		om_blad(b, "d11release: odczyt RESET_CTL wrappera nieudany -- backplane nie odpowiada; PRZERYWAM (zero zapisow)\n");
++		om_blad(b, "d11release: wrapper RESET_CTL read failed -- the backplane is not answering; ABORTING (zero writes)\n");
 +		return;
 +	}
 +	(void)om_bp_read32(b, OM_D11_WRAP + OM_BCMA_RESET_ST, &st_przed);
 +	(void)om_bp_read32(b, OM_D11_WRAP + OM_BCMA_CLKCTLST, &clk_przed);
-+	om_odp(b, "d11release: PRZED: IOCTL(+0x%03x)=0x%08x RESET_CTL(+0x%03x)=0x%08x RESET_ST=0x%08x CLKCTLST(+0x%03x)=0x%08x => %s\n",
++	om_odp(b, "d11release: BEFORE: IOCTL(+0x%03x)=0x%08x RESET_CTL(+0x%03x)=0x%08x RESET_ST=0x%08x CLKCTLST(+0x%03x)=0x%08x => %s\n",
 +	       OM_BCMA_IOCTL, ioctl_przed, OM_BCMA_RESET_CTL, reset_przed, st_przed,
 +	       OM_BCMA_CLKCTLST, clk_przed,
 +	       (reset_przed & OM_BCMA_RESET_CTL_RESET) ?
-+	       "D11 W RESECIE (przestrzen rdzenia NIE odpowiada -- stad AXI timeout fw)" :
-+	       "D11 poza resetem (jesli fw i tak traci szyne, przyczyna jest inna)");
++	       "D11 IN RESET (the core space does NOT answer -- hence the fw AXI timeout)" :
++	       "D11 out of reset (if the fw still loses the bus, the cause is elsewhere)");
 +
-+	/* krok 1 -- tylko gdy rdzen NIE jest w resecie (chip.c:360-375): wstaw w reset,
-+	 * bo inaczej nie ma czego zwalniac. */
++	/* step 1 -- only when the core is NOT in reset (chip.c:360-375): put it in reset,
++	 * because otherwise there is nothing to release. */
 +	if (!(reset_przed & OM_BCMA_RESET_CTL_RESET)) {
 +		(void)om_bp_write32(b, OM_D11_WRAP + OM_BCMA_IOCTL,
 +				    prereset | OM_BCMA_IOCTL_FGC | OM_BCMA_IOCTL_CLK);
@@ -971,17 +971,17 @@
 +				break;
 +			udelay(1);
 +		}
-+		om_odp(b, "d11release: krok 1 (wstawienie w reset): IOCTL := 0x%08x (readback 0x%08x), RESET_CTL := 0x%08x\n",
++		om_odp(b, "d11release: step 1 (putting into reset): IOCTL := 0x%08x (readback 0x%08x), RESET_CTL := 0x%08x\n",
 +		       prereset | OM_BCMA_IOCTL_FGC | OM_BCMA_IOCTL_CLK, ioctl_cfg,
 +		       OM_BCMA_RESET_CTL_RESET);
 +	}
-+	/* krok 2 -- konfiguracja w resecie (chip.c:378-381). Oczekiwane 0x7 = fire #23 BEFORE. */
++	/* step 2 -- configuration in reset (chip.c:378-381). Expected 0x7 = fire #23 BEFORE. */
 +	(void)om_bp_write32(b, OM_D11_WRAP + OM_BCMA_IOCTL,
 +			    reset | OM_BCMA_IOCTL_FGC | OM_BCMA_IOCTL_CLK);
 +	(void)om_bp_read32(b, OM_D11_WRAP + OM_BCMA_IOCTL, &ioctl_cfg);
-+	om_odp(b, "d11release: krok 2 (konfiguracja w resecie): IOCTL := 0x%08x (wzorzec fire #23: 0x7)\n",
++	om_odp(b, "d11release: step 2 (configuration in reset): IOCTL := 0x%08x (pattern fire #23: 0x7)\n",
 +	       ioctl_cfg);
-+	/* krok 3 -- zdjecie resetu, petla OGRANICZONA (chip.c:459-470: max 50 prob). */
++	/* step 3 -- removing the reset, a BOUNDED loop (chip.c:459-470: max 50 tries). */
 +	for (i = 0; i < 50; i++) {
 +		if (om_d11_w_reset_ctl(b, &reset_po) != 0)
 +			break;
@@ -992,43 +992,43 @@
 +		(void)om_bp_write32(b, OM_D11_WRAP + OM_BCMA_RESET_CTL, 0);
 +		usleep_range(40, 60);
 +	}
-+	/* Krok 3 mial dotad ZADNEJ linii w logu (uwaga z audytu 11.09.2026) --
-+	 * a to on jest sedno werdyktu, wiec raportujemy wyjscie z petli. */
-+	om_odp(b, "d11release: krok 3 (zdjecie resetu): RESET_CTL := 0 w petli <= 50; wyjscie na iteracji %u, RESET_CTL = 0x%08x%s\n",
++	/* Step 3 had NO line in the log until now (note from the 11.09.2026 audit) --
++	 * yet it is the crux of the verdict, so we report the loop exit. */
++	om_odp(b, "d11release: step 3 (removing the reset): RESET_CTL := 0 in a loop <= 50; exit at iteration %u, RESET_CTL = 0x%08x%s\n",
 +	       i, reset_ost,
-+	       po_ok ? "" : " (zaden odczyt RESET_CTL sie nie udal)");
-+	/* krok 4 -- postreset (chip.c:483-485). Oczekiwane 0x5 = fire #23 AFTER. */
++	       po_ok ? "" : " (no RESET_CTL read succeeded)");
++	/* step 4 -- postreset (chip.c:483-485). Expected 0x5 = fire #23 AFTER. */
 +	(void)om_bp_write32(b, OM_D11_WRAP + OM_BCMA_IOCTL, postreset | OM_BCMA_IOCTL_CLK);
 +	(void)om_bp_read32(b, OM_D11_WRAP + OM_BCMA_IOCTL, &ioctl_po);
-+	/* Werdykt wylacznie z UDANEGO odczytu: nieudany odczyt = stan NIEZNANY, a nie
-+	 * "TAK" z niezainicjowanej zmiennej (ta sama klasa bledu, co statyczny werdykt
-+	 * w `read rings` -- 11.09.2026). Ostatni udany odczyt = stan biezacy. */
++	/* Verdict only from a SUCCESSFUL read: a failed read = an UNKNOWN state, not
++	 * a "YES" from an uninitialized variable (the same error class as the static verdict
++	 * in `read rings` -- 11.09.2026). The last successful read = the current state. */
 +	if (om_d11_w_reset_ctl(b, &reset_po) == 0) {
 +		reset_ost = reset_po;
 +		po_ok = true;
 +	} else {
-+		om_blad(b, "d11release: odczyt RESET_CTL po postresecie NIEUDANY -- werdykt z ostatniego udanego odczytu (0x%08x)\n",
++		om_blad(b, "d11release: RESET_CTL read after the postreset FAILED -- verdict from the last successful read (0x%08x)\n",
 +			reset_ost);
 +	}
 +	(void)om_bp_read32(b, OM_D11_WRAP + OM_BCMA_RESET_ST, &st_po);
 +	(void)om_bp_read32(b, OM_D11_WRAP + OM_BCMA_CLKCTLST, &clk_po);
-+	om_odp(b, "d11release: PO: IOCTL=0x%08x RESET_CTL=0x%08x (udany odczyt: %s) RESET_ST=0x%08x CLKCTLST(+0x%03x)=0x%08x\n",
-+	       ioctl_po, reset_ost, po_ok ? "tak" : "NIE -- stan NIEZNANY", st_po,
++	om_odp(b, "d11release: AFTER: IOCTL=0x%08x RESET_CTL=0x%08x (successful read: %s) RESET_ST=0x%08x CLKCTLST(+0x%03x)=0x%08x\n",
++	       ioctl_po, reset_ost, po_ok ? "yes" : "NO -- state UNKNOWN", st_po,
 +	       OM_BCMA_CLKCTLST, clk_po);
-+	om_odp(b, "d11release: WERDYKT D11 wyszlo z resetu: %s (RESET_CTL b0: 0x%x -> 0x%x); IOCTL 0x%x -> 0x%x (wzorzec fire #23: 0x7 -> 0x5)\n",
-+	       !po_ok ? "NIEZNANE (zaden odczyt RESET_CTL sie nie udal)" :
-+	       (reset_ost & OM_BCMA_RESET_CTL_RESET) ? "NIE" : "TAK",
++	om_odp(b, "d11release: VERDICT: D11 came out of reset: %s (RESET_CTL b0: 0x%x -> 0x%x); IOCTL 0x%x -> 0x%x (pattern fire #23: 0x7 -> 0x5)\n",
++	       !po_ok ? "UNKNOWN (no RESET_CTL read succeeded)" :
++	       (reset_ost & OM_BCMA_RESET_CTL_RESET) ? "NO" : "YES",
 +	       reset_przed & 1u, reset_ost & 1u, ioctl_cfg, ioctl_po);
-+	om_odp(b, "d11release: kolejnosc ZMIERZONA (test.342/345; pcie.c:5874 obraz, :5883 TCM): ten krok po `zero`/`loadfw`/`contract`/`vars`, a przed `maccontrol` i `release` -- obie sciany sa niezalezne: najpierw szyna (reset), potem predykat clk (maccontrol)\n");
++	om_odp(b, "d11release: order MEASURED (test.342/345; pcie.c:5874 image, :5883 TCM): this step after `zero`/`loadfw`/`contract`/`vars`, before `maccontrol` and `release` -- the two walls are independent: first the bus (reset), then the clk predicate (maccontrol)\n");
 +}
 +
-+/* ==================================================== maccontrol (strona D11)
++/* ==================================================== maccontrol (D11 page)
 + *
-+ * PODWOJNA BRAMKA: parametr modulu `d11_ok=1` ORAZ token `d11-ok` w samej
-+ * komendzie -- OBA sprawdzane PRZED jakimkolwiek MMIO (wymagania 3 i 5
-+ * zlecenia; HARD RULE CLAUDE.md p.7). Wartosc: seed kextu 0x04000400
-+ * (MCTL_IHR_EN b10 | MCTL_WAKE b26) -- notes/;
-+ * zmierzone w test.341/342: wypuszcza fw z asercji `clk == 0`. */
++ * DOUBLE GATE: the module parameter `d11_ok=1` AND the token `d11-ok` in the
++ * command itself -- BOTH checked BEFORE any MMIO (requirements 3 and 5
++ * of the brief; HARD RULE project rulebook item 7). Value: the kext seed 0x04000400
++ * (MCTL_IHR_EN b10 | MCTL_WAKE b26) -- project notes;
++ * measured in test.341/342: releases the fw out of the `clk == 0` assert. */
 +static void om_op_maccontrol(struct om_bridge *b, int argc, char **argv)
 +{
 +	u32 addr = OM_D11_BASE + OM_D11_MACCONTROL_OFF;
@@ -1042,68 +1042,68 @@
 +			token = true;
 +
 +	if (!d11_ok) {
-+		om_blad(b, "ODMOWA: maccontrol dotyka strony D11 0x%08x, a modul nie zostal zaladowany z `d11_ok=1` -- HARD RULE CLAUDE.md p.7 (fire #21 = zwis maszyny). Zero MMIO.\n",
++		om_blad(b, "REFUSAL: maccontrol touches the D11 page 0x%08x but the module was not loaded with `d11_ok=1` -- HARD RULE project rulebook item 7 (fire #21 = machine hang). Zero MMIO.\n",
 +			addr);
 +		return;
 +	}
 +	if (!token) {
-+		om_blad(b, "ODMOWA: maccontrol wymaga tokenu `d11-ok` w samej komendzie (np. `maccontrol 0x04000400 d11-ok`), mimo d11_ok=1. Zero MMIO.\n");
++		om_blad(b, "REFUSAL: maccontrol requires the `d11-ok` token in the command itself (e.g. `maccontrol 0x04000400 d11-ok`) despite d11_ok=1. Zero MMIO.\n");
 +		return;
 +	}
 +	if (argc >= 2 && strcmp(argv[1], "d11-ok") && kstrtouint(argv[1], 0, &wartosc)) {
-+		om_blad(b, "maccontrol: uzycie `maccontrol [<hex>] d11-ok` (bez wartosci biore seed kextu 0x%08x)\n",
++		om_blad(b, "maccontrol: usage `maccontrol [<hex>] d11-ok` (without a value I take the kext seed 0x%08x)\n",
 +			OM_D11_MACCONTROL_SEED);
 +		return;
 +	}
-+	/* BLOKADA BEZPIECZENSTWA (doszla 11.09.2026): dopoki D11 jest W RESECIE, jego
-+	 * przestrzen rejestrow nie odpowiada na szynie -- kazdy dostep do niej to AXI
-+	 * timeout, a przy odczycie z hosta realny zwis maszyny (fire #21). Stan czytamy
-+	 * z WRAPPERA (0x18101000), ktory odpowiada ZAWSZE.
-+	 * BRAMKA FAIL-CLOSED (11.09.2026, po audycie): NIEUDANY odczyt wrappera to NIE
-+	 * "brak dowodu na reset", a "stan NIEZNANY" -- i taki przypadek tez konczy sie
-+	 * odmowa. Poprzednia wersja przepuszczala wtedy zapis na strone rdzenia (jedyna
-+	 * egzekucja HARD RULE byla fail-open). */
++	/* SAFETY LOCK (added 11.09.2026): while D11 is IN RESET, its
++	 * register space does not answer on the bus -- every access to it is an AXI
++	 * timeout, and on a host read a real machine hang (fire #21). We read the state
++	 * from the WRAPPER (0x18101000), which answers ALWAYS.
++	 * FAIL-CLOSED GATE (11.09.2026, after the audit): a FAILED wrapper read is NOT
++	 * "no proof of reset" but an "UNKNOWN state" -- and such a case also ends
++	 * in a refusal. The previous version then allowed the write to the core page (the only
++	 * execution of the HARD RULE was fail-open). */
 +	{
 +		u32 rc = 0;
 +
 +		if (om_d11_w_reset_ctl(b, &rc) != 0) {
-+			om_blad(b, "ODMOWA: odczyt RESET_CTL wrappera 0x%08x NIEUDANY -- stan D11 NIEZNANY, a przy D11 w resecie strona rdzenia 0x%08x nie odpowiada na szynie (AXI timeout/zwis, fire #21). Bramka jest FAIL-CLOSED. Zero MMIO na rdzeniu.\n",
++			om_blad(b, "REFUSAL: wrapper RESET_CTL read 0x%08x FAILED -- D11 state UNKNOWN, and with D11 in reset the core page 0x%08x does not answer on the bus (AXI timeout/hang, fire #21). The gate is FAIL-CLOSED. Zero MMIO on the core.\n",
 +				OM_D11_WRAP + OM_BCMA_RESET_CTL, addr);
 +			return;
 +		}
 +		if (rc & OM_BCMA_RESET_CTL_RESET) {
-+			om_blad(b, "ODMOWA: D11 jest W RESECIE (wrapper 0x%08x RESET_CTL=0x%08x) -- strona rdzenia 0x%08x NIE odpowiada na szynie; dostep = AXI timeout/zwis (fire #21). Najpierw `d11release`. Zero MMIO na rdzeniu.\n",
++			om_blad(b, "REFUSAL: D11 IS IN RESET (wrapper 0x%08x RESET_CTL=0x%08x) -- the core page 0x%08x does NOT answer on the bus; access = AXI timeout/hang (fire #21). Run `d11release` first. Zero MMIO on the core.\n",
 +				OM_D11_WRAP, rc, addr);
 +			return;
 +		}
-+		om_odp(b, "maccontrol: wrapper D11 RESET_CTL=0x%08x => rdzen poza resetem, dostep do strony 0x%08x ma sens\n",
++		om_odp(b, "maccontrol: D11 wrapper RESET_CTL=0x%08x => core out of reset, accessing page 0x%08x makes sense\n",
 +		       rc, addr);
 +	}
-+	om_emrg(b, "maccontrol: D11 0x%08x := 0x%08x -- SWIADOMY dostep do STRONY D11 (d11_ok=1 + token d11-ok + bramka FAIL-CLOSED; jedyne wejscie: om_bp_*_d11)\n",
++	om_emrg(b, "maccontrol: D11 0x%08x := 0x%08x -- DELIBERATE access to the D11 PAGE (d11_ok=1 + the d11-ok token + the FAIL-CLOSED gate; only entry: om_bp_*_d11)\n",
 +		addr, wartosc);
 +	if (om_bp_read32_d11(b, addr, &przed) == 0)
 +		om_odp(b, "maccontrol: PRZED = 0x%08x\n", przed);
 +	if (om_bp_write32_d11(b, addr, wartosc) == 0 && om_bp_read32_d11(b, addr, &po) == 0)
-+		om_odp(b, "maccontrol: po zapisie 0x%08x (readback 0x%08x) -- %s; predykat fw (mctrl & 0x404) = 0x%03x => %s\n",
-+		       wartosc, po, po == wartosc ? "zapis siadl" : "ZAPIS NIE SIADL",
++		om_odp(b, "maccontrol: after the write 0x%08x (readback 0x%08x) -- %s; fw predicate (mctrl & 0x404) = 0x%03x => %s\n",
++		       wartosc, po, po == wartosc ? "write landed" : "WRITE DID NOT LAND",
 +		       po & 0x404u,
-+		       (po & 0x404u) == 0x400u ? "D11 obecny dla fw (clk != 0)" :
-+						 "fw uzna D11 za nieobecny (clk = 0)");
++		       (po & 0x404u) == 0x400u ? "D11 present for the fw (clk != 0)" :
++						 "fw treats D11 as absent (clk = 0)");
 +}
 +
 +/* ============================================ reset SOCRAM + release ARM */
 +
-+/* Reset rdzenia INTERNAL_MEM (0x81a) przed releasem -- pcie.c:4076-4081,
-+ * chip.c:350-486 (ai_coredisable + petla zdjecia resetu + IOCTL := postreset|CLK). */
++/* INTERNAL_MEM core reset (0x81a) before the release -- pcie.c:4076-4081,
++ * chip.c:350-486 (ai_coredisable + reset-removal loop + IOCTL := postreset|CLK). */
 +static void om_reset_internal_mem(struct om_bridge *b)
 +{
 +	u32 v = 0, i;
 +
-+	om_emrg(b, "release: reset rdzenia INTERNAL_MEM (SOCRAM, wrap 0x%08x) -- brcmf_chip_resetcore(core,0,0,0)\n",
++	om_emrg(b, "release: resetting the INTERNAL_MEM core (SOCRAM, wrap 0x%08x) -- brcmf_chip_resetcore(core,0,0,0)\n",
 +		OM_SOCRAM_WRAP);
 +	if (om_bp_read32(b, OM_SOCRAM_WRAP + OM_BCMA_RESET_CTL, &v) != 0)
 +		return;
-+	om_odp(b, "release: SOCRAM RESET_CTL przed = 0x%08x\n", v);
++	om_odp(b, "release: SOCRAM RESET_CTL before = 0x%08x\n", v);
 +	if (!(v & OM_BCMA_RESET_CTL_RESET)) {
 +		(void)om_bp_write32(b, OM_SOCRAM_WRAP + OM_BCMA_IOCTL,
 +				    OM_BCMA_IOCTL_FGC | OM_BCMA_IOCTL_CLK);
@@ -1124,14 +1124,14 @@
 +	}
 +	(void)om_bp_write32(b, OM_SOCRAM_WRAP + OM_BCMA_IOCTL, OM_BCMA_IOCTL_CLK);
 +	if (om_bp_read32(b, OM_SOCRAM_WRAP + OM_BCMA_IOCTL, &v) == 0)
-+		om_odp(b, "release: SOCRAM po resecie IOCTL = 0x%08x\n", v);
++		om_odp(b, "release: SOCRAM IOCTL after the reset = 0x%08x\n", v);
 +}
 +
-+/* Release ARM -- sekwencja 1:1 z minihosta (op_release, minihost.c:1309-1364):
++/* ARM release -- sequence 1:1 from the reference tool (op_release, reference tool l. 1309-1364):
 + * ops->activate = TCM[0] := rstvec (pcie.c brcmf_pcie_buscore_activate) +
 + * brcmf_chip_resetcore(core_arm_cr4, CPUHALT, 0, 0) (chip.c:1351-1362).
-+ * Efekt = RMW kextu `wrapper[0x408] &= ~0x20` (notes/:213):
-+ * ostatni zapis IOCTL to CLK bez CPUHALT => ARM rusza. */
++ * Effect = the kext's RMW `wrapper[0x408] &= ~0x20` (project notes):
++ * the last IOCTL write is CLK without CPUHALT => ARM starts. */
 +static void om_op_release(struct om_bridge *b, int argc, char **argv)
 +{
 +	u32 v = 0, i;
@@ -1139,22 +1139,22 @@
 +
 +	if (b->rstvec_znamy) {
 +		rstvec = b->rstvec;
-+		om_odp(b, "release: rstvec = 0x%08x (z ostatniego `loadfw`)\n", rstvec);
++		om_odp(b, "release: rstvec = 0x%08x (from the last `loadfw`)\n", rstvec);
 +	} else {
 +		(void)om_tcm_read32(b, 0, &rstvec);
-+		om_odp(b, "release: UWAGA bez `loadfw` w tej sesji -- biore rstvec z TCM[0x00000] = 0x%08x (moze byc smiec z poprzedniego przebiegu; `reset` nie czysci TCM)\n",
++		om_odp(b, "release: NOTE no `loadfw` in this session -- I take rstvec from TCM[0x00000] = 0x%08x (may be junk from a previous run; `reset` does not clear TCM)\n",
 +		       rstvec);
 +	}
 +	om_reset_internal_mem(b);
-+	om_emrg(b, "release: TCM[0x00000] := 0x%08x + wrapper ARM 0x%08x (RESET_CTL, IOCTL, petla, IOCTL := CLK bez CPUHALT) -- start\n",
++	om_emrg(b, "release: TCM[0x00000] := 0x%08x + ARM wrapper 0x%08x (RESET_CTL, IOCTL, loop, IOCTL := CLK without CPUHALT) -- start\n",
 +		rstvec, OM_ARM_WRAP);
 +	(void)om_tcm_write32(b, OM_RAMBASE, rstvec);
 +	if (om_bp_read32(b, OM_ARM_WRAP + OM_BCMA_RESET_CTL, &v) != 0) {
-+		om_blad(b, "release: nie moge odczytac RESET_CTL ARM -- PRZERWANE (zero dalszych zapisow)\n");
++		om_blad(b, "release: cannot read the ARM RESET_CTL -- ABORTED (no further writes)\n");
 +		return;
 +	}
-+	om_odp(b, "release: ARM RESET_CTL przed = 0x%08x (w resecie: %s)\n", v,
-+	       (v & OM_BCMA_RESET_CTL_RESET) ? "TAK" : "NIE");
++	om_odp(b, "release: ARM RESET_CTL before = 0x%08x (in reset: %s)\n", v,
++	       (v & OM_BCMA_RESET_CTL_RESET) ? "YES" : "NO");
 +	if (!(v & OM_BCMA_RESET_CTL_RESET)) {
 +		(void)om_bp_write32(b, OM_ARM_WRAP + OM_BCMA_IOCTL,
 +				    OM_ARMCR4_IOCTL_CPUHALT | OM_BCMA_IOCTL_FGC | OM_BCMA_IOCTL_CLK);
@@ -1175,20 +1175,20 @@
 +	}
 +	(void)om_bp_write32(b, OM_ARM_WRAP + OM_BCMA_IOCTL, OM_BCMA_IOCTL_CLK);
 +	if (om_bp_read32(b, OM_ARM_WRAP + OM_BCMA_IOCTL, &v) == 0) {
-+		om_odp(b, "release: ARM IOCTL po releasie = 0x%08x (CPUHALT b5 = %u => %s)\n",
++		om_odp(b, "release: ARM IOCTL after the release = 0x%08x (CPUHALT b5 = %u => %s)\n",
 +		       v, (v >> 5) & 1u,
-+		       (v & OM_ARMCR4_IOCTL_CPUHALT) ? "ARM nadal w halt" : "ARM RUSZYL");
++		       (v & OM_ARMCR4_IOCTL_CPUHALT) ? "ARM still in halt" : "ARM STARTED");
 +		b->arm_wypuszczony = !(v & OM_ARMCR4_IOCTL_CPUHALT);
 +	}
 +	if (om_bp_read32(b, OM_ARM_WRAP + OM_BCMA_RESET_CTL, &v) == 0)
-+		om_odp(b, "release: ARM RESET_CTL po releasie = 0x%08x\n", v);
++		om_odp(b, "release: ARM RESET_CTL after the release = 0x%08x\n", v);
 +}
 +
-+/* ============================================== bramka gotowosci i konsola fw */
++/* ============================================== readiness gate and the fw console */
 +
-+/* Poll kontrakt+0x5028 co 1 ms, limit 2000 (domyslnie; argument zmienia limit).
-+ * Po timeoucie LOG i KONTYNUACJA -- nigdy blad (Apple robi dokladnie to:
-+ * kext 0x73d3a-0x73d63; notes/ par.2.1). */
++/* Poll contract+0x5028 every 1 ms, limit 2000 (default; the argument changes the limit).
++ * After the timeout LOG and CONTINUE -- never an error (Apple does exactly this:
++ * kext 0x73d3a-0x73d63; project notes par. 2.1). */
 +static void om_op_gate(struct om_bridge *b, int argc, char **argv)
 +{
 +	u32 limit = OM_GATE_ITERACJE;
@@ -1198,7 +1198,7 @@
 +		if (kstrtouint(argv[1], 0, &limit) || limit == 0)
 +			limit = OM_GATE_ITERACJE;
 +	}
-+	om_odp(b, "gate: poll TCM[0x%05x] (heartbeat = kontrakt+0x%04x) co 1 ms, limit %u\n",
++	om_odp(b, "gate: poll TCM[0x%05x] (heartbeat = contract+0x%04x) every 1 ms, limit %u\n",
 +	       OM_KONTRAKT + OM_K_HEARTBEAT, OM_K_HEARTBEAT, limit);
 +	for (i = 0; i < limit; i++) {
 +		(void)om_tcm_read32(b, OM_KONTRAKT + OM_K_HEARTBEAT, &hb);
@@ -1207,14 +1207,14 @@
 +		usleep_range(1000, 2000);
 +	}
 +	if (hb)
-+		om_odp(b, "gate: heartbeat = 0x%08x po %u iteracjach -- FW ZYJE\n", hb, i + 1);
++		om_odp(b, "gate: heartbeat = 0x%08x after %u iterations -- FW ALIVE\n", hb, i + 1);
 +	else
-+		om_odp(b, "gate: TIMEOUT po %u ms, heartbeat nadal 0 -- KONTYNUUJE (Apple tez nie przerywa bootu; brak galezi bledu)\n",
++		om_odp(b, "gate: TIMEOUT after %u ms, heartbeat still 0 -- CONTINUING (Apple does not interrupt the boot either; there is no error branch)\n",
 +		       limit);
 +}
 +
-+/* Wskaznik struktury konsoli fw (kontrakt+0x10) i jej pola
-+ * {buf @+0, size @+4, wr_idx @+8} -- notatka par.5.2; publikuje je FW. */
++/* Pointer of the fw console struct (contract+0x10) and its fields
++ * {buf @+0, size @+4, wr_idx @+8} -- notes par. 5.2; published by the FW. */
 +static int om_konsola(struct om_bridge *b, u32 *ptr, u32 *buf, u32 *size, u32 *wr)
 +{
 +	if (om_tcm_read32(b, OM_KONTRAKT + OM_K_CONSOLE_PTR, ptr) != 0)
@@ -1236,7 +1236,7 @@
 +	if (om_konsola(b, &ptr, &buf, &size, &wr) != 0)
 +		return false;
 +	dl = (u32)strlen(szukana);
-+	n = (wr > size) ? size : wr;	/* wr > size => licznik przebiegl ring */
++	n = (wr > size) ? size : wr;	/* wr > size => the counter wrapped the ring */
 +	if (!dl || n < dl || buf + n > b->bar2_len)
 +		return false;
 +	for (i = 0; i + dl <= n; i++) {
@@ -1252,28 +1252,28 @@
 +	return false;
 +}
 +
-+/* Doczekanie linii `pciedngl_open called` przed doorbellem (nota par.6 p. 5).
-+ * Bez niej doorbell moze zostac zatrzasniety i nieobsluzony -- fw czyta ring
-+ * WYLACZNIE w ISR. Po ~2 s idziemy dalej (pomiar: linia jest po 0,052 s). */
++/* Waiting for the `pciedngl_open called` line before the doorbell (notes par. 6, item 5).
++ * Without it the doorbell may be latched and unserviced -- the fw reads the ring
++ * ONLY in its ISR. After ~2 s we move on (measurement: the line appears after 0.052 s). */
 +static void om_czekaj_pciedngl_open(struct om_bridge *b)
 +{
 +	u32 i, cierpliwosc = OM_KONSOLA_CZEKAJ_MS / 10u;
 +
-+	om_odp(b, "doczekanie linii `%s` w konsoli fw (kontrakt+0x%04x -> P+0/4/8), max ~%u ms\n",
++	om_odp(b, "waiting for the `%s` line in the fw console (contract+0x%04x -> P+0/4/8), max ~%u ms\n",
 +	       OM_KONSOLA_LINIA, OM_K_CONSOLE_PTR, OM_KONSOLA_CZEKAJ_MS);
 +	for (i = 0; i < cierpliwosc; i++) {
 +		if (om_konsola_ma(b, OM_KONSOLA_LINIA)) {
-+			om_odp(b, "konsola fw: `%s` JEST (po ~%u ms) -- fw uzbrojony na doorbell\n",
++			om_odp(b, "fw console: `%s` IS THERE (after ~%u ms) -- fw armed for the doorbell\n",
 +			       OM_KONSOLA_LINIA, (i + 1) * 10u);
 +			return;
 +		}
 +		usleep_range(10000, 11000);
 +	}
-+	om_odp(b, "konsola fw: `%s` NIE pojawila sie w ~%u ms -- wysylam mimo to (doorbell moze zostac nieobsluzony; ISR fw przy pustym ringu drukuje tylko `pktlen: 0`)\n",
++	om_odp(b, "fw console: `%s` did NOT appear within ~%u ms -- sending anyway (the doorbell may go unserviced; with an empty ring the fw ISR only prints `pktlen: 0`)\n",
 +	       OM_KONSOLA_LINIA, OM_KONSOLA_CZEKAJ_MS);
 +}
 +
-+/* =========================================================== pierscienie DMA */
++/* =========================================================== DMA rings */
 +
 +static void om_op_ringinit(struct om_bridge *b, int argc, char **argv)
 +{
@@ -1283,21 +1283,21 @@
 +	} h[8] = {
 +		{ OM_RING_HDR_H2D + 0x0, OM_RING_DATA_H2D, "H2D data_off" },
 +		{ OM_RING_HDR_H2D + 0x4, OM_RING_ROZMIAR, "H2D size" },
-+		{ OM_RING_HDR_H2D + 0x8, 0, "H2D rd (pisze FW: zuzycie)" },
-+		{ OM_RING_HDR_H2D + 0xc, 0, "H2D wr (pisze HOST: publikacja)" },
++		{ OM_RING_HDR_H2D + 0x8, 0, "H2D rd (written by FW: consumption)" },
++		{ OM_RING_HDR_H2D + 0xc, 0, "H2D wr (written by HOST: publication)" },
 +		{ OM_RING_HDR_D2H + 0x0, OM_RING_DATA_D2H, "D2H data_off" },
 +		{ OM_RING_HDR_D2H + 0x4, OM_RING_ROZMIAR, "D2H size" },
-+		{ OM_RING_HDR_D2H + 0x8, 0, "D2H rd (pisze HOST)" },
-+		{ OM_RING_HDR_D2H + 0xc, 0, "D2H wr (pisze FW)" },
++		{ OM_RING_HDR_D2H + 0x8, 0, "D2H rd (written by HOST)" },
++		{ OM_RING_HDR_D2H + 0xc, 0, "D2H wr (written by FW)" },
 +	};
 +	u32 i;
 +
 +	if (!b->dma_va || !b->dma_ok) {
-+		om_blad(b, "ringinit: brak zweryfikowanego bufora DMA (adres 0x%llx) -- naglowki pierscieni nie maja gdzie powstac\n",
++		om_blad(b, "ringinit: no verified DMA buffer (address 0x%llx) -- the ring headers have nowhere to live\n",
 +			(unsigned long long)b->dma_fiz);
 +		return;
 +	}
-+	om_emrg(b, "ringinit: naglowki obu pierscieni olmsg w buforze DMA 0x%llx (RAM hosta, zero MMIO; rownowazne z bcm_olmsg_init @0x4f38) -- start\n",
++	om_emrg(b, "ringinit: headers of both olmsg rings in the DMA buffer 0x%llx (host RAM, zero MMIO; equivalent to bcm_olmsg_init @0x4f38) -- start\n",
 +		(unsigned long long)b->dma_fiz);
 +	for (i = 0; i < 8; i++) {
 +		om_buf_wr32(b, h[i].off, h[i].val);
@@ -1310,10 +1310,10 @@
 +	       om_buf_rd32(b, 0x18), om_buf_rd32(b, 0x1c));
 +}
 +
-+/* Zapis komunikatu olmsg do pierscienia H2D: naglowek {type,seq,len} po 4 B LE
-+ * pod `off`, potem `len` bajtow payloadu -- 1:1 z bcm4360_olmsg_write
-+ * (pcie.c:1570-1576) i z `olmsg_peek_len` @0x4d48 w fw (total = len + 12).
-+ * `seq` fw NIE waliduje (olmsg_readmsg @0x4e24) => 0, jak u Apple. */
++/* Writing an olmsg message to the H2D ring: header {type,seq,len}, 4 B LE each
++ * at `off`, then `len` bytes of payload -- 1:1 with bcm4360_olmsg_write
++ * (pcie.c:1570-1576) and with `olmsg_peek_len` @0x4d48 in the fw (total = len + 12).
++ * The fw does NOT validate `seq` (olmsg_readmsg @0x4e24) => 0, as at Apple. */
 +static void om_ring_msg(struct om_bridge *b, u32 off, u32 typ, u32 seq,
 +			u32 len, const u8 *payload)
 +{
@@ -1326,11 +1326,11 @@
 +		((u8 *)b->dma_va)[off + OM_OLMSG_HDR + i] = payload[i];
 +}
 +
-+/* Skan pierscienia D2H z NASZEGO bufora (RAM hosta, zero MMIO) + przesuniecie
-+ * rd na wr. Wolane z watku przerwania ORAZ tuz po doorbellu (R7 z notes/
-+ * dma-irq-adresy-audyt.md par. 4: RMW na 0x48 moze skasowac OBCE oczekujace
-+ * zgloszenie D2H -- bit 8 jest W1C -- wiec po wlasnym zapisie trzeba od razu
-+ * przejrzec pierscien, zeby tego zgloszenia nie zgubic). */
++/* Scan of the D2H ring from OUR buffer (host RAM, zero MMIO) + moving
++ * rd onto wr. Called from the interrupt thread AND right after the doorbell (R7 from the project notes
++ * on DMA/IRQ addresses, par. 4: an RMW on 0x48 can clear a FOREIGN pending
++ * D2H notification -- bit 8 is W1C -- so right after our own write we must
++ * scan the ring so that that notification is not lost). */
 +static void om_d2h_scan(struct om_bridge *b, const char *skad)
 +{
 +	u32 rd = om_buf_rd32(b, OM_RING_HDR_D2H + OM_RING_D2H_RD);
@@ -1347,7 +1347,7 @@
 +		u32 len = om_buf_rd32(b, OM_RING_DATA_D2H + off + 8);
 +
 +		if (off + OM_OLMSG_HDR + len > OM_RING_ROZMIAR) {
-+			om_blad(b, "d2h (%s): naglowek @+0x%04x niespojny (len %u) -- przerywam\n",
++			om_blad(b, "d2h (%s): header @+0x%04x incoherent (len %u) -- aborting\n",
 +				skad, OM_RING_DATA_D2H + off, len);
 +			break;
 +		}
@@ -1360,31 +1360,31 @@
 +	om_buf_wr32(b, OM_RING_HDR_D2H + OM_RING_D2H_RD, wr);
 +}
 +
-+/* Doorbell H2D: BAR0+0x48 |= 0x1 -- RMW jak Apple (`_wlc_ol_msg_send`
-+ * 0x76e3c-0x76e5a: read + orl $0x1 + zapis) i jak nasz modul. Rejestr lezy
-+ * w PCIE2 (0x18003048), NIE w D11 (notes/); bit 0 =>
-+ * fw widzi bit 8 swojego intstatus i wchodzi w `pciedngl_isr`. */
++/* H2D doorbell: BAR0+0x48 |= 0x1 -- RMW like Apple (`_wlc_ol_msg_send`
++ * 0x76e3c-0x76e5a: read + orl $0x1 + write) and like our module. The register lies
++ * in PCIE2 (0x18003048), NOT in D11 (project notes); bit 0 =>
++ * the fw sees bit 8 of its intstatus and enters `pciedngl_isr`. */
 +static void om_doorbell(struct om_bridge *b, const char *skad)
 +{
 +	u32 przed = 0, po = 0;
 +
 +	if (om_bp_read32(b, OM_PCIE2_BASE + OM_R_MAILBOXINT, &przed) != 0) {
-+		om_blad(b, "doorbell (%s): nie moge odczytac BAR0+0x%03x -- POMINIETY\n",
++		om_blad(b, "doorbell (%s): cannot read BAR0+0x%03x -- SKIPPED\n",
 +			skad, OM_R_MAILBOXINT);
 +		return;
 +	}
 +	om_emrg(b, "doorbell (%s): BAR0+0x%03x: 0x%08x |= 0x1 -- start\n",
 +		skad, OM_R_MAILBOXINT, przed);
 +	if (om_bp_write32(b, OM_PCIE2_BASE + OM_R_MAILBOXINT, przed | OM_DB_H2D) != 0) {
-+		om_blad(b, "doorbell (%s): zapis nie udal sie\n", skad);
++		om_blad(b, "doorbell (%s): the write failed\n", skad);
 +		return;
 +	}
 +	if (om_bp_read32(b, OM_PCIE2_BASE + OM_R_MAILBOXINT, &po) == 0)
 +		om_odp(b, "doorbell (%s): readback 0x%08x (bit0 %s, bit8 %s)\n", skad, po,
-+		       (po & OM_DB_H2D) ? "zatrzasniety (fw go jeszcze nie zdjal)" : "juz zdjety przez fw",
-+		       (po & OM_INT_D2H) ? "USTAWIONY -- fw ma zgloszenie D2H" : "czysty");
++		       (po & OM_DB_H2D) ? "latched (the fw has not taken it yet)" : "already taken by the fw",
++		       (po & OM_INT_D2H) ? "SET -- the fw has a D2H notification" : "clean");
 +	if (po & OM_INT_D2H)
-+		om_d2h_scan(b, "po doorbellu (R7)");
++		om_d2h_scan(b, "after the doorbell (R7)");
 +}
 +
 +/* =============================================================== send/sendtrio */
@@ -1396,20 +1396,20 @@
 +	int i;
 +
 +	if (argc < 4) {
-+		om_blad(b, "send: uzycie `send <typ_hex> <len_hex> <payload_hex|->`\n");
++		om_blad(b, "send: usage `send <type_hex> <len_hex> <payload_hex|->`\n");
 +		return;
 +	}
 +	if (!b->dma_va || !b->dma_ok) {
-+		om_blad(b, "send: brak zweryfikowanego bufora DMA (adres 0x%llx) -- nie ma gdzie zbudowac pierscienia H2D\n",
++		om_blad(b, "send: no verified DMA buffer (address 0x%llx) -- nowhere to build the H2D ring\n",
 +			(unsigned long long)b->dma_fiz);
 +		return;
 +	}
 +	if (kstrtouint(argv[1], 0, &typ) || kstrtouint(argv[2], 0, &len)) {
-+		om_blad(b, "send: typ i len musza byc liczbami (hex z 0x)\n");
++		om_blad(b, "send: type and len must be numbers (hex with 0x)\n");
 +		return;
 +	}
 +	if (len > sizeof(payload) || len + OM_OLMSG_HDR > OM_OLMSG_MAX_TOTAL) {
-+		om_blad(b, "send: len %u B przekracza limit fw (total = len + 12 <= 0x%x; wiekszy komunikat zawiesza ISR fw w petli)\n",
++		om_blad(b, "send: len of %u B exceeds the fw limit (total = len + 12 <= 0x%x; a larger message hangs the fw ISR in a loop)\n",
 +			len, OM_OLMSG_MAX_TOTAL);
 +		return;
 +	}
@@ -1417,7 +1417,7 @@
 +		const char *h = argv[3];
 +
 +		if (strlen(h) != (size_t)len * 2) {
-+			om_blad(b, "send: payload ma %zu znakow, a len = %u B (oczekuje %u znakow hex)\n",
++			om_blad(b, "send: payload has %zu chars but len = %u B (expected %u hex chars)\n",
 +				strlen(h), len, len * 2);
 +			return;
 +		}
@@ -1430,7 +1430,7 @@
 +				(h[i * 2 + 1] >= 'A' && h[i * 2 + 1] <= 'F') ? h[i * 2 + 1] - 'A' + 10 : 0xff;
 +
 +			if (hi == 0xff || lo == 0xff) {
-+				om_blad(b, "send: payload nie jest hexem (znak %d)\n", i * 2);
++				om_blad(b, "send: payload is not hex (char %d)\n", i * 2);
 +				return;
 +			}
 +			payload[i] = (u8)((hi << 4) | lo);
@@ -1439,19 +1439,19 @@
 +	total = OM_OLMSG_HDR + len;
 +	wr = om_buf_rd32(b, OM_RING_HDR_H2D + OM_RING_H2D_WR);
 +	if (wr + total > OM_RING_ROZMIAR) {
-+		om_blad(b, "send: pierscien H2D pelny (wr=%u + %u B > 0x%x) -- zawijania nie implementujemy; poczekaj, az fw zuzyje (rd), albo `ringinit`\n",
++		om_blad(b, "send: H2D ring full (wr=%u + %u B > 0x%x) -- we do not implement wrapping; wait for the fw to consume (rd), or `ringinit`\n",
 +			wr, total, OM_RING_ROZMIAR);
 +		return;
 +	}
 +	off = OM_RING_DATA_H2D + wr;
 +	om_czekaj_pciedngl_open(b);
 +	om_ring_msg(b, off, typ, 0, len, payload);
-+	/* bariera przed publikacja indeksu -- odpowiednik __sync_synchronize()
-+	 * z minihost.c:1765-1767; bez niej fw moglby zobaczyc `wr` przed danymi */
++	/* barrier before publishing the index -- equivalent of __sync_synchronize()
++	 * from the reference tool l. 1765-1767; without it the fw could see `wr` before the data */
 +	wmb();
 +	om_buf_wr32(b, OM_RING_HDR_H2D + OM_RING_H2D_WR, wr + total);
 +	wmb();
-+	om_odp(b, "send: typ 0x%08x len %u -> buf+0x%04x, publikacja wr = %u (bylo %u)\n",
++	om_odp(b, "send: type 0x%08x len %u -> buf+0x%04x, published wr = %u (was %u)\n",
 +	       typ, len, off, wr + total, wr);
 +	om_doorbell(b, "po send");
 +}
@@ -1468,19 +1468,19 @@
 +	u32 wr_przed;
 +
 +	if (!b->dma_va || !b->dma_ok) {
-+		om_blad(b, "sendtrio: brak zweryfikowanego bufora DMA (adres 0x%llx) -- nie ma gdzie zbudowac pierscienia H2D\n",
++		om_blad(b, "sendtrio: no verified DMA buffer (address 0x%llx) -- nowhere to build the H2D ring\n",
 +			(unsigned long long)b->dma_fiz);
 +		return;
 +	}
-+	/* uptime hosta w ms -- Apple bierze go bezposrednio przed wysylka
-+	 * (`_osl_sysuptime()` @0x759c9); minihost: CLOCK_MONOTONIC
-+	 * (minihost.c:894-905). ktime_get() = ten sam zegar. Payload liczymy
-+	 * PO bramkach (doczekanie konsoli moze zajac sekundy). */
++	/* host uptime in ms -- Apple takes it right before the send
++	 * (`_osl_sysuptime()` @0x759c9); the reference tool: CLOCK_MONOTONIC
++	 * (reference tool l. 894-905). ktime_get() = the same clock. We compute the payload
++	 * AFTER the gates (waiting for the console can take seconds). */
 +	wr_przed = om_buf_rd32(b, OM_RING_HDR_H2D + OM_RING_H2D_WR);
-+	om_emrg(b, "sendtrio: 3 komunikaty pod buf+0x%04x/0x%04x/0x%04x, publikacja wr = %u, JEDEN doorbell -- start\n",
++	om_emrg(b, "sendtrio: 3 messages at buf+0x%04x/0x%04x/0x%04x, published wr = %u, ONE doorbell -- start\n",
 +		o1, o2, o3, OM_TRIO_WR);
 +	if (wr_przed)
-+		om_blad(b, "sendtrio: UWAGA pierscien H2D nie byl pusty (wr = %u) -- trio Apple zaklada pusty pierscien i NADPISUJE jego poczatek; publikuje %u\n",
++		om_blad(b, "sendtrio: NOTE the H2D ring was not empty (wr = %u) -- the Apple trio assumes an empty ring and OVERWRITES its beginning; it publishes %u\n",
 +			wr_przed, OM_TRIO_WR);
 +	om_czekaj_pciedngl_open(b);
 +	uptime = (u32)ktime_to_ms(ktime_get());
@@ -1488,7 +1488,7 @@
 +		p1[i] = (u8)(uptime >> (8 * i));
 +	for (i = 0; i < 4; i++)
 +		p2[i] = (u8)(OM_TRIO_EWT_VAL >> (8 * i));
-+	p3[0] = 0;	/* ltr_enabled  = 0 -- nasz host nie ma LTR (nota par.5.5) */
++	p3[0] = 0;	/* ltr_enabled  = 0 -- our host has no LTR (notes par. 5.5) */
 +	p3[1] = 0;	/* obff_enabled = 0 */
 +	for (i = 0; i < 5; i++)
 +		for (k = 0; k < 4; k++)
@@ -1497,21 +1497,21 @@
 +	om_ring_msg(b, o1, OM_TRIO_TYP_TS, 0, OM_TRIO_TS_LEN, p1);
 +	om_ring_msg(b, o2, OM_TRIO_TYP_EWT, 0, OM_TRIO_EWT_LEN, p2);
 +	om_ring_msg(b, o3, OM_TRIO_TYP_LTR, 0, OM_TRIO_LTR_LEN, p3);
-+	om_odp(b, "sendtrio: #1 0x%08x len %u payload u32 = %u (0x%08x) = uptime hosta w ms\n",
++	om_odp(b, "sendtrio: #1 0x%08x len %u payload u32 = %u (0x%08x) = host uptime in ms\n",
 +	       OM_TRIO_TYP_TS, OM_TRIO_TS_LEN, uptime, uptime);
 +	om_odp(b, "sendtrio: #2 0x%08x len %u payload u32 = %u (iovar wowl_excess_wake_timeout)\n",
 +	       OM_TRIO_TYP_EWT, OM_TRIO_EWT_LEN, OM_TRIO_EWT_VAL);
-+	om_odp(b, "sendtrio: #3 0x%08x len %u payload 22 B: [0]=0 [1]=0 potem u32 %u %u %u %u %u\n",
++	om_odp(b, "sendtrio: #3 0x%08x len %u payload 22 B: [0]=0 [1]=0 then u32 %u %u %u %u %u\n",
 +	       OM_TRIO_TYP_LTR, OM_TRIO_LTR_LEN, ltr[0], ltr[1], ltr[2], ltr[3], ltr[4]);
 +	wmb();
 +	om_buf_wr32(b, OM_RING_HDR_H2D + OM_RING_H2D_WR, OM_TRIO_WR);
 +	wmb();
-+	om_odp(b, "sendtrio: publikacja wr = %u (readback %u) -- 16+16+34, NIE 50 (przy 50 fw czytalby uciety trzeci komunikat)\n",
++	om_odp(b, "sendtrio: published wr = %u (readback %u) -- 16+16+34, NOT 50 (at 50 the fw would read a truncated third message)\n",
 +	       OM_TRIO_WR, om_buf_rd32(b, OM_RING_HDR_H2D + OM_RING_H2D_WR));
-+	om_doorbell(b, "po trio");
++	om_doorbell(b, "after trio");
 +}
 +
-+/* ================================================================= przerwania */
++/* ================================================================= interrupts */
 +
 +static irqreturn_t om_isr_szybki(int irq, void *arg)
 +{
@@ -1522,12 +1522,12 @@
 +	return IRQ_WAKE_THREAD;
 +}
 +
-+/* Watek przerwania: W1C bitow, ktore przyszly w MAILBOXINT, po bicie 8 (D2H)
-+ * skan pierscienia D2H, na koniec re-arm maski RMW |= 0x100 (wzorzec wl.ko
++/* Interrupt thread: W1C of the bits that arrived in MAILBOXINT, after bit 8 (D2H)
++ * a D2H ring scan, at the end a mask re-arm RMW |= 0x100 (pattern wl.ko
 + * wlc_ol_enable_intrs, pcie.c brcmf_pcie_intr_enable).
-+ * UWAGA: ten watek NIE bierze om_lock (moglby zablokowac komende na sekundy)
-+ * i dotyka WYLACZNIE bufora DMA (RAM hosta, wlasnosc modulu) + rejestrow 0x48
-+ * i 0x4C. Bufor jest zwalniany dopiero po free_irq() w om_remove(). */
++ * NOTE: this thread does NOT take om_lock (it could block a command for seconds)
++ * and touches ONLY the DMA buffer (host RAM, module property) + the 0x48
++ * and 0x4C registers. The buffer is freed only after free_irq() in om_remove(). */
 +static irqreturn_t om_isr_watek(int irq, void *arg)
 +{
 +	struct om_bridge *b = arg;
@@ -1549,25 +1549,25 @@
 +	int err;
 +
 +	if (argc < 2 || (strcmp(argv[1], "on") && strcmp(argv[1], "off"))) {
-+		om_blad(b, "irq: uzycie `irq on|off`\n");
++		om_blad(b, "irq: usage `irq on|off`\n");
 +		return;
 +	}
 +	if (!strcmp(argv[1], "on")) {
 +		if (b->irq_on) {
-+			om_odp(b, "irq: juz wlaczone (irq=%u)\n", b->pdev->irq);
++			om_odp(b, "irq: already on (irq=%u)\n", b->pdev->irq);
 +			return;
 +		}
 +		if (!b->pdev->irq) {
-+			om_blad(b, "irq: pdev->irq = 0 -- karta nie ma linii przerwania\n");
++			om_blad(b, "irq: pdev->irq = 0 -- the card has no interrupt line\n");
 +			return;
 +		}
-+		/* MSI jak w module: pci_enable_msi (wynik logujemy, nie jest
-+		 * krytyczny -- bez MSI zostaje INTx), a przy nieudanym
-+		 * request_threaded_irq wracamy z MSI (pcie.c request_irq). */
++		/* MSI like in the module: pci_enable_msi (we log the result, it is not
++		 * critical -- without MSI INTx remains), and on a failed
++		 * request_threaded_irq we back off from MSI (pcie.c request_irq). */
 +		err = pci_enable_msi(b->pdev);
 +		b->msi_on = (err == 0);
 +		om_odp(b, "irq: pci_enable_msi = %d (%s)\n", err,
-+		       b->msi_on ? "MSI wlaczone" : "MSI niedostepne -- zostaje INTx");
++		       b->msi_on ? "MSI enabled" : "MSI unavailable -- INTx remains");
 +		err = request_threaded_irq(b->pdev->irq, om_isr_szybki, om_isr_watek,
 +					   IRQF_SHARED, OM_NAZWA, b);
 +		if (err) {
@@ -1579,11 +1579,11 @@
 +			return;
 +		}
 +		b->irq_on = true;
-+		/* odmaskowanie jak wl.ko: RMW BAR0+0x4C |= 0x100 (pcie.c:4496-4503).
-+		 * NIGDY zapisu absolutnego 0 w up-path (notes/ par.2). */
++		/* unmasking like wl.ko: RMW BAR0+0x4C |= 0x100 (pcie.c:4496-4503).
++		 * NEVER an absolute 0 write in the up-path (project notes par. 2). */
 +		iowrite32(ioread32(b->bar0 + OM_R_MAILBOXMASK) | OM_INT_MASK,
 +			  b->bar0 + OM_R_MAILBOXMASK);
-+		om_odp(b, "irq: ON (irq=%u), BAR0+0x%03x |= 0x%03x (rejestru 0x%03x/intmask NIE ruszamy -- fw sam robi intmask |= 0x100 w pciedngl_open)\n",
++		om_odp(b, "irq: ON (irq=%u), BAR0+0x%03x |= 0x%03x (we do NOT touch register 0x%03x/intmask -- the fw does intmask |= 0x100 itself in pciedngl_open)\n",
 +		       b->pdev->irq, OM_R_MAILBOXMASK, OM_INT_MASK, OM_R_INTMASK);
 +	} else {
 +		if (b->irq_on) {
@@ -1594,25 +1594,25 @@
 +			pci_disable_msi(b->pdev);
 +			b->msi_on = false;
 +		}
-+		/* RMW -- nie zerujemy calego rejestru (inne bity maski moga byc fw) */
++		/* RMW -- we do not zero the whole register (other mask bits may be the fw's) */
 +		iowrite32(ioread32(b->bar0 + OM_R_MAILBOXMASK) & ~OM_INT_MASK,
 +			  b->bar0 + OM_R_MAILBOXMASK);
 +		om_odp(b, "irq: OFF (BAR0+0x%03x &= ~0x%03x)\n", OM_R_MAILBOXMASK, OM_INT_MASK);
 +	}
 +	if (om_bp_read32(b, OM_PCIE2_BASE + OM_R_INTSTATUS, &is) == 0 &&
 +	    om_bp_read32(b, OM_PCIE2_BASE + OM_R_INTMASK, &im) == 0)
-+		om_odp(b, "irq: intstatus = 0x%08x, intmask = 0x%08x (intmask 0x100 = fw juz uzbrojony: pciedngl_open)\n",
++		om_odp(b, "irq: intstatus = 0x%08x, intmask = 0x%08x (intmask 0x100 = the fw is already armed: pciedngl_open)\n",
 +		       is, im);
 +}
 +
-+/* ================================================================== odczyty */
++/* ================================================================== reads */
 +
 +static void om_cmd_read_contract(struct om_bridge *b)
 +{
 +	u32 i;
 +	u32 hb = 0, fl = 0, rec = 0, me = 0;
 +
-+	om_odp(b, "read contract: kontrakt @0x%05x (TCM_end - 0x5F80)\n", OM_KONTRAKT);
++	om_odp(b, "read contract: contract @0x%05x (TCM_end - 0x5F80)\n", OM_KONTRAKT);
 +	for (i = 0; i < 0x40; i += 16) {
 +		u32 v0 = 0, v1 = 0, v2 = 0, v3 = 0;
 +
@@ -1637,13 +1637,13 @@
 +	u32 w_linii = 0;
 +
 +	if (om_konsola(b, &ptr, &buf, &size, &wr) != 0) {
-+		om_odp(b, "read console: brak struktury konsoli (kontrakt+0x10 niepublikowane albo niespojne) -- fw jej nie zrobil\n");
++		om_odp(b, "read console: no console struct (contract+0x10 unpublished or incoherent) -- the fw has not made it\n");
 +		return;
 +	}
 +	n = (wr > size) ? size : wr;
 +	start = (max && n > max) ? n - max : 0;
 +	om_odp(b, "read console: ptr=0x%05x buf=0x%05x size=%u wr_idx=%u; %s [%u..%u)\n",
-+	       ptr, buf, size, wr, start ? "OGON" : "CALOSC", start, n);
++	       ptr, buf, size, wr, start ? "TAIL" : "ALL", start, n);
 +	memset(txt, 0, sizeof(txt));
 +	for (i = start; i < n && w_linii < OM_KONSOLA_LINII; i++) {
 +		u8 c = ioread8(b->bar2 + buf + i);
@@ -1658,18 +1658,18 @@
 +		}
 +	}
 +	if (n == 0)
-+		om_odp(b, "read console: konsola pusta (wr_idx = 0)\n");
++		om_odp(b, "read console: console empty (wr_idx = 0)\n");
 +	if (w_linii >= OM_KONSOLA_LINII)
-+		om_odp(b, "read console: ... uciete na %u liniach (limit odpowiedzi; reszta tylko w dmesg)\n", OM_KONSOLA_LINII);
++		om_odp(b, "read console: ... truncated at %u lines (response limit; the rest only in dmesg)\n", OM_KONSOLA_LINII);
 +}
 +
 +static void om_cmd_read_rings(struct om_bridge *b)
 +{
 +	if (!b->dma_va) {
-+		om_blad(b, "read rings: brak bufora DMA\n");
++		om_blad(b, "read rings: no DMA buffer\n");
 +		return;
 +	}
-+	om_odp(b, "read rings (bufor DMA 0x%llx, RAM hosta -- zero MMIO):\n",
++	om_odp(b, "read rings (DMA buffer 0x%llx, host RAM -- zero MMIO):\n",
 +	       (unsigned long long)b->dma_fiz);
 +	om_odp(b, "  H2D: data_off=0x%04x size=0x%04x rd=%u wr=%u\n",
 +	       om_buf_rd32(b, OM_RING_HDR_H2D + 0x0), om_buf_rd32(b, OM_RING_HDR_H2D + 0x4),
@@ -1679,20 +1679,20 @@
 +	       om_buf_rd32(b, OM_RING_HDR_D2H + 0x0), om_buf_rd32(b, OM_RING_HDR_D2H + 0x4),
 +	       om_buf_rd32(b, OM_RING_HDR_D2H + OM_RING_D2H_RD),
 +	       om_buf_rd32(b, OM_RING_HDR_D2H + OM_RING_D2H_WR));
-+	/* Werdykt LICZONY z odczytanych wartosci. Poprzednia wersja drukowala
-+	 * zdanie na sztywno ("rd H2D == 66 i D2H wr == 0 => fw SZKONSUMOWAL trio"),
-+	 * wiec przy rd=0 i wr=288740 (bieg 11.09) klamala w kierunku "wszystko OK",
-+	 * a lezala w logs/ jako dowod. */
++	/* Verdict COMPUTED from the read values. The previous version printed
++	 * a hard-coded sentence ("rd H2D == 66 and D2H wr == 0 => the fw CONSUMED the trio"),
++	 * so with rd=0 and wr=288740 (the 11.09 run) it lied in the direction of "everything OK",
++	 * and lay in the fire logs as evidence. */
 +	{
 +		u32 rd_h2d = om_buf_rd32(b, OM_RING_HDR_H2D + OM_RING_H2D_RD);
 +		u32 wr_d2h = om_buf_rd32(b, OM_RING_HDR_D2H + OM_RING_D2H_WR);
 +
-+		om_odp(b, "  werdykt: H2D rd=%u (%s); D2H wr=%u (%s)\n", rd_h2d,
-+		       (rd_h2d == OM_TRIO_WR) ? "== 66: fw zuzyl cale trio" :
-+		       (rd_h2d ? "!= 66: zuzycie inne niz zakladamy (66)" :
-+				 "== 0: fw NIE opublikowal zuzycia -- brak dowodu na konsumpcje"),
-+		       wr_d2h, wr_d2h ? "!= 0: fw COS opublikowal -- patrz `read d2h`" :
-+					"== 0: D2H pusty");
++		om_odp(b, "  verdict: H2D rd=%u (%s); D2H wr=%u (%s)\n", rd_h2d,
++		       (rd_h2d == OM_TRIO_WR) ? "== 66: the fw consumed the whole trio" :
++		       (rd_h2d ? "!= 66: consumption other than assumed (66)" :
++				 "== 0: the fw did NOT publish consumption -- no evidence of consumption"),
++		       wr_d2h, wr_d2h ? "!= 0: the fw published SOMETHING -- see `read d2h`" :
++					"== 0: D2H empty");
 +	}
 +}
 +
@@ -1702,9 +1702,9 @@
 +
 +	(void)om_tcm_read32(b, OM_KONTRAKT + OM_K_HEARTBEAT, &hb);
 +	(void)om_tcm_read32(b, OM_KONTRAKT + OM_K_TRAP_FLAG, &fl);
-+	om_odp(b, "read heartbeat: kontrakt+0x%04x = 0x%08x (bramka gotowosci fw)\n",
++	om_odp(b, "read heartbeat: contract+0x%04x = 0x%08x (fw readiness gate)\n",
 +	       OM_K_HEARTBEAT, hb);
-+	om_odp(b, "read heartbeat: kontrakt+0x%04x trap_flag = 0x%08x\n", OM_K_TRAP_FLAG, fl);
++	om_odp(b, "read heartbeat: contract+0x%04x trap_flag = 0x%08x\n", OM_K_TRAP_FLAG, fl);
 +}
 +
 +static void om_cmd_read_trap(struct om_bridge *b)
@@ -1713,9 +1713,9 @@
 +
 +	(void)om_tcm_read32(b, OM_KONTRAKT + OM_K_TRAP_FLAG, &flag);
 +	om_odp(b, "read trap: trap_flag = 0x%08x %s\n", flag,
-+	       flag == OM_TRAP_FLAG_VAL ? "<= FW W TRAPIE (0xDEADBEEF)" :
-+	       (flag ? "<= niezerowe (dowod, nie tylko 0xDEADBEEF)" : ""));
-+	om_odp(b, "read trap: rekord %u B @kontrakt+0x%04x, po 8 dwordow w linii\n",
++	       flag == OM_TRAP_FLAG_VAL ? "<= FW IN TRAP (0xDEADBEEF)" :
++	       (flag ? "<= nonzero (evidence, not just 0xDEADBEEF)" : ""));
++	om_odp(b, "read trap: record of %u B @contract+0x%04x, 8 dwords per line\n",
 +	       OM_K_TRAP_REC_BAJTY, OM_K_TRAP_REC);
 +	for (i = 0; i < OM_K_TRAP_REC_BAJTY; i += 32) {
 +		u32 v[8];
@@ -1728,21 +1728,21 @@
 +	}
 +}
 +
-+/* Odczyt TCM (BAR2 = RAM fw). To pamiec, nie rejestry -- nie ma tu zadnej
-+ * sciezki do D11 (strona 0x18001000 zyje w backplane, nie w BAR2). */
++/* TCM read (BAR2 = fw RAM). That is memory, not registers -- there is no
++ * D11 path here (the page 0x18001000 lives in the backplane, not in BAR2). */
 +static void om_cmd_read_tcm(struct om_bridge *b, u32 adr, u32 len)
 +{
 +	u32 off;
 +
 +	if (!len || len > 256) {
-+		om_blad(b, "read tcm: dlugosc 1..256 B (podano %u)\n", len);
++		om_blad(b, "read tcm: length 1..256 B (given %u)\n", len);
 +		return;
 +	}
 +	if (adr >= OM_RAMSIZE || adr + len > OM_RAMSIZE) {
-+		om_blad(b, "read tcm: zakres 0x%05x+%u poza ramsize 0x%05x\n", adr, len, OM_RAMSIZE);
++		om_blad(b, "read tcm: range 0x%05x+%u outside ramsize 0x%05x\n", adr, len, OM_RAMSIZE);
 +		return;
 +	}
-+	om_odp(b, "read tcm: TCM[0x%05x..0x%05x) (BAR2 = RAM fw, zero MMIO rejestrow)\n",
++	om_odp(b, "read tcm: TCM[0x%05x..0x%05x) (BAR2 = fw RAM, zero register MMIO)\n",
 +	       adr, adr + len);
 +	for (off = adr; off < adr + len; off += 16) {
 +		u32 v0 = 0, v1 = 0, v2 = 0, v3 = 0;
@@ -1763,7 +1763,7 @@
 +	u32 v1 = 0, v2 = 0;
 +
 +	if (argc < 2) {
-+		om_blad(b, "read: uzycie `read contract|console|rings|heartbeat|trap|tcm <adr_hex> <len_hex>`\n");
++		om_blad(b, "read: usage `read contract|console|rings|heartbeat|trap|tcm <adr_hex> <len_hex>`\n");
 +		return;
 +	}
 +	if (!strcmp(argv[1], "contract")) {
@@ -1781,34 +1781,34 @@
 +		om_cmd_read_trap(b);
 +	} else if (!strcmp(argv[1], "tcm")) {
 +		if (argc < 4 || kstrtouint(argv[2], 0, &v1) || kstrtouint(argv[3], 0, &v2)) {
-+			om_blad(b, "read tcm: uzycie `read tcm <adr_hex> <len_hex>` (len 1..256)\n");
++			om_blad(b, "read tcm: usage `read tcm <adr_hex> <len_hex>` (len 1..256)\n");
 +			return;
 +		}
 +		om_cmd_read_tcm(b, v1, v2);
 +	} else {
-+		om_blad(b, "read: nieznany podkomendant `%s` (contract|console|rings|heartbeat|trap|tcm)\n",
++		om_blad(b, "read: unknown subcommand `%s` (contract|console|rings|heartbeat|trap|tcm)\n",
 +			argv[1]);
 +	}
 +}
 +
-+/* Zrzut zawartosci pierscienia D2H (RAM hosta, ZERO MMIO) -- komenda
-+ * diagnostyczna: czyta to samo, co om_d2h_scan, ale NIE przesuwa rd, wiec
-+ * dane nie przepadaja przy powtorzeniu komendy. */
++/* Dump of the D2H ring contents (host RAM, ZERO MMIO) -- a diagnostic
++ * command: it reads the same as om_d2h_scan but does NOT move rd, so
++ * the data is not lost when the command is repeated. */
 +static void om_op_d2h(struct om_bridge *b, int argc, char **argv)
 +{
 +	u32 rd, wr, n, off;
 +	u32 wiadomosci = 0;
 +
 +	if (!b->dma_va) {
-+		om_blad(b, "d2h: brak bufora DMA\n");
++		om_blad(b, "d2h: no DMA buffer\n");
 +		return;
 +	}
 +	rd = om_buf_rd32(b, OM_RING_HDR_D2H + OM_RING_D2H_RD);
 +	wr = om_buf_rd32(b, OM_RING_HDR_D2H + OM_RING_D2H_WR);
-+	om_odp(b, "d2h: pierscien D2H rd=%u wr=%u (odczyt RAM hosta, zero MMIO; rd NIE przesuwam)\n",
++	om_odp(b, "d2h: D2H ring rd=%u wr=%u (host RAM read, zero MMIO; I do NOT move rd)\n",
 +	       rd, wr);
 +	if (!wr || wr > OM_RING_ROZMIAR) {
-+		om_odp(b, "d2h: pusty -- fw nic nie zapisal (kanal H2D->fw jest jednokierunkowy; jedyny znany D2H to TRAP_IND)\n");
++		om_odp(b, "d2h: empty -- the fw wrote nothing (the H2D->fw channel is one-way; the only known D2H message is TRAP_IND)\n");
 +		return;
 +	}
 +	n = (wr >= rd) ? (wr - rd) : (OM_RING_ROZMIAR - rd + wr);
@@ -1818,7 +1818,7 @@
 +		u32 len = om_buf_rd32(b, OM_RING_DATA_D2H + off + 8);
 +
 +		if (off + OM_OLMSG_HDR + len > OM_RING_ROZMIAR) {
-+			om_blad(b, "d2h: naglowek @+0x%04x niespojny (len %u) -- przerywam\n",
++			om_blad(b, "d2h: header @+0x%04x incoherent (len %u) -- aborting\n",
 +				OM_RING_DATA_D2H + off, len);
 +			break;
 +		}
@@ -1838,7 +1838,7 @@
 +		wiadomosci++;
 +	}
 +	if (!wiadomosci)
-+		om_odp(b, "d2h: pierscien deklaruje wr=%u, ale zadnego naglowka nie udalo sie rozpoznac\n", wr);
++		om_odp(b, "d2h: the ring declares wr=%u but no header could be recognized\n", wr);
 +}
 +
 +/* ==================================================================== status */
@@ -1851,29 +1851,29 @@
 +	u32 ioctl_arm = 0, win = 0;
 +	u16 cmd = 0;
 +
-+	om_odp(b, "status: karta %04x:%04x (PCI rev %u) @ %s\n", b->pdev->vendor,
++	om_odp(b, "status: card %04x:%04x (PCI rev %u) @ %s\n", b->pdev->vendor,
 +	       b->pdev->device, b->pdev->revision, pci_name(b->pdev));
 +	if (om_bp_read32(b, OM_CC_BASE, &cc) == 0)
-+		om_odp(b, "status: ChipCommon @0x%08x = 0x%08x => chipid 0x%04x chiprev %u (oczekiwane 0x%04x / %u)\n",
++		om_odp(b, "status: ChipCommon @0x%08x = 0x%08x => chipid 0x%04x chiprev %u (expected 0x%04x / %u)\n",
 +		       OM_CC_BASE, cc, cc & 0xffffu, (cc & 0x000f0000u) >> 16,
 +		       OM_CHIPID_4360, OM_CHIPREV_4360);
 +	else
-+		om_blad(b, "status: nie moge odczytac ChipCommon @0x%08x\n", OM_CC_BASE);
-+	om_odp(b, "status: rdzenie (logs/test.345.journalctl.txt:14-19): CC 0x%08x/0x%08x D11 0x%08x (strona ZAKAZANA) ARM 0x%08x/0x%08x PCIE2 0x%08x/0x%08x SOCRAM 0x%08x/0x%08x\n",
++		om_blad(b, "status: cannot read ChipCommon @0x%08x\n", OM_CC_BASE);
++	om_odp(b, "status: cores (test.345 journalctl fire log:14-19): CC 0x%08x/0x%08x D11 0x%08x (FORBIDDEN page) ARM 0x%08x/0x%08x PCIE2 0x%08x/0x%08x SOCRAM 0x%08x/0x%08x\n",
 +	       OM_CC_BASE, OM_CC_WRAP, OM_D11_BASE, OM_ARM_BASE, OM_ARM_WRAP,
 +	       OM_PCIE2_BASE, OM_PCIE2_WRAP, OM_SOCRAM_BASE, OM_SOCRAM_WRAP);
 +	pci_read_config_dword(b->pdev, OM_BAR0_WINDOW, &win);
 +	pci_read_config_word(b->pdev, PCI_COMMAND, &cmd);
-+	om_odp(b, "status: BAR0 0x%llx (%llu B) BAR2 0x%llx (%llu B); okno config 0x80 = 0x%08x (po operacji wraca na PCIE2 0x%08x)\n",
++	om_odp(b, "status: BAR0 0x%llx (%llu B) BAR2 0x%llx (%llu B); config window 0x80 = 0x%08x (it returns to PCIE2 0x%08x after the operation)\n",
 +	       (unsigned long long)pci_resource_start(b->pdev, 0),
 +	       (unsigned long long)pci_resource_len(b->pdev, 0),
 +	       (unsigned long long)pci_resource_start(b->pdev, 2),
 +	       (unsigned long long)b->bar2_len, win, OM_PCIE2_BASE);
 +	om_odp(b, "status: COMMAND (config offset 0x04) = 0x%04x (mem b1 = %u, bus-master b2 = %u)\n",
 +	       cmd, (cmd >> 1) & 1u, (cmd >> 2) & 1u);
-+	om_odp(b, "status: DMA: va=%p fiz=0x%llx rozmiar=%u B; bramka fw (<4 GiB i okno 64 MiB) = %s\n",
++	om_odp(b, "status: DMA: va=%p phys=0x%llx size=%u B; the fw gate (<4 GiB and the 64 MiB window) = %s\n",
 +	       b->dma_va, (unsigned long long)b->dma_fiz, OM_DMA_ROZMIAR,
-+	       b->dma_ok ? "PRZECHODZI" : "ODRZUCONY -- pola msgbufaddr NIE publikowane");
++	       b->dma_ok ? "PASSES" : "REJECTED -- msgbufaddr fields NOT published");
 +	if (b->dma_va)
 +		om_odp(b, "status: pierscienie: H2D rd=%u wr=%u; D2H rd=%u wr=%u\n",
 +		       om_buf_rd32(b, OM_RING_HDR_H2D + OM_RING_H2D_RD),
@@ -1881,32 +1881,32 @@
 +		       om_buf_rd32(b, OM_RING_HDR_D2H + OM_RING_D2H_RD),
 +		       om_buf_rd32(b, OM_RING_HDR_D2H + OM_RING_D2H_WR));
 +	if (om_bp_read32(b, OM_ARM_WRAP + OM_BCMA_IOCTL, &ioctl_arm) == 0)
-+		om_odp(b, "status: ARM wrap IOCTL = 0x%08x (CPUHALT b5 = %u) => %s (flaga modulu: %s)\n",
++		om_odp(b, "status: ARM wrap IOCTL = 0x%08x (CPUHALT b5 = %u) => %s (module flag: %s)\n",
 +		       ioctl_arm, (ioctl_arm >> 5) & 1u,
-+		       (ioctl_arm & OM_ARMCR4_IOCTL_CPUHALT) ? "ARM w halt" : "ARM wypuszczony",
-+		       b->arm_wypuszczony ? "release poszedl" : "release NIE poszedl");
++		       (ioctl_arm & OM_ARMCR4_IOCTL_CPUHALT) ? "ARM in halt" : "ARM released",
++		       b->arm_wypuszczony ? "release went" : "release did NOT go");
 +	(void)om_tcm_read32(b, OM_KONTRAKT + OM_K_HEARTBEAT, &hb);
 +	(void)om_tcm_read32(b, OM_KONTRAKT + OM_K_TRAP_FLAG, &fl);
 +	if (om_konsola(b, &ptr, &buf, &size, &wr) == 0)
 +		console_wr = wr;
 +	om_odp(b, "status: heartbeat(0x%04x) = 0x%08x, trap_flag(0x%04x) = 0x%08x%s\n",
 +	       OM_K_HEARTBEAT, hb, OM_K_TRAP_FLAG, fl,
-+	       fl == OM_TRAP_FLAG_VAL ? " <= FW W TRAPIE" : "");
++	       fl == OM_TRAP_FLAG_VAL ? " <= FW IN TRAP" : "");
 +	om_odp(b, "status: konsola fw: ptr=0x%08x buf=0x%08x size=%u wr_idx=%u\n",
 +	       ptr, buf, size, console_wr);
-+	om_odp(b, "status: rstvec=%s0x%08x; d11_ok=%u (token `d11-ok` nadal wymagany w komendzie); irq=%s; msi=%s\n",
-+	       b->rstvec_znamy ? "" : "(nieznany -- bez loadfw) ", b->rstvec, d11_ok ? 1 : 0,
++	om_odp(b, "status: rstvec=%s0x%08x; d11_ok=%u (the `d11-ok` token still required in the command); irq=%s; msi=%s\n",
++	       b->rstvec_znamy ? "" : "(unknown -- no loadfw) ", b->rstvec, d11_ok ? 1 : 0,
 +	       b->irq_on ? "ON" : "OFF", b->msi_on ? "ON" : "OFF");
 +	om_odp(b, "status: hardening PCIe (ASPM off + CTO): %s\n",
-+	       !b->hardening_bylo ? "NIE nakladany w tej sesji -- `reset` naklada go PO SBR (odpowiednik setpci przed kazdym fire)" :
-+	       (b->hardening_ok ? "ZALOZONY, readback zgodny" :
-+		"NIEZGODNY -- NIE kontynuuj bez rebootu (sciezka awaryjna: REBOOT + setpci z czystego boota)"));
++	       !b->hardening_bylo ? "NOT applied in this session -- `reset` applies it AFTER SBR (the equivalent of setpci before every fire)" :
++	       (b->hardening_ok ? "APPLIED, readback consistent" :
++		"INCONSISTENT -- do NOT continue without a reboot (fallback path: REBOOT + setpci from a clean boot)"));
 +}
 +
 +/* ================================================= hardening PCIe (config) */
 +
-+/* Jeden zapis 16-bitowy w config space z readbackiem; zwraca 0 gdy wartosc
-+ * sie utrzymala, -EIO gdy nie. `kto` sluzy tylko do logu. */
++/* One 16-bit write in config space with a readback; returns 0 when the value
++ * held, -EIO when not. `kto` serves only for the log. */
 +static int om_hard_zapis(struct om_bridge *b, const char *kto, struct pci_dev *dev,
 +			 u16 off, u16 val, const char *nazwa)
 +{
@@ -1917,33 +1917,33 @@
 +	pci_read_config_word(dev, off, &po);
 +	om_odp(b, "hardening: %s %s 0x%02x (%s): 0x%04x -> 0x%04x (exp 0x%04x) %s\n",
 +	       kto, pci_name(dev), off, nazwa, przed, po, val,
-+	       po == val ? "OK" : "NIE ZGADZA SIE");
++	       po == val ? "OK" : "DOES NOT MATCH");
 +	if (po != val) {
-+		om_blad(b, "hardening: %s %s 0x%02x = 0x%04x, a oczekiwane 0x%04x\n",
++		om_blad(b, "hardening: %s %s 0x%02x = 0x%04x, but 0x%04x expected\n",
 +			kto, pci_name(dev), off, po, val);
 +		return -EIO;
 +	}
 +	return 0;
 +}
 +
-+/* Hardening 1:1 ze scripts/minihost.sh:167-180: LnkCtl (ASPM off) + DevCtl2
-+ * (CTO) na mostku i na endpoincie, potem READBACK WSZYSTKICH CZTERECH.
-+ * Mostek bierzemy z pdev->bus->self (BDF-a NIE zaszywamy); gdy go nie ma,
-+ * logujemy i POMIJAMY zapisy mostka -- endpoint robimy dalej, bo tam nie ma
-+ * czego zgadywac (mamy `pdev`). Zwraca 0 (readback zgodny) albo -EIO. */
++/* Hardening 1:1 from the reference bridge script l. 167-180: LnkCtl (ASPM off) + DevCtl2
++ * (CTO) on the bridge and the endpoint, then READBACK OF ALL FOUR.
++ * We take the bridge from pdev->bus->self (we do NOT hard-code the BDF); when there is none,
++ * we log and SKIP the bridge writes -- we still do the endpoint, because there
++ * is nothing to guess there (we have `pdev`). Returns 0 (readback consistent) or -EIO. */
 +static int om_hardening(struct om_bridge *b)
 +{
 +	struct pci_dev *mostek = b->pdev->bus ? b->pdev->bus->self : NULL;
 +	int bledy = 0;
 +
 +	b->hardening_bylo = true;
-+	om_emrg(b, "hardening: ASPM-off + CTO (LnkCtl/DevCtl2 na mostku i endpoincie) -- start; wzorzec scripts/minihost.sh:167-180\n");
++	om_emrg(b, "hardening: ASPM-off + CTO (LnkCtl/DevCtl2 on the bridge and the endpoint) -- start; pattern from the reference bridge script l. 167-180\n");
 +	if (!mostek) {
-+		om_blad(b, "hardening: pdev->bus->self == NULL (brak mostka) -- zapisy mostka POMINIETE; BDF-a nie zgaduje; robie tylko endpoint\n");
++		om_blad(b, "hardening: pdev->bus->self == NULL (no bridge) -- bridge writes SKIPPED; I do not guess the BDF; doing the endpoint only\n");
 +	} else {
-+		bledy += om_hard_zapis(b, "mostek", mostek, OM_HARD_MOSTEK_LNKCTL,
++		bledy += om_hard_zapis(b, "bridge", mostek, OM_HARD_MOSTEK_LNKCTL,
 +				       OM_HARD_MOSTEK_LNKCTL_V, "LnkCtl (ASPM off)") < 0;
-+		bledy += om_hard_zapis(b, "mostek", mostek, OM_HARD_MOSTEK_DEVCTL2,
++		bledy += om_hard_zapis(b, "bridge", mostek, OM_HARD_MOSTEK_DEVCTL2,
 +				       OM_HARD_MOSTEK_DEVCTL2_V, "DevCtl2 (CTO)") < 0;
 +	}
 +	bledy += om_hard_zapis(b, "endpoint", b->pdev, OM_HARD_EP_LNKCTL,
@@ -1953,78 +1953,78 @@
 +
 +	if (!bledy) {
 +		b->hardening_ok = true;
-+		om_odp(b, "hardening: readback ZGODNY (ASPM off + CTO, mostek i endpoint) -- to jest odpowiednik `setpci` sprzed kazdego fire (CLAUDE.md p.5: hardening ginie z rebootem)\n");
++		om_odp(b, "hardening: readback CONSISTENT (ASPM off + CTO, bridge and endpoint) -- this is the equivalent of `setpci` before every fire (project rulebook item 5: hardening dies with a reboot)\n");
 +		return 0;
 +	}
 +	b->hardening_ok = false;
-+	om_blad(b, "hardening: NIEZGODNY (%d pol) -- NIE kontynuuj bez rebootu; sciezka awaryjna: REBOOT + setpci z czystego boota (scripts/minihost.sh:180)\n",
++	om_blad(b, "hardening: INCONSISTENT (%d fields) -- do NOT continue without a reboot; fallback path: REBOOT + setpci from a clean boot (reference bridge script l. 180)\n",
 +		bledy);
 +	return -EIO;
 +}
 +
 +static void om_op_hardening(struct om_bridge *b, int argc, char **argv)
 +{
-+	om_odp(b, "hardening: komenda recznie naklada ASPM-off + CTO (bez SBR); `reset` robi to samo PO SBR automatycznie\n");
++	om_odp(b, "hardening: the command applies ASPM-off + CTO by hand (without SBR); `reset` does the same AFTER SBR automatically\n");
 +	(void)om_hardening(b);
 +}
 +
 +/* ============================================================ reset (SBR) */
 +
-+/* SBR = pci_reset_function(): reset DOZWOLONY przy zwiazanym sterowniku --
++/* SBR = pci_reset_function(): a reset ALLOWED with a bound driver --
 + * pci_dev_save_and_disable() (zapisuje config), __pci_reset_function_locked(),
-+ * pci_dev_restore() (notes/:12, drivers/pci/
-+ * pci-sysfs.c). Metoda "bus" przez mostek. Po SBR TCM NIE jest czyszczony --
-+ * dlatego `zero` i `loadfw` sa osobnymi komendami. Mapowania BAR sa odtwarzane
-+ * (pci_iounmap + pci_iomap), okno backplane wraca na PCIE2. */
++ * pci_dev_restore() (project notes, drivers/pci/
++ * pci-sysfs.c). The "bus" method through the bridge. After SBR TCM is NOT cleared --
++ * hence `zero` and `loadfw` are separate commands. BAR mappings are recreated
++ * (pci_iounmap + pci_iomap), the backplane window returns to PCIE2. */
 +static void om_op_reset(struct om_bridge *b, int argc, char **argv)
 +{
 +	u32 win = 0, cc = 0;
 +	int err;
 +
-+	om_emrg(b, "reset: pci_reset_function (SBR) -- start; TCM NIE jest czyszczony (CLAUDE.md p.5)\n");
++	om_emrg(b, "reset: pci_reset_function (SBR) -- start; TCM is NOT cleared (project rulebook item 5)\n");
 +	if (!om_reset_fn) {
-+		om_blad(b, "reset: brak pci_reset_function w tym kernelu -- most nie moze dzialac bez SBR (ODMOWA, zero MMIO)\n");
++		om_blad(b, "reset: no pci_reset_function in this kernel -- the bridge cannot work without SBR (REFUSAL, zero MMIO)\n");
 +		return;
 +	}
 +	err = om_reset_fn(b->pdev);
 +	if (err) {
-+		om_blad(b, "reset: pci_reset_function = %d -- SBR NIE DOSZEDL; dalsze kroki przerwane (zadnego czesciowego re-init)\n",
++		om_blad(b, "reset: pci_reset_function = %d -- SBR did NOT GO; further steps aborted (no partial re-init)\n",
 +			err);
 +		return;
 +	}
 +	om_odp(b, "reset: SBR OK (pci_reset_function = 0)\n");
-+	/* Hardening PO SBR -- kolejnosc jak w scripts/minihost.sh (KROK 1 = SBR,
-+	 * KROK 2 = setpci x4 + readback). SBR przywraca domyslne Device Control
-+	 * endpointu, wiec bez tego kroku `reset` NIE bylby odpowiednikiem
-+	 * "reboot + hardening". Gdy readback sie nie zgadza, om_hardening
-+	 * krzyczy i mowi wprost, ze nie wolno kontynuowac bez rebootu -- ale
-+	 * re-init robimy dalej, zeby stan mostu byl okreslony (nota par. 6). */
++	/* Hardening AFTER SBR -- order as in the reference bridge script (STEP 1 = SBR,
++	 * STEP 2 = setpci x4 + readback). SBR restores the endpoint's default Device Control,
++	 * so without this step `reset` would NOT be the equivalent of
++	 * "reboot + hardening". When the readback does not match, om_hardening
++	 * shouts and says plainly that continuing without a reboot is forbidden -- but
++	 * we still do the re-init so the bridge state is determined (notes par. 6). */
 +	(void)om_hardening(b);
-+	/* re-init mapowan: BAR0 i BAR2 od nowa (po SBR config jest ten sam,
-+	 * bo jadro go zapisuje i przywraca, ale mapowanie ma byc udowodnione) */
++	/* re-init of the mappings: BAR0 and BAR2 anew (after SBR the config is the same,
++	 * because the kernel saves and restores it, but the mapping must be proven) */
 +	pci_iounmap(b->pdev, b->bar0);
 +	pci_iounmap(b->pdev, b->bar2);
 +	b->bar0 = pci_iomap(b->pdev, 0, 0);
 +	b->bar2 = pci_iomap(b->pdev, 2, 0);
 +	if (!b->bar0 || !b->bar2) {
-+		om_blad(b, "reset: pci_iomap po SBR nieudane (bar0=%p bar2=%p) -- modul wymaga przeladowania\n",
++		om_blad(b, "reset: pci_iomap after SBR failed (bar0=%p bar2=%p) -- the module needs a reload\n",
 +			b->bar0, b->bar2);
 +		return;
 +	}
-+	om_odp(b, "reset: mapowanie BAR0=%p BAR2=%p (rozmiar 0x%llx)\n", b->bar0, b->bar2,
++	om_odp(b, "reset: mapping BAR0=%p BAR2=%p (size 0x%llx)\n", b->bar0, b->bar2,
 +	       (unsigned long long)b->bar2_len);
 +	pci_set_master(b->pdev);
 +	om_okno_restore(b);
 +	pci_read_config_dword(b->pdev, OM_BAR0_WINDOW, &win);
-+	om_odp(b, "reset: okno backplane = 0x%08x (PCIE2 0x%08x), bus-master wlaczony\n",
++	om_odp(b, "reset: backplane window = 0x%08x (PCIE2 0x%08x), bus-master enabled\n",
 +	       win, OM_PCIE2_BASE);
 +	if (om_bp_read32(b, OM_CC_BASE, &cc) == 0)
 +		om_odp(b, "reset: ChipCommon = 0x%08x => chipid 0x%04x chiprev %u\n",
 +		       cc, cc & 0xffffu, (cc & 0x000f0000u) >> 16);
-+	om_odp(b, "reset: rdzenie: CC 0x%08x D11 0x%08x (strona ZAKAZANA) ARM 0x%08x (wrap 0x%08x) PCIE2 0x%08x (wrap 0x%08x) SOCRAM 0x%08x (wrap 0x%08x)\n",
++	om_odp(b, "reset: cores: CC 0x%08x D11 0x%08x (FORBIDDEN page) ARM 0x%08x (wrap 0x%08x) PCIE2 0x%08x (wrap 0x%08x) SOCRAM 0x%08x (wrap 0x%08x)\n",
 +	       OM_CC_BASE, OM_D11_BASE, OM_ARM_BASE, OM_ARM_WRAP, OM_PCIE2_BASE,
 +	       OM_PCIE2_WRAP, OM_SOCRAM_BASE, OM_SOCRAM_WRAP);
-+	om_odp(b, "reset: po SBR stan fw jest zerowy -- sekwencja: zero 0x%05x 0x%05x; loadfw <obraz>; contract; vars <vars>; ringinit; release\n",
++	om_odp(b, "reset: after SBR the fw state is zero -- sequence: zero 0x%05x 0x%05x; loadfw <image>; contract; vars <vars>; ringinit; release\n",
 +	       OM_ZERO_OD_777, OM_ZERO_DO_777);
 +}
 +
@@ -2034,17 +2034,17 @@
 +	"help",
 +	"status",
 +	"reset",
-+	"hardening                          (ASPM-off + CTO na mostku i endpoincie; reset robi to sam po SBR)",
-+	"zero [<od_hex> <do_hex>]            (domyslnie 0x6e322 0x9a080 = 179550 B)",
-+	"loadfw <sciezka>                   (obraz 7.77.0.0 = 451362 B)",
++	"hardening                          (ASPM-off + CTO on the bridge and the endpoint; reset does the same after SBR)",
++	"zero [<from_hex> <to_hex>]            (default 0x6e322 0x9a080 = 179550 B)",
++	"loadfw <path>                      (image 7.77.0.0 = 451362 B)",
 +	"ringinit",
 +	"contract",
-+	"vars <sciezka>                     (vars rev11 = 3783 B)",
-+	"maccontrol [<hex>] d11-ok          (D11 0x18001120; wymaga d11_ok=1)",
++	"vars <path>                        (vars rev11 = 3783 B)",
++	"maccontrol [<hex>] d11-ok          (D11 0x18001120; requires d11_ok=1)",
 +	"release",
-+	"gate [ms]                          (domyslnie 2000 x 1 ms; timeout nie przerywa)",
++	"gate [ms]                          (default 2000 x 1 ms; the timeout does not abort)",
 +	"send <typ_hex> <len_hex> <payload_hex|->",
-+	"sendtrio                           (0x42 + 0x45 + 0x38, wr = 66, jeden doorbell)",
++	"sendtrio                           (0x42 + 0x45 + 0x38, wr = 66, one doorbell)",
 +	"irq on|off",
 +	"read contract|console|rings|heartbeat|trap|tcm <adr_hex> <len_hex>",
 +	"d2h",
@@ -2055,20 +2055,20 @@
 +{
 +	int i;
 +
-+	om_odp(b, "omwifi_bridge -- most do BCM4360 (14e4:43a0) / fw Broadcom 7.77; urzadzenie %s\n", OM_DEV);
-+	om_odp(b, "zapis: `echo \"<komenda>\" > %s`; odczyt: `cat %s` (odpowiedz RAZ, potem EOF)\n",
++	om_odp(b, "omwifi_bridge -- a bridge to the BCM4360 (14e4:43a0) / Broadcom 7.77 fw; device %s\n", OM_DEV);
++	om_odp(b, "write: `echo \"<command>\" > %s`; read: `cat %s` (an answer ONCE, then EOF)\n",
 +	       OM_DEV, OM_DEV);
-+	om_odp(b, "komendy:\n");
++	om_odp(b, "commands:\n");
 +	for (i = 0; om_komendy[i]; i++)
 +		om_odp(b, "  %s\n", om_komendy[i]);
-+	om_odp(b, "sekwencja od zera (bez rebootu): reset; zero; loadfw <obraz>; contract; vars <vars>; ringinit;\n");
++	om_odp(b, "sequence from zero (no reboot): reset; zero; loadfw <image>; contract; vars <vars>; ringinit;\n");
 +	om_odp(b, "  release; gate 2000; irq on; sendtrio; read rings; read console 3000\n");
-+	om_odp(b, "granice: strona D11 0x18001000 tylko `maccontrol` (d11_ok=1 + token d11-ok); zapis TCM tylko 32-bit;\n");
-+	om_odp(b, "  D11 z resetu zwalnia `d11release` (WRAPPER 0x18101000 -- dozwolony, jak wrappery SOCRAM/ARM);\n");
-+	om_odp(b, "  bez zdjetego resetu D11 nie odpowiada na szynie i fw dostaje AXI timeout (fire #20/#23, bieg mostu 11.09)\n");
-+	om_odp(b, "  okno backplane z kontrola odczytu i powrotem na PCIE2; pola msgbufaddr tylko po bramce adresu\n");
-+	om_odp(b, "  obce okno (D11 wrapper/rdzen, SOCRAM, ARM, CC): na czas dostepu linia przerwania MASKOWANA, bo ISR\n");
-+	om_odp(b, "  czyta i W1C-pisze BAR0+0x48/+0x4C bez om_lock, a BAR0 jest oknem (audyt 11.09.2026)\n");
++	om_odp(b, "limits: the D11 page 0x18001000 only via `maccontrol` (d11_ok=1 + the d11-ok token); TCM writes only 32-bit;\n");
++	om_odp(b, "  `d11release` takes D11 out of reset (WRAPPER 0x18101000 -- allowed, like the SOCRAM/ARM wrappers);\n");
++	om_odp(b, "  without the reset off D11 does not answer on the bus and the fw gets an AXI timeout (fire #20/#23, bridge run of 11.09)\n");
++	om_odp(b, "  backplane window with a readback check and a return to PCIE2; msgbufaddr fields only past the address gate\n");
++	om_odp(b, "  a foreign window (D11 wrapper/core, SOCRAM, ARM, CC): for the access the interrupt line is MASKED, because the ISR\n");
++	om_odp(b, "  reads and W1C-writes BAR0+0x48/+0x4C without om_lock, and BAR0 is a window (audit of 11.09.2026)\n");
 +}
 +
 +/* ================================================================== parser */
@@ -2116,7 +2116,7 @@
 +		argv[argc++] = tok;
 +	}
 +	if (!argc) {
-+		om_blad(b, "(pusta komenda) -- `help`\n");
++		om_blad(b, "(empty command) -- `help`\n");
 +		return;
 +	}
 +
@@ -2127,10 +2127,10 @@
 +	b->resp_pos = 0;
 +	b->resp[0] = 0;
 +
-+	/* Niezmiennik, od ktorego zalezy ISR i bezposrednie odczyty BAR0+0x20/
-+	 * 0x24/0x48/0x4C: okno backplane wskazuje PCIE2. Ustawiamy je PRZED
-+	 * kazda komenda (koszt = jeden zapis config), zeby zaden wczesniejszy
-+	 * przebieg nie zostawil okna na innym rdzeniu. */
++	/* The invariant the ISR and the direct BAR0+0x20/
++	 * 0x24/0x48/0x4C reads depend on: the backplane window points at PCIE2. We set it BEFORE
++	 * every command (cost = one config write) so that no earlier
++	 * run left the window on another core. */
 +	om_okno_restore(b);
 +
 +	for (i = 0; i < ARRAY_SIZE(om_tabela); i++) {
@@ -2140,10 +2140,10 @@
 +			return;
 +		}
 +	}
-+	om_blad(b, "nieznana komenda `%s` -- `help`\n", argv[0]);
++	om_blad(b, "unknown command `%s` -- `help`\n", argv[0]);
 +}
 +
-+/* ======================================================== urzadzenie znakowe */
++/* ======================================================== character device */
 +
 +static ssize_t om_fop_read(struct file *f, char __user *ubuf, size_t count, loff_t *pos)
 +{
@@ -2159,7 +2159,7 @@
 +	}
 +	if (b->resp_pos >= b->resp_len) {
 +		mutex_unlock(&om_lock);
-+		return 0;			/* EOF -- `cat` konczy prace */
++		return 0;			/* EOF -- `cat` ends its work */
 +	}
 +	n = min(count, b->resp_len - b->resp_pos);
 +	if (copy_to_user(ubuf, b->resp + b->resp_pos, n)) {
@@ -2198,11 +2198,11 @@
 +		kfree(linia);
 +		return -ENODEV;
 +	}
-+	/* Wynik komendy jest w ODPOWIEDZI, nie w kodzie wyjscia write(): klient
-+	 * userspace traktuje krotki/nieudany write jako blad TRANSPORTU, a odrzucona
-+	 * komenda (np. maccontrol bez tokenu d11-ok) bledem transportu nie jest.
-+	 * Dlatego konsumujemy CALY bufor i zwracamy count -- takze gdy komenda
-+	 * byla odrzucona; tresc odmowy czeka w buforze odpowiedzi na `read`. */
++	/* The command result is in the RESPONSE, not in the write() exit code: the client
++	 * treats a short/failed write as a TRANSPORT error, and a rejected
++	 * command (e.g. maccontrol without the d11-ok token) is not a transport error.
++	 * Hence we consume the WHOLE buffer and return count -- also when the command
++	 * was rejected; the refusal text waits in the response buffer for `read`. */
 +	om_wykonaj(b, linia);
 +	mutex_unlock(&om_lock);
 +	kfree(linia);
@@ -2216,7 +2216,7 @@
 +	.llseek = noop_llseek,
 +};
 +
-+/* ============================================================ sterownik PCI */
++/* ============================================================ PCI driver */
 +
 +static int om_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 +{
@@ -2228,7 +2228,7 @@
 +	mutex_lock(&om_lock);
 +	if (om) {
 +		mutex_unlock(&om_lock);
-+		dev_err(&pdev->dev, OM_NAZWA ": karta juz trzymana przez most (jeden egzemplarz)\n");
++		dev_err(&pdev->dev, OM_NAZWA ": card already held by the bridge (one instance)\n");
 +		return -EBUSY;
 +	}
 +	mutex_unlock(&om_lock);
@@ -2237,7 +2237,7 @@
 +	if (!b)
 +		return -ENOMEM;
 +	b->pdev = pdev;
-+	/* 16 KiB odpowiedzi na komende -- konsola fw (~1,6 KB) i zrzuty musza sie zmiescic */
++	/* 16 KiB of response per command -- the fw console (~1.6 KB) and dumps must fit */
 +	b->resp = kzalloc(OM_RESP_MAX, GFP_KERNEL);
 +	if (!b->resp) {
 +		err = -ENOMEM;
@@ -2259,40 +2259,40 @@
 +	b->bar0 = pci_iomap(pdev, 0, 0);
 +	b->bar2 = pci_iomap(pdev, 2, 0);
 +	if (!b->bar0 || !b->bar2) {
-+		dev_err(&pdev->dev, OM_NAZWA ": pci_iomap nieudane (bar0=%p bar2=%p)\n",
++		dev_err(&pdev->dev, OM_NAZWA ": pci_iomap failed (bar0=%p bar2=%p)\n",
 +			b->bar0, b->bar2);
 +		err = -EIO;
 +		goto blad_regiony;
 +	}
 +	if (b->bar2_len < OM_RAMSIZE) {
-+		dev_err(&pdev->dev, OM_NAZWA ": BAR2 = 0x%llx B < ramsize 0x%x -- zla karta albo zly BAR\n",
++		dev_err(&pdev->dev, OM_NAZWA ": BAR2 = 0x%llx B < ramsize 0x%x -- wrong card or wrong BAR\n",
 +			(unsigned long long)b->bar2_len, OM_RAMSIZE);
 +		err = -EINVAL;
 +		goto blad_mapowanie;
 +	}
 +
-+	/* Bufor DMA na pierscienie olmsg: 64 KiB = msgbuf_sz kontraktu (pcie.c:108;
-+	 * ten sam rozmiar w module). Maska 32-bit jest tu ISTOTNA -- fw 7.77 czyta
-+	 * z kontraktu tylko dolny dword i buduje okno 64 MiB, wiec bufor musi lezec
-+	 * < 4 GiB; sprawdzamy to jawnie bramka om_dma_adres_ok() (nie "ufamy, ze
-+	 * wyjdzie": w fire'ach modul dostawal 0x01280000, ale to nie jest gwarancja). */
++	/* DMA buffer for the olmsg rings: 64 KiB = the contract's msgbuf_sz (pcie.c:108;
++	 * same size in the module). The 32-bit mask matters HERE -- the fw 7.77 reads
++	 * only the low dword from the contract and builds a 64 MiB window, so the buffer must lie
++	 * < 4 GiB; we check that explicitly with the om_dma_adres_ok() gate (we do not "trust that
++	 * it works out": in the fires the module got 0x01280000, but that is not a guarantee). */
 +	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 +	if (err)
-+		dev_warn(&pdev->dev, OM_NAZWA ": dma_set_mask_and_coherent(32 bity) = %d -- kontynuuje, bramka adresu i tak sprawdzi wynik\n",
++		dev_warn(&pdev->dev, OM_NAZWA ": dma_set_mask_and_coherent(32 bits) = %d -- continuing, the address gate will check the result anyway\n",
 +			 err);
 +	b->dma_va = dma_alloc_coherent(&pdev->dev, OM_DMA_ROZMIAR, &b->dma_fiz, GFP_KERNEL);
 +	if (!b->dma_va) {
-+		dev_err(&pdev->dev, OM_NAZWA ": dma_alloc_coherent(%u) nieudane\n", OM_DMA_ROZMIAR);
++		dev_err(&pdev->dev, OM_NAZWA ": dma_alloc_coherent(%u) failed\n", OM_DMA_ROZMIAR);
 +		err = -ENOMEM;
 +		goto blad_mapowanie;
 +	}
 +	b->dma_ok = om_dma_adres_ok(b->dma_fiz);
 +
-+	/* Niezmiennik od razu po mapowaniu: okno backplane na PCIE2. Bez tego
-+	 * bezposrednie odczyty BAR0+0x20/0x24/0x48/0x4C (ISR, `irq`, doorbell
-+	 * readback) moglyby trafic w inny rdzen -- PCIE2 widac pod BAR0 tylko
-+	 * przy oknie = 0x18003000 (notes/;
-+	 * pcie.c brcmf_pcie_select_core robi to samo przed kazdym dostepem). */
++	/* The invariant right after the mapping: the backplane window on PCIE2. Without it
++	 * the direct BAR0+0x20/0x24/0x48/0x4C reads (ISR, `irq`, doorbell
++	 * readback) could hit another core -- PCIE2 is visible under BAR0 only
++	 * with the window = 0x18003000 (project notes;
++	 * pcie.c brcmf_pcie_select_core does the same before every access). */
 +	om_okno_restore(b);
 +
 +	b->misc.minor = MISC_DYNAMIC_MINOR;
@@ -2312,15 +2312,15 @@
 +
 +	pci_read_config_dword(pdev, OM_BAR0_WINDOW, &win);
 +	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
-+	dev_info(&pdev->dev, OM_NAZWA ": most gotowy: %s, BAR0=%p BAR2=%p (0x%llx B), DMA 0x%llx (%u B), okno 0x80 = 0x%08x, COMMAND = 0x%04x (bus-master b2 = %u)\n",
++	dev_info(&pdev->dev, OM_NAZWA ": bridge ready: %s, BAR0=%p BAR2=%p (0x%llx B), DMA 0x%llx (%u B), window 0x80 = 0x%08x, COMMAND = 0x%04x (bus-master b2 = %u)\n",
 +		 OM_DEV, b->bar0, b->bar2, (unsigned long long)b->bar2_len,
 +		 (unsigned long long)b->dma_fiz, OM_DMA_ROZMIAR, win, cmd, (cmd >> 2) & 1u);
-+	dev_info(&pdev->dev, OM_NAZWA ": bufor DMA przechodzi bramke fw 7.77 (<4 GiB i okno 64 MiB): %s\n",
-+		 b->dma_ok ? "TAK" : "NIE");
++	dev_info(&pdev->dev, OM_NAZWA ": the DMA buffer passes the fw 7.77 gate (<4 GiB and the 64 MiB window): %s\n",
++		 b->dma_ok ? "YES" : "NO");
 +	if (!b->dma_ok)
-+		dev_emerg(&pdev->dev, OM_NAZWA ": UWAGA adres DMA 0x%llx NIE przechodzi bramki -- `contract` pominie pola msgbufaddr, a `ringinit`/`send`/`sendtrio` beda ODMAWIAC\n",
++		dev_emerg(&pdev->dev, OM_NAZWA ": NOTE the DMA address 0x%llx does NOT pass the gate -- `contract` will skip the msgbufaddr fields, and `ringinit`/`send`/`sendtrio` will REFUSE\n",
 +			  (unsigned long long)b->dma_fiz);
-+	dev_info(&pdev->dev, OM_NAZWA ": sekwencja startowa: echo \"reset\" > %s; echo \"zero\" > %s; echo \"loadfw <obraz>\" > %s; echo \"contract\" > %s; echo \"vars <vars>\" > %s; echo \"ringinit\" > %s; echo \"release\" > %s; echo \"gate\" > %s; echo \"irq on\" > %s; echo \"sendtrio\" > %s\n",
++	dev_info(&pdev->dev, OM_NAZWA ": startup sequence: echo \"reset\" > %s; echo \"zero\" > %s; echo \"loadfw <image>\" > %s; echo \"contract\" > %s; echo \"vars <vars>\" > %s; echo \"ringinit\" > %s; echo \"release\" > %s; echo \"gate\" > %s; echo \"irq on\" > %s; echo \"sendtrio\" > %s\n",
 +		 OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV, OM_DEV);
 +	return 0;
 +
@@ -2386,10 +2386,10 @@
 +
 +/* ============================================================== init / exit */
 +
-+/* Sprawdzenie PRZED rejestracja sterownika: czy karta nie jest juz zbindowana
-+ * do innego sterownika (wymaganie 2). Gdyby byla (np. brcmfmac), probe() nigdy
-+ * by sie nie wykonal, a modul "zaladowalby sie po cichu" i nic nie robil --
-+ * dlatego ODMOWUJEMY JAWNIE, z nazwa sterownika i gotowa komenda. */
++/* A check BEFORE registering the driver: whether the card is not already bound
++ * to another driver (requirement 2). If it were (e.g. brcmfmac), probe() would never
++ * run, and the module would "load silently" and do nothing --
++ * hence we REFUSE explicitly, with the driver name and a ready command. */
 +static int om_sprawdz_zajetosc(void)
 +{
 +	struct pci_dev *pdev;
@@ -2397,16 +2397,16 @@
 +
 +	pdev = pci_get_device(OM_VENDOR, OM_DEVICE_4360, NULL);
 +	if (!pdev) {
-+		pr_err(OM_NAZWA ": ODMOWA: brak karty %04x:%04x na PCI -- nie ma czego przejac\n",
++		pr_err(OM_NAZWA ": REFUSAL: no card %04x:%04x on PCI -- nothing to take over\n",
 +		       OM_VENDOR, OM_DEVICE_4360);
 +		return -ENODEV;
 +	}
 +	if (pdev->dev.driver) {
-+		pr_err(OM_NAZWA ": ODMOWA: karta %s jest juz zbindowana do sterownika `%s` -- odczekaj/odbinduj go (CLAUDE.md p.5: po fire zakaz rmmod => REBOOT), potem zaladuj most\n",
++		pr_err(OM_NAZWA ": REFUSAL: the card %s is already bound to the driver `%s` -- wait/unbind it (project rulebook item 5: after a fire rmmod is forbidden => REBOOT), then load the bridge\n",
 +		       pci_name(pdev), pdev->dev.driver->name);
 +		err = -EBUSY;
 +	} else {
-+		pr_info(OM_NAZWA ": karta %s wolna (bez sterownika) -- most moze ja przejac\n",
++		pr_info(OM_NAZWA ": card %s is free (no driver) -- the bridge can take it over\n",
 +			pci_name(pdev));
 +	}
 +	pci_dev_put(pdev);
@@ -2417,23 +2417,23 @@
 +{
 +	int err;
 +
-+	pr_info(OM_NAZWA ": inicjalizacja (d11_ok=%u; strona D11 0x%08x dostepna %s)\n",
++	pr_info(OM_NAZWA ": initializing (d11_ok=%u; the D11 page 0x%08x available %s)\n",
 +		d11_ok ? 1 : 0, OM_D11_BASE,
-+		d11_ok ? "TYLKO komenda maccontrol z tokenem d11-ok" : "NIGDY (d11_ok=0)");
++		d11_ok ? "ONLY the maccontrol command with the d11-ok token" : "NEVER (d11_ok=0)");
 +
-+	/* Wymaganie 2: bez pci_reset_function() most NIE MOZE dzialac (caly cykl
-+	 * bez rebootu stoi na SBR -- notes/). Symbol
-+	 * jest EXPORT_SYMBOL_GPL (drivers/pci/pci.c:5202, deklaracja
-+	 * include/linux/pci.h:1473), nie jest za zadnym CONFIG_* i modul go
-+	 * WOLA -- w kernelu bez niego insmod konczy sie unresolved symbol
-+	 * (glosno), a nie po cichu. Ten warunek jest dodatkowym, jawnym
-+	 * sprawdzeniem tej samej rzeczy przed jakimkolwiek dotknieciem karty. */
++	/* Requirement 2: without pci_reset_function() the bridge CANNOT work (the whole cycle
++	 * without a reboot stands on SBR -- project notes). The symbol
++	 * is EXPORT_SYMBOL_GPL (drivers/pci/pci.c:5202, declaration
++	 * include/linux/pci.h:1473), it is behind no CONFIG_* and the module just
++	 * CALLS it -- in a kernel without it insmod ends in an unresolved symbol
++	 * (loudly), not silently. This condition is an additional, explicit
++	 * check of the same thing before any touch of the card. */
 +	if (!IS_ENABLED(CONFIG_PCI)) {
-+		pr_err(OM_NAZWA ": ODMOWA: kernel bez CONFIG_PCI -- nie ma pci_reset_function ani BAR-ow\n");
++		pr_err(OM_NAZWA ": REFUSAL: kernel without CONFIG_PCI -- no pci_reset_function and no BARs\n");
 +		return -ENODEV;
 +	}
 +	if (!om_reset_fn) {
-+		pr_err(OM_NAZWA ": ODMOWA: brak pci_reset_function w tym kernelu -- most nie ma czym robic SBR\n");
++		pr_err(OM_NAZWA ": REFUSAL: no pci_reset_function in this kernel -- the bridge has nothing to do SBR with\n");
 +		return -ENODEV;
 +	}
 +
@@ -2446,7 +2446,7 @@
 +		pr_err(OM_NAZWA ": pci_register_driver = %d\n", err);
 +		return err;
 +	}
-+	pr_info(OM_NAZWA ": sterownik zarejestrowany; %s pojawi sie po przejeciu karty\n",
++	pr_info(OM_NAZWA ": driver registered; %s will appear after the bridge takes over the card\n",
 +		OM_DEV);
 +	return 0;
 +}
@@ -2454,7 +2454,7 @@
 +static void __exit om_exit(void)
 +{
 +	pci_unregister_driver(&om_driver);
-+	pr_info(OM_NAZWA ": most usuniety (projektowy zakaz rmmod po fire -- CLAUDE.md p.5; TCM nie czysci sie rebootem)\n");
++	pr_info(OM_NAZWA ": bridge removed (project rule: no rmmod after a fire -- project rulebook item 5; TCM is not cleared by a reboot)\n");
 +}
 +
 +module_init(om_init);
