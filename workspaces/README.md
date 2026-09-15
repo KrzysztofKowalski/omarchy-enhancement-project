@@ -43,6 +43,8 @@ is a **local override**, never an edit there.
 
 ```
 workspaces/
+├── install.sh                     # installer: install / --check / --uninstall
+├── test.sh                        # round-trip test on a throwaway fake $HOME
 ├── hypr/bindings-workspaces.lua   # appended to ~/.config/hypr/bindings.lua
 └── omarchy-plugin/Workspaces.qml  # patched clone of omarchy.workspaces
 ```
@@ -56,22 +58,26 @@ to the clone's own id makes no difference (A/B tested with a shell restart).
 
 ```bash
 ./install.sh              # append bindings + clone & patch the bar widget
-./install.sh --uninstall  # remove the bindings block
+./install.sh --check      # report the current state, change nothing
+./install.sh --uninstall  # restore the stock 10-workspace layout
+./test.sh                 # round-trip test on a throwaway fake $HOME
 ```
 
-`install.sh` backs up `bindings.lua` before touching it and is idempotent (it
-keys off an `-- om-enh:workspaces` marker). It reloads Hyprland and rescans the
-shell plugin.
+`install.sh` backs up `bindings.lua` before touching it and is idempotent. It
+reloads Hyprland and rescans the shell plugin — the bar rebuilds over ~10 s, so
+give it a moment before judging a screenshot.
 
-### Fully reverting the bar
+The block is **detected by its body text, not by the `-- om-enh:workspaces`
+marker it writes**. That matters on a machine where the block was appended by
+hand and carries no marker: keying off the marker alone would append a second
+copy and `--uninstall` would fail to find the original. Both cases are covered
+by `test.sh`.
 
-`--uninstall` only removes the bindings; the cloned widget stays. To finish:
-
-```bash
-rm -rf "$HOME/.config/omarchy/plugins/$(id -un).workspaces"
-# then in ~/.config/omarchy/shell.json set the bar's left-section id back to
-# "omarchy.workspaces", and: omarchy restart shell
-```
+`--uninstall` restores the cloned widget to the stock QML (the bar shows 10
+again) and removes the bindings block, leaving that file byte-for-byte as it
+was before install. The now-unused clone directory stays behind — harmless;
+delete it and point `shell.json`'s left section back at `omarchy.workspaces` if
+you want it gone entirely.
 
 ## Warnings
 
