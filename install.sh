@@ -3,7 +3,7 @@
 # omarchy-enhancement-project — per-module installer
 #   ./install.sh              → list modules
 #   ./install.sh <module>...  → install selected
-# Safe modules (theme, audio, touchpad) install themselves.
+# Safe modules (theme, audio, touchpad, workspaces) install themselves.
 # kernel/gpu/wifi/aec/music/gaming/llm → run the scripts from their READMEs
 # (boot/initramfs/reboot).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -18,6 +18,7 @@ usage() {
   echo "  theme     — Omarchy 4 themes (las, ogien, ciemny-las, ciemny-ogien) → ~/.config/omarchy/themes/"
   echo "  audio     — BT speaker fix (dummy AVRCP player) + audio preview fix"
   echo "  touchpad  — system-sleep hook: rebind bcm5974 after resume"
+  echo "  workspaces — 20 workspaces (two banks of 10) + patched bar widget"
   echo ""
   echo "Manual modules (see README in each directory): kernel, gpu, wifi, aec, music, gaming, llm, mikrofon, system"
 }
@@ -58,6 +59,12 @@ install_touchpad() {
   bash "$HERE/touchpad/scripts/install-sleep-hook.sh"
 }
 
+install_workspaces() {
+  require_omarchy
+  echo "  → running workspaces/install.sh"
+  bash "$HERE/workspaces/install.sh"
+}
+
 [ $# -eq 0 ] && { usage; exit 0; }
 
 for mod in "$@"; do
@@ -65,6 +72,7 @@ for mod in "$@"; do
     theme)    install_theme ;;
     audio)    install_audio ;;
     touchpad) install_touchpad ;;
+    workspaces) install_workspaces ;;
     kernel|gpu|wifi|aec|music|gaming|llm|mikrofon|system)
       echo "  ! module '$mod' — manual install, see $mod/README.md" ;;
     *) usage; exit 1 ;;

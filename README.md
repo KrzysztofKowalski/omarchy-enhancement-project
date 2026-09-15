@@ -32,6 +32,7 @@ proprietary AEC paths with open implementations.
 | [`gaming/`](gaming/) | RimWorld on the Retina panel via a custom gamescope build (click/scroll input fixes) |
 | [`llm/`](llm/) | Haswell-free ollama build used as a Claude Code gateway (cloud models on a CPU that stock ollama refuses) |
 | [`system/`](system/) | System changes: config backups (limine, hyprland, chromium-flags), fan scripts, `apple_set_os` / Iris panel plan, NAS mount helpers |
+| [`workspaces/`](workspaces/) | **20 workspaces** in the bar — two banks of 10 (`SUPER+ALT+1..0` = 11..20), plus a patched `omarchy.workspaces` widget that renders all of them |
 
 ## Install
 
@@ -40,10 +41,10 @@ proprietary AEC paths with open implementations.
 ./install.sh theme audio touchpad   # specific modules
 ```
 
-The installer covers the safe modules (theme, audio, touchpad). `kernel`,
-`gpu`, `wifi`, `aec` are build/install scripts run manually as described in
-each module README — they touch bootloaders/initramfs or the audio daemon
-and may require a reboot.
+The installer covers the safe modules (theme, audio, touchpad, workspaces).
+`kernel`, `gpu`, `wifi`, `aec` are build/install scripts run manually as
+described in each module README — they touch bootloaders/initramfs or the audio
+daemon and may require a reboot.
 
 ## Working notes
 
