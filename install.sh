@@ -3,7 +3,7 @@
 # omarchy-enhancement-project — per-module installer
 #   ./install.sh              → list modules
 #   ./install.sh <module>...  → install selected
-# Safe modules (theme, audio, touchpad, workspaces) install themselves.
+# Safe modules (theme, audio, touchpad, workspaces, clock) install themselves.
 # kernel/gpu/wifi/aec/music/gaming/llm → run the scripts from their READMEs
 # (boot/initramfs/reboot).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -19,6 +19,7 @@ usage() {
   echo "  audio     — BT speaker fix (dummy AVRCP player) + audio preview fix"
   echo "  touchpad  — system-sleep hook: rebind bcm5974 after resume"
   echo "  workspaces — 20 workspaces (two banks of 10) + patched bar widget"
+  echo "  clock     — seconds in the bar clock + system-locale calendar day names"
   echo ""
   echo "Manual modules (see README in each directory): kernel, gpu, wifi, aec, music, gaming, llm, mikrofon, system"
 }
@@ -65,6 +66,12 @@ install_workspaces() {
   bash "$HERE/workspaces/install.sh"
 }
 
+install_clock() {
+  require_omarchy
+  echo "  → running clock/install.sh"
+  bash "$HERE/clock/install.sh"
+}
+
 [ $# -eq 0 ] && { usage; exit 0; }
 
 for mod in "$@"; do
@@ -73,6 +80,7 @@ for mod in "$@"; do
     audio)    install_audio ;;
     touchpad) install_touchpad ;;
     workspaces) install_workspaces ;;
+    clock)    install_clock ;;
     kernel|gpu|wifi|aec|music|gaming|llm|mikrofon|system)
       echo "  ! module '$mod' — manual install, see $mod/README.md" ;;
     *) usage; exit 1 ;;
