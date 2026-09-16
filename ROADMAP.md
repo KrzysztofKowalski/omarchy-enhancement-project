@@ -20,6 +20,7 @@
 | gaming | 🟡 | RimWorld clicks/scroll fixed via custom gamescope — exit-crash investigation (gamescope-shdr) open |
 | llm | 🟡 | Haswell-free ollama gateway works; usage guard in — hardening the account switching |
 | system | 🟢 | Backups + scripts; Iris panel plan: Stage 0 done, Stage 1 (`apple_set_os.efi` chainload) pending |
+| clock | 🟢 | Bar clock with ticking seconds + system-locale day names (`clock/`); install/check/uninstall verified against a sandbox `$HOME` |
 
 ## Cross-cutting
 
